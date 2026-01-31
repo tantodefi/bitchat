@@ -20,6 +20,11 @@ enum CommandInfo: String, Identifiable {
     case who
     case favorite
     case unfavorite
+    // XMTP commands
+    case xmtp
+    case dmWallet = "dm-wallet"
+    case xmtpSync = "xmtp-sync"
+    case xmtpList = "xmtp-list"
     
     var id: String { rawValue }
     
@@ -29,7 +34,9 @@ enum CommandInfo: String, Identifiable {
         switch self {
         case .block, .hug, .message, .slap, .unblock, .favorite, .unfavorite:
             return "<" + String(localized: "content.input.nickname_placeholder") + ">"
-        case .clear, .who:
+        case .dmWallet:
+            return "<inbox_id>"
+        case .clear, .who, .xmtp, .xmtpSync, .xmtpList:
             return nil
         }
     }
@@ -45,14 +52,19 @@ enum CommandInfo: String, Identifiable {
         case .who:          String(localized: "content.commands.who")
         case .favorite:     String(localized: "content.commands.favorite")
         case .unfavorite:   String(localized: "content.commands.unfavorite")
+        case .xmtp:         "show XMTP wallet status"
+        case .dmWallet:     "start XMTP DM with inbox"
+        case .xmtpSync:     "sync XMTP conversations"
+        case .xmtpList:     "list XMTP conversations"
         }
     }
     
     static func all(isGeoPublic: Bool, isGeoDM: Bool) -> [CommandInfo] {
         let baseCommands: [CommandInfo] = [.block, .unblock, .clear, .hug, .message, .slap, .who]
+        let xmtpCommands: [CommandInfo] = [.xmtp, .dmWallet, .xmtpSync, .xmtpList]
         if isGeoPublic || isGeoDM {
-            return baseCommands + [.favorite, .unfavorite]
+            return baseCommands + [.favorite, .unfavorite] + xmtpCommands
         }
-        return baseCommands
+        return baseCommands + xmtpCommands
     }
 }

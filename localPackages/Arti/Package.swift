@@ -34,7 +34,8 @@ let package = Package(
             linkerSettings: [
                 .linkedLibrary("resolv"),
                 .linkedLibrary("z"),
-                .linkedLibrary("sqlite3"),
+                // NOTE: sqlite3 is provided by SQLCipher framework (from XMTP CocoaPod)
+                // Do not link system sqlite3 as it conflicts with SQLCipher encryption
             ]
         ),
         // Binary framework containing the Rust static library

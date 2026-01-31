@@ -824,6 +824,17 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
     
     @MainActor
     func toggleFavorite(peerID: PeerID) {
+        // Handle XMTP peers separately
+        if peerID.isXMTPDM {
+            guard XMTPServiceContainer.isConfigured, XMTPServiceContainer.shared.isInitialized else {
+                addSystemMessage("❌ XMTP not connected")
+                return
+            }
+            XMTPServiceContainer.shared.clientService.toggleContact(peerID: peerID)
+            objectWillChange.send()
+            return
+        }
+        
         // Distinguish between ephemeral peer IDs (16 hex chars) and Noise public keys (64 hex chars)
         // Ephemeral peer IDs are 8 bytes = 16 hex characters
         // Noise public keys are 32 bytes = 64 hex characters
@@ -890,6 +901,14 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
     
     @MainActor
     func isFavorite(peerID: PeerID) -> Bool {
+        // Handle XMTP peers
+        if peerID.isXMTPDM {
+            guard XMTPServiceContainer.isConfigured, XMTPServiceContainer.shared.isInitialized else {
+                return false
+            }
+            return XMTPServiceContainer.shared.clientService.isContactSaved(peerID: peerID)
+        }
+        
         // Distinguish between ephemeral peer IDs (16 hex chars) and Noise public keys (64 hex chars)
         if let noisePublicKey = peerID.noiseKey {
             // This is a Noise public key
@@ -3697,6 +3716,51 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
                                 mentions: [],
                                 messageID: UUID().uuidString,
                                 timestamp: Date())
+    }
+    
+    // MARK: - XMTP Commands
+    
+    /// Start an XMTP DM chat with an inbox ID
+    @MainActor
+    func startXMTPChat(with inboxId: String) async {
+        guard XMTPServiceContainer.isConfigured, XMTPServiceContainer.shared.isInitialized else {
+            addPublicSystemMessage("❌ XMTP not connected")
+            return
+        }
+        
+        do {
+            // Find or create DM with the inbox ID
+            let dm = try await XMTPServiceContainer.shared.clientService.findOrCreateDM(with: inboxId)
+            
+            // Create a virtual PeerID for this XMTP conversation
+            let virtualPeerID = PeerID(xmtp: inboxId)
+            
+            // Initialize private chat for this peer
+            if privateChats[virtualPeerID] == nil {
+                privateChats[virtualPeerID] = []
+            }
+            
+            // Switch to the private chat
+            selectedPrivateChatPeer = virtualPeerID
+            
+            // Add system message
+            let systemMsg = BitchatMessage(
+                sender: "system",
+                content: "🔐 XMTP DM with \(inboxId.prefix(8))…\nMessages are end-to-end encrypted.",
+                timestamp: Date(),
+                isRelay: false
+            )
+            privateChats[virtualPeerID]?.append(systemMsg)
+            
+            addPublicSystemMessage("✅ Opened XMTP DM with \(inboxId.prefix(8))…")
+            objectWillChange.send()
+            
+            SecureLogger.info("📮 Started XMTP chat with \(inboxId.prefix(16))…", category: .session)
+            
+        } catch {
+            addPublicSystemMessage("❌ Failed to create XMTP DM: \(error.localizedDescription)")
+            SecureLogger.error("XMTP DM creation failed: \(error)", category: .session)
+        }
     }
     
 

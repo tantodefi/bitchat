@@ -8,21 +8,26 @@ final class FavoritesPersistenceService: ObservableObject {
     
     struct FavoriteRelationship: Codable {
         let peerNoisePublicKey: Data
-        let peerNostrPublicKey: String?
+        let peerNostrPublicKey: String? // Legacy - kept for migration
+        let peerXMTPInboxId: String? // XMTP inbox ID for internet messaging
         let peerNickname: String
         let isFavorite: Bool
         let theyFavoritedUs: Bool
         let favoritedAt: Date
         let lastUpdated: Date
-        // Track what we last sent as OUR npub to this peer, to avoid resending unless it changes
-        // Note: we do not track which npub we last sent to them; sending happens only on favorite toggle
+        // Track what we last sent as OUR identity to this peer
         
         var isMutual: Bool {
             isFavorite && theyFavoritedUs
         }
+        
+        /// Check if this peer can be reached via XMTP
+        var isXMTPReachable: Bool {
+            peerXMTPInboxId != nil
+        }
     }
     
-    // We intentionally do not track when we last sent our npub; sending happens only on favorite toggle.
+    // We intentionally do not track when we last sent our identity; sending happens only on favorite toggle.
 
     private static let storageKey = "chat.bitchat.favorites"
     private static let keychainService = "chat.bitchat.favorites"
@@ -49,6 +54,7 @@ final class FavoritesPersistenceService: ObservableObject {
     func addFavorite(
         peerNoisePublicKey: Data,
         peerNostrPublicKey: String? = nil,
+        peerXMTPInboxId: String? = nil,
         peerNickname: String
     ) {
         SecureLogger.info("⭐️ Adding favorite: \(peerNickname) (\(peerNoisePublicKey.hexEncodedString()))", category: .session)
@@ -58,6 +64,7 @@ final class FavoritesPersistenceService: ObservableObject {
         let relationship = FavoriteRelationship(
             peerNoisePublicKey: peerNoisePublicKey,
             peerNostrPublicKey: peerNostrPublicKey ?? existing?.peerNostrPublicKey,
+            peerXMTPInboxId: peerXMTPInboxId ?? existing?.peerXMTPInboxId,
             peerNickname: peerNickname,
             isFavorite: true,
             theyFavoritedUs: existing?.theyFavoritedUs ?? false,
@@ -92,6 +99,7 @@ final class FavoritesPersistenceService: ObservableObject {
             let updated = FavoriteRelationship(
                 peerNoisePublicKey: existing.peerNoisePublicKey,
                 peerNostrPublicKey: existing.peerNostrPublicKey,
+                peerXMTPInboxId: existing.peerXMTPInboxId,
                 peerNickname: existing.peerNickname,
                 isFavorite: false,
                 theyFavoritedUs: true,
@@ -121,7 +129,8 @@ final class FavoritesPersistenceService: ObservableObject {
         peerNoisePublicKey: Data,
         favorited: Bool,
         peerNickname: String? = nil,
-        peerNostrPublicKey: String? = nil
+        peerNostrPublicKey: String? = nil,
+        peerXMTPInboxId: String? = nil
     ) {
         let existing = favorites[peerNoisePublicKey]
         let displayName = peerNickname ?? existing?.peerNickname ?? "Unknown"
@@ -131,6 +140,7 @@ final class FavoritesPersistenceService: ObservableObject {
         let relationship = FavoriteRelationship(
             peerNoisePublicKey: peerNoisePublicKey,
             peerNostrPublicKey: peerNostrPublicKey ?? existing?.peerNostrPublicKey,
+            peerXMTPInboxId: peerXMTPInboxId ?? existing?.peerXMTPInboxId,
             peerNickname: displayName,
             isFavorite: existing?.isFavorite ?? false,
             theyFavoritedUs: favorited,
@@ -185,6 +195,42 @@ final class FavoritesPersistenceService: ObservableObject {
             return rel
         }
         return nil
+    }
+    
+    /// Update XMTP inbox ID for an existing favorite
+    func updateXMTPInboxId(_ inboxId: String, for peerNoisePublicKey: Data) {
+        guard let existing = favorites[peerNoisePublicKey] else { return }
+        
+        let updated = FavoriteRelationship(
+            peerNoisePublicKey: existing.peerNoisePublicKey,
+            peerNostrPublicKey: existing.peerNostrPublicKey,
+            peerXMTPInboxId: inboxId,
+            peerNickname: existing.peerNickname,
+            isFavorite: existing.isFavorite,
+            theyFavoritedUs: existing.theyFavoritedUs,
+            favoritedAt: existing.favoritedAt,
+            lastUpdated: Date()
+        )
+        
+        favorites[peerNoisePublicKey] = updated
+        saveFavorites()
+        
+        SecureLogger.info("📬 Updated XMTP inbox ID for \(existing.peerNickname): \(inboxId.prefix(16))…", category: .session)
+        
+        // Notify observers with XMTP info
+        NotificationCenter.default.post(
+            name: .favoriteStatusChanged,
+            object: nil,
+            userInfo: [
+                "peerPublicKey": peerNoisePublicKey,
+                "xmtpInboxId": inboxId
+            ]
+        )
+    }
+    
+    /// Get all favorites that are XMTP-reachable
+    func getXMTPReachableFavorites() -> [FavoriteRelationship] {
+        favorites.values.filter { $0.isXMTPReachable && $0.isFavorite }
     }
     
     /// Clear all favorites - used for panic mode
@@ -244,10 +290,10 @@ final class FavoritesPersistenceService: ObservableObject {
             
             SecureLogger.info("✅ Loaded \(relationships.count) favorite relationships", category: .session)
             
-            // Log Nostr public key info
+            // Log XMTP inbox ID info
             for relationship in relationships {
-                if relationship.peerNostrPublicKey == nil {
-                    SecureLogger.warning("⚠️ No Nostr public key stored for '\(relationship.peerNickname)'", category: .session)
+                if relationship.peerXMTPInboxId == nil {
+                    SecureLogger.warning("⚠️ No XMTP inbox ID stored for '\(relationship.peerNickname)'", category: .session)
                 }
             }
             

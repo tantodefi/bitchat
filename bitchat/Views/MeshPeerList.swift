@@ -63,6 +63,11 @@ struct MeshPeerList: View {
                             Image(systemName: "point.3.filled.connected.trianglepath.dotted")
                                 .font(.bitchatSystem(size: 10))
                                 .foregroundColor(baseColor)
+                        } else if peer.isMutualFavorite && peer.isXMTPReachable {
+                            // Mutual favorite reachable via XMTP: wallet icon (blue)
+                            Image(systemName: "wallet.pass.fill")
+                                .font(.bitchatSystem(size: 10))
+                                .foregroundColor(.blue)
                         } else if peer.isMutualFavorite {
                             // Mutual favorite reachable via Nostr: globe icon (purple)
                             Image(systemName: "globe")

@@ -50,6 +50,9 @@ protocol CommandContextProvider: AnyObject {
     // MARK: - Favorites
     func toggleFavorite(peerID: PeerID)
     func sendFavoriteNotification(to peerID: PeerID, isFavorite: Bool)
+    
+    // MARK: - XMTP Actions
+    func startXMTPChat(with inboxId: String) async
 }
 
 /// Processes chat commands in a focused, efficient way
@@ -102,6 +105,14 @@ final class CommandProcessor {
         case "/unfav":
             if inGeoPublic || inGeoDM { return .error(message: "favorites are only for mesh peers in #mesh") }
             return handleFavorite(args, add: false)
+        case "/xmtp":
+            return handleXMTPStatus()
+        case "/dm-wallet":
+            return handleDMWallet(args)
+        case "/xmtp-sync":
+            return handleXMTPSync()
+        case "/xmtp-list":
+            return handleXMTPList()
         default:
             return .error(message: "unknown command: \(cmd)")
         }
@@ -343,6 +354,127 @@ final class CommandProcessor {
             
             return .success(message: "removed \(nickname) from favorites")
         }
+    }
+    
+    // MARK: - XMTP Commands
+    
+    private func handleXMTPStatus() -> CommandResult {
+        guard XMTPServiceContainer.isConfigured else {
+            return .error(message: "XMTP not configured")
+        }
+        
+        let container = XMTPServiceContainer.shared
+        
+        guard container.isInitialized else {
+            return .error(message: "XMTP not connected")
+        }
+        
+        let inboxId = container.clientService.inboxId ?? "unknown"
+        let isConnected = container.clientService.isConnected
+        
+        // Get wallet address asynchronously - we need to return sync, so fetch cached if available
+        Task {
+            if let address = try? await container.wallet.getAddress() {
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage("📮 XMTP Status:\n• Wallet: \(address)\n• Inbox: \(inboxId.prefix(16))…\n• Connected: \(isConnected ? "✅" : "❌")")
+                }
+            }
+        }
+        
+        return .handled
+    }
+    
+    private func handleDMWallet(_ args: String) -> CommandResult {
+        let inboxId = args.trimmingCharacters(in: .whitespaces)
+        
+        guard !inboxId.isEmpty else {
+            return .error(message: "usage: /dm-wallet <inbox_id>\nGet inbox ID from recipient's /xmtp command")
+        }
+        
+        // Validate inbox ID format (64 char hex)
+        guard inboxId.count == 64, inboxId.allSatisfy({ $0.isHexDigit }) else {
+            return .error(message: "invalid inbox ID format. Must be 64 hex characters")
+        }
+        
+        guard XMTPServiceContainer.isConfigured, XMTPServiceContainer.shared.isInitialized else {
+            return .error(message: "XMTP not connected. Check /xmtp status")
+        }
+        
+        // Start DM asynchronously
+        Task {
+            await contextProvider?.startXMTPChat(with: inboxId)
+        }
+        
+        return .success(message: "opening XMTP DM with \(inboxId.prefix(8))…")
+    }
+    
+    private func handleXMTPSync() -> CommandResult {
+        guard XMTPServiceContainer.isConfigured, XMTPServiceContainer.shared.isInitialized else {
+            return .error(message: "XMTP not connected")
+        }
+        
+        Task {
+            do {
+                try await XMTPServiceContainer.shared.clientService.syncAll()
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage("✅ XMTP sync complete")
+                }
+            } catch {
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage("❌ XMTP sync failed: \(error.localizedDescription)")
+                }
+            }
+        }
+        
+        return .handled
+    }
+    
+    private func handleXMTPList() -> CommandResult {
+        guard XMTPServiceContainer.isConfigured, XMTPServiceContainer.shared.isInitialized else {
+            return .error(message: "XMTP not connected")
+        }
+        
+        Task {
+            do {
+                let conversations = try await XMTPServiceContainer.shared.clientService.listConversations()
+                
+                if conversations.isEmpty {
+                    await MainActor.run {
+                        contextProvider?.addPublicSystemMessage("📭 No XMTP conversations yet")
+                    }
+                } else {
+                    var list = "📬 XMTP Conversations (\(conversations.count)):\n"
+                    for (index, conv) in conversations.prefix(10).enumerated() {
+                        let peerDisplay: String
+                        if case .dm(let dm) = conv {
+                            if let inboxId = try? dm.peerInboxId {
+                                peerDisplay = "\(inboxId.prefix(8))…"
+                            } else {
+                                peerDisplay = "DM (unknown peer)"
+                            }
+                        } else if case .group(let group) = conv {
+                            let groupName = (try? group.name()) ?? "Unnamed"
+                            peerDisplay = groupName.isEmpty ? "Group \(group.id.prefix(8))…" : groupName
+                        } else {
+                            peerDisplay = "unknown"
+                        }
+                        list += "  \(index + 1). \(peerDisplay)\n"
+                    }
+                    if conversations.count > 10 {
+                        list += "  … and \(conversations.count - 10) more"
+                    }
+                    await MainActor.run {
+                        contextProvider?.addPublicSystemMessage(list)
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage("❌ Failed to list conversations: \(error.localizedDescription)")
+                }
+            }
+        }
+        
+        return .handled
     }
     
 }

@@ -20,6 +20,7 @@ import Tor
 /// - Broadcasts Kind 20001 events to low-precision geohash channels
 /// - Uses randomized timing (40-80s loop) and decorrelated bursts
 /// - Respects privacy by NOT broadcasting to Neighborhood/Block/Building levels
+/// - Respects TransportPreferences.geoTransport setting
 @MainActor
 final class GeohashPresenceService: ObservableObject {
     static let shared = GeohashPresenceService()
@@ -107,6 +108,13 @@ final class GeohashPresenceService: ObservableObject {
     private func performHeartbeat() {
         // Always schedule next loop first ensures continuity even if this one fails/skips
         defer { scheduleNextHeartbeat() }
+        
+        // 0. Check if Nostr is enabled for geo features
+        let prefs = TransportPreferences.shared
+        guard prefs.geoTransport == .nostr && prefs.isNostrEnabled else {
+            SecureLogger.debug("Presence: skipping heartbeat (Nostr not active for geo)", category: .session)
+            return
+        }
 
         // 1. Check preconditions
         guard TorManager.shared.isReady else {

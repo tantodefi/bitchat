@@ -20,4 +20,5 @@ public extension OSLog {
     static let security     = OSLog(subsystem: subsystem, category: "security")
     static let handshake    = OSLog(subsystem: subsystem, category: "handshake")
     static let sync         = OSLog(subsystem: subsystem, category: "sync")
+    static let network      = OSLog(subsystem: subsystem, category: "network")
 }

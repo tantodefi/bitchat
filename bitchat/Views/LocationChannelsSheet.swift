@@ -11,9 +11,11 @@ struct LocationChannelsSheet: View {
     @ObservedObject private var bookmarks = GeohashBookmarksStore.shared
     @ObservedObject private var network = NetworkActivationService.shared
     @EnvironmentObject var viewModel: ChatViewModel
+    @EnvironmentObject var xmtpContainer: XMTPServiceContainer
     @Environment(\.colorScheme) var colorScheme
     @State private var customGeohash: String = ""
     @State private var customError: String? = nil
+    @State private var showXMTPConversations: Bool = false
 
     private var backgroundColor: Color { colorScheme == .dark ? .black : .white }
 
@@ -260,6 +262,11 @@ struct LocationChannelsSheet: View {
                     .buttonStyle(.plain)
                     .padding(.vertical, 8)
                 }
+                
+                // XMTP Conversations Section
+                sectionDivider
+                xmtpSection
+                    .padding(.vertical, 8)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.vertical, 6)
@@ -511,6 +518,138 @@ extension LocationChannelsSheet {
         .padding(12)
         .background(Color.secondary.opacity(0.12))
         .cornerRadius(8)
+    }
+    
+    private var xmtpSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button(action: { showXMTPConversations.toggle() }) {
+                HStack {
+                    Text("#xmtp")
+                        .font(.bitchatSystem(size: 14, weight: .semibold, design: .monospaced))
+                        .foregroundColor(xmtpOrange)
+                    
+                    if xmtpContainer.isInitialized {
+                        let contactCount = xmtpContainer.clientService.savedContacts.count
+                        Text("[\(contactCount) saved]")
+                            .font(.bitchatSystem(size: 12, design: .monospaced))
+                            .foregroundColor(.secondary)
+                    } else {
+                        Text("[not connected]")
+                            .font(.bitchatSystem(size: 12, design: .monospaced))
+                            .foregroundColor(.secondary)
+                    }
+                    
+                    Spacer()
+                    
+                    Image(systemName: showXMTPConversations ? "chevron.up" : "chevron.down")
+                        .font(.bitchatSystem(size: 12))
+                        .foregroundColor(.secondary)
+                }
+            }
+            .buttonStyle(.plain)
+            
+            if showXMTPConversations {
+                xmtpConversationsList
+            }
+        }
+        .padding(12)
+        .background(xmtpOrange.opacity(0.08))
+        .cornerRadius(8)
+    }
+    
+    @ViewBuilder
+    private var xmtpConversationsList: some View {
+        if !xmtpContainer.isInitialized {
+            Text("Connect wallet in settings to use XMTP")
+                .font(.bitchatSystem(size: 11, design: .monospaced))
+                .foregroundColor(.secondary)
+                .padding(.top, 4)
+        } else {
+            let contacts = xmtpContainer.clientService.savedContacts
+            let privateChats = viewModel.privateChats.filter { $0.key.isXMTPDM }
+            
+            if contacts.isEmpty && privateChats.isEmpty {
+                Text("No XMTP conversations yet.\nUse /dm-wallet <inbox-id> to start one.")
+                    .font(.bitchatSystem(size: 11, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .padding(.top, 4)
+            } else {
+                VStack(spacing: 0) {
+                    // Show saved contacts first
+                    ForEach(contacts) { contact in
+                        xmtpContactRow(contact)
+                    }
+                    
+                    // Show unsaved conversations
+                    let unsavedPeers = privateChats.keys.filter { peerID in
+                        !contacts.contains { $0.peerID == peerID }
+                    }
+                    ForEach(Array(unsavedPeers), id: \.self) { peerID in
+                        xmtpPeerRow(peerID)
+                    }
+                }
+            }
+        }
+    }
+    
+    private func xmtpContactRow(_ contact: XMTPContact) -> some View {
+        Button(action: {
+            viewModel.selectedPrivateChatPeer = contact.peerID
+            isPresented = false
+        }) {
+            HStack {
+                Image(systemName: "star.fill")
+                    .font(.bitchatSystem(size: 10))
+                    .foregroundColor(xmtpOrange)
+                
+                Text(contact.displayName)
+                    .font(.bitchatSystem(size: 12, design: .monospaced))
+                    .foregroundColor(.primary)
+                
+                Spacer()
+                
+                // Unread indicator
+                if viewModel.unreadPrivateMessages.contains(contact.peerID) {
+                    Circle()
+                        .fill(xmtpOrange)
+                        .frame(width: 8, height: 8)
+                }
+            }
+            .padding(.vertical, 6)
+        }
+        .buttonStyle(.plain)
+    }
+    
+    private func xmtpPeerRow(_ peerID: PeerID) -> some View {
+        Button(action: {
+            viewModel.selectedPrivateChatPeer = peerID
+            isPresented = false
+        }) {
+            HStack {
+                Image(systemName: "bubble.left")
+                    .font(.bitchatSystem(size: 10))
+                    .foregroundColor(.secondary)
+                
+                Text("XMTP:\(peerID.bare.prefix(8))…")
+                    .font(.bitchatSystem(size: 12, design: .monospaced))
+                    .foregroundColor(.primary)
+                
+                Spacer()
+                
+                // Unread indicator
+                if viewModel.unreadPrivateMessages.contains(peerID) {
+                    Circle()
+                        .fill(xmtpOrange)
+                        .frame(width: 8, height: 8)
+                }
+            }
+            .padding(.vertical, 6)
+        }
+        .buttonStyle(.plain)
+    }
+    
+    private var xmtpOrange: Color {
+        Color.orange
     }
 
     private var standardGreen: Color {

@@ -42,6 +42,12 @@ extension ChatViewModel {
             return
         }
         
+        // XMTP DM routing: peer IDs start with "xmtp_"
+        if peerID.isXMTPDM {
+            sendXMTPDM(content, to: peerID)
+            return
+        }
+        
         // Determine routing method and recipient nickname
         guard let noiseKey = Data(hexString: peerID.id) else { return }
         let isConnected = meshService.isPeerConnected(peerID)
@@ -188,6 +194,69 @@ extension ChatViewModel {
             }
         }
     }
+    
+    /// Send a private message via XMTP
+    func sendXMTPDM(_ content: String, to peerID: PeerID) {
+        guard XMTPServiceContainer.isConfigured, XMTPServiceContainer.shared.isInitialized else {
+            addSystemMessage("❌ XMTP not connected")
+            return
+        }
+        
+        // Get the truncated ID (the bare part, without "xmtp_" prefix)
+        let truncatedId = peerID.bare
+        
+        // Look up the full inbox ID from the map
+        guard let fullInboxId = XMTPServiceContainer.shared.clientService.inboxIdMap[truncatedId] else {
+            addSystemMessage("❌ XMTP inbox ID not found. Try /dm-wallet again.")
+            SecureLogger.error("XMTP inbox ID not in map: \(truncatedId)", category: .network)
+            return
+        }
+        
+        let messageID = UUID().uuidString
+        
+        // Create local message
+        let message = BitchatMessage(
+            id: messageID,
+            sender: nickname,
+            content: content,
+            timestamp: Date(),
+            isRelay: false,
+            isPrivate: true,
+            recipientNickname: "XMTP:\(truncatedId.prefix(8))…",
+            senderPeerID: meshService.myPeerID,
+            deliveryStatus: .sending
+        )
+        
+        if privateChats[peerID] == nil {
+            privateChats[peerID] = []
+        }
+        privateChats[peerID]?.append(message)
+        objectWillChange.send()
+        
+        // Send via XMTP
+        Task {
+            do {
+                try await XMTPServiceContainer.shared.clientService.sendMessage(content, toInboxId: fullInboxId)
+                
+                // Update delivery status to sent
+                await MainActor.run {
+                    if let idx = self.privateChats[peerID]?.firstIndex(where: { $0.id == messageID }) {
+                        self.privateChats[peerID]?[idx].deliveryStatus = .sent
+                    }
+                    self.objectWillChange.send()
+                }
+                SecureLogger.debug("📤 XMTP message sent to \(fullInboxId.prefix(8))…", category: .network)
+            } catch {
+                await MainActor.run {
+                    if let idx = self.privateChats[peerID]?.firstIndex(where: { $0.id == messageID }) {
+                        self.privateChats[peerID]?[idx].deliveryStatus = .failed(reason: error.localizedDescription)
+                    }
+                    self.objectWillChange.send()
+                }
+                SecureLogger.error("XMTP send failed: \(error)", category: .network)
+            }
+        }
+    }
 
     // MARK: - Private Chat Handling (Geohash/Ephemeral)
 
@@ -311,6 +380,12 @@ extension ChatViewModel {
 
     @MainActor
     func sendVoiceNote(at url: URL) {
+        // Route to XMTP if in an XMTP conversation
+        if let peer = selectedPrivateChatPeer, peer.isXMTPDM {
+            sendXMTPVoiceNote(from: url, to: peer)
+            return
+        }
+        
         guard canSendMediaInCurrentContext else {
             SecureLogger.info("Voice note blocked outside mesh/private context", category: .session)
             try? FileManager.default.removeItem(at: url)
@@ -366,6 +441,13 @@ extension ChatViewModel {
 
     @MainActor
     func sendImage(from sourceURL: URL, cleanup: (() -> Void)? = nil) {
+        // Route to XMTP if in an XMTP conversation
+        if let peer = selectedPrivateChatPeer, peer.isXMTPDM {
+            sendXMTPImage(from: sourceURL, to: peer)
+            cleanup?()
+            return
+        }
+        
         guard canSendMediaInCurrentContext else {
             SecureLogger.info("Image send blocked outside mesh/private context", category: .session)
             cleanup?()

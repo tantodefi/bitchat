@@ -172,6 +172,9 @@ final class MessageDeduplicationService {
     /// Cache for Nostr ACK deduplication (messageId:ackType:senderPubkey format)
     private let nostrAckCache: LRUDeduplicationCache<Bool>
 
+    /// Cache for XMTP message ID deduplication
+    private let xmtpMessageCache: LRUDeduplicationCache<Bool>
+
     /// Creates a new deduplication service with specified capacities.
     /// - Parameters:
     ///   - contentCapacity: Max entries for content cache
@@ -183,6 +186,7 @@ final class MessageDeduplicationService {
         self.contentCache = LRUDeduplicationCache(capacity: contentCapacity)
         self.nostrEventCache = LRUDeduplicationCache(capacity: nostrEventCapacity)
         self.nostrAckCache = LRUDeduplicationCache(capacity: nostrEventCapacity)
+        self.xmtpMessageCache = LRUDeduplicationCache(capacity: nostrEventCapacity)
     }
 
     // MARK: - Content Deduplication
@@ -261,6 +265,21 @@ final class MessageDeduplicationService {
         "\(messageId):\(ackType):\(senderPubkey)"
     }
 
+    // MARK: - XMTP Message Deduplication
+
+    /// Checks if an XMTP message has already been processed.
+    /// - Parameter messageId: The XMTP message ID
+    /// - Returns: true if already processed
+    func hasProcessedXMTPMessage(_ messageId: String) -> Bool {
+        xmtpMessageCache.contains(messageId)
+    }
+
+    /// Records an XMTP message as processed.
+    /// - Parameter messageId: The XMTP message ID
+    func recordXMTPMessage(_ messageId: String) {
+        xmtpMessageCache.record(messageId, value: true)
+    }
+
     // MARK: - Clear
 
     /// Clears all caches
@@ -268,11 +287,17 @@ final class MessageDeduplicationService {
         contentCache.clear()
         nostrEventCache.clear()
         nostrAckCache.clear()
+        xmtpMessageCache.clear()
     }
 
     /// Clears only the Nostr caches (events and ACKs)
     func clearNostrCaches() {
         nostrEventCache.clear()
         nostrAckCache.clear()
+    }
+
+    /// Clears only the XMTP message cache
+    func clearXMTPCache() {
+        xmtpMessageCache.clear()
     }
 }

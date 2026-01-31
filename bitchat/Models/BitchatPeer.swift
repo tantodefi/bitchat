@@ -20,6 +20,7 @@ struct BitchatPeer: Equatable {
     enum ConnectionState {
         case bluetoothConnected
         case meshReachable      // Seen via mesh recently, not directly connected
+        case xmtpAvailable      // Mutual favorite, reachable via XMTP wallet messaging
         case nostrAvailable     // Mutual favorite, reachable via Nostr
         case offline            // Not connected via any transport
     }
@@ -29,12 +30,20 @@ struct BitchatPeer: Equatable {
             return .bluetoothConnected
         } else if isReachable {
             return .meshReachable
+        } else if favoriteStatus?.isMutual == true && favoriteStatus?.isXMTPReachable == true {
+            // Mutual favorites with XMTP inbox can communicate via XMTP
+            return .xmtpAvailable
         } else if favoriteStatus?.isMutual == true {
             // Mutual favorites can communicate via Nostr when offline
             return .nostrAvailable
         } else {
             return .offline
         }
+    }
+    
+    /// Check if this peer is reachable via XMTP
+    var isXMTPReachable: Bool {
+        favoriteStatus?.isXMTPReachable ?? false
     }
     
     var isFavorite: Bool {
@@ -60,6 +69,8 @@ struct BitchatPeer: Equatable {
             return "📻" // Radio icon for mesh connection
         case .meshReachable:
             return "📡" // Antenna for mesh reachable
+        case .xmtpAvailable:
+            return "💳" // Card/wallet for XMTP
         case .nostrAvailable:
             return "🌐" // Purple globe for Nostr
         case .offline:

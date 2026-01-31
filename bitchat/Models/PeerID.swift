@@ -22,6 +22,8 @@ struct PeerID: Equatable, Hashable {
         case geoDM = "nostr_"
         /// `"nostr:"` (+ 8 characters hex)
         case geoChat = "nostr:"
+        /// `"xmtp_"` (+ 16 characters hex)
+        case xmtpDM = "xmtp_"
     }
     
     let prefix: Prefix
@@ -50,6 +52,11 @@ extension PeerID {
     /// Convenience init to create GeoChat PeerID by appending `"nostr:"` to the first 8 characters of `pubKey`
     init(nostr pubKey: String) {
         self.init(prefix: .geoChat, bare: pubKey.prefix(TransportConfig.nostrShortKeyDisplayLength))
+    }
+    
+    /// Convenience init to create XMTP DM PeerID by appending `"xmtp_"` to the first 16 characters of `inboxId`
+    init(xmtp inboxId: String) {
+        self.init(prefix: .xmtpDM, bare: inboxId.prefix(TransportConfig.nostrConvKeyPrefixLength))
     }
     
     /// Convenience init to create PeerID from String/Substring by splitting it into prefix and bare parts
@@ -129,6 +136,11 @@ extension PeerID {
     /// Returns true if `id` starts with "`nostr_`"
     var isGeoDM: Bool {
         prefix == .geoDM
+    }
+    
+    /// Returns true if `id` starts with "`xmtp_`"
+    var isXMTPDM: Bool {
+        prefix == .xmtpDM
     }
     
     func toPercentEncoded() -> String {

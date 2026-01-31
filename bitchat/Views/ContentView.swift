@@ -33,6 +33,7 @@ struct ContentView: View {
     // MARK: - Properties
     
     @EnvironmentObject var viewModel: ChatViewModel
+    @EnvironmentObject var xmtpContainer: XMTPServiceContainer
     @ObservedObject private var locationManager = LocationChannelManager.shared
     @ObservedObject private var bookmarks = GeohashBookmarksStore.shared
     @State private var messageText = ""
@@ -63,6 +64,7 @@ struct ContentView: View {
     @State private var isPreparingVoiceNote = false
     @State private var recordingDuration: TimeInterval = 0
     @State private var recordingTimer: Timer?
+    @State private var showWalletView = false
     @State private var recordingStartDate: Date?
 #if os(iOS)
     @State private var showImagePicker = false
@@ -188,8 +190,19 @@ struct ContentView: View {
         .sheet(isPresented: $showAppInfo) {
             AppInfoView()
                 .environmentObject(viewModel)
+                .environmentObject(xmtpContainer)
                 .onAppear { viewModel.isAppInfoPresented = true }
                 .onDisappear { viewModel.isAppInfoPresented = false }
+        }
+        .sheet(isPresented: $showWalletView) {
+            NavigationStack {
+                WalletView(wallet: xmtpContainer.wallet)
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Done") { showWalletView = false }
+                        }
+                    }
+            }
         }
         .sheet(isPresented: Binding(
             get: { viewModel.showingFingerprintFor != nil },
@@ -1066,6 +1079,11 @@ struct ContentView: View {
                             .font(.bitchatSystem(size: 14))
                             .foregroundColor(textColor)
                             .accessibilityLabel(String(localized: "content.accessibility.reachable_mesh", comment: "Accessibility label for mesh-reachable peer indicator"))
+                    case .xmtpAvailable:
+                        Image(systemName: "wallet.pass.fill")
+                            .font(.bitchatSystem(size: 14))
+                            .foregroundColor(.blue)
+                            .accessibilityLabel(String(localized: "content.accessibility.available_xmtp", comment: "Accessibility label for XMTP-available peer indicator"))
                     case .nostrAvailable:
                         Image(systemName: "globe")
                             .font(.bitchatSystem(size: 14))
@@ -1253,6 +1271,15 @@ struct ContentView: View {
             }()
 
             HStack(spacing: 10) {
+                // XMTP/Wallet status indicator
+                Button(action: { showWalletView = true }) {
+                    Image(systemName: xmtpContainer.clientService.isConnected ? "wallet.pass.fill" : "wallet.pass")
+                        .font(.bitchatSystem(size: 12))
+                        .foregroundColor(xmtpContainer.clientService.isConnected ? Color.green : Color.secondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(xmtpContainer.clientService.isConnected ? "Wallet connected" : "Wallet disconnected")
+                
                 // Unread icon immediately to the left of the channel badge (independent from channel button)
                 
                 // Unread indicator (now shown on iOS and macOS)

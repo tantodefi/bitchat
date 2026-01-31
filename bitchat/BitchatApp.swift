@@ -16,6 +16,7 @@ struct BitchatApp: App {
     static let groupID = "group.\(bundleID)"
     
     @StateObject private var chatViewModel: ChatViewModel
+    @StateObject private var xmtpContainer: XMTPServiceContainer
     #if os(iOS)
     @Environment(\.scenePhase) var scenePhase
     @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
@@ -39,6 +40,11 @@ struct BitchatApp: App {
             )
         )
         
+        // Initialize XMTP service container
+        _xmtpContainer = StateObject(
+            wrappedValue: XMTPServiceContainer.configure(keychain: keychain)
+        )
+        
         UNUserNotificationCenter.current().delegate = NotificationDelegate.shared
         // Warm up georelay directory and refresh if stale (once/day)
         GeoRelayDirectory.shared.prefetchIfNeeded()
@@ -48,6 +54,7 @@ struct BitchatApp: App {
         WindowGroup {
             ContentView()
                 .environmentObject(chatViewModel)
+                .environmentObject(xmtpContainer)
                 .onAppear {
                     NotificationDelegate.shared.chatViewModel = chatViewModel
                     // Inject live Noise service into VerificationService to avoid creating new BLE instances
@@ -66,6 +73,19 @@ struct BitchatApp: App {
                     
                     // Start presence service (will wait for Tor readiness)
                     GeohashPresenceService.shared.start()
+                    
+                    // Initialize XMTP services asynchronously
+                    Task {
+                        await xmtpContainer.initialize()
+                        // Wire up BLE service for transaction relay (if transport is BLEService)
+                        if let bleService = chatViewModel.meshService as? BLEService {
+                            xmtpContainer.configureBLEService(bleService)
+                        }
+                        // Set up XMTP delegate for incoming messages
+                        await MainActor.run {
+                            chatViewModel.setupXMTPDelegate()
+                        }
+                    }
 
                     // Check for shared content
                     checkForSharedContent()

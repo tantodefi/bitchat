@@ -16,7 +16,8 @@ final class AutocompleteService {
     private let commands = [
         "/msg", "/who", "/clear",
         "/hug", "/slap", "/fav", "/unfav",
-        "/block", "/unblock"
+        "/block", "/unblock",
+        "/xmtp", "/dm-wallet", "/xmtp-sync", "/xmtp-list"
     ]
     
     /// Get autocomplete suggestions for current text
@@ -95,7 +96,7 @@ final class AutocompleteService {
     
     private func needsArgument(command: String) -> Bool {
         switch command {
-        case "/who", "/clear":
+        case "/who", "/clear", "/xmtp", "/xmtp-sync", "/xmtp-list":
             return false
         default:
             return true

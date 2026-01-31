@@ -1,0 +1,36 @@
+PODS:
+  - Connect-Swift (1.2.0):
+    - SwiftProtobuf (~> 1.30.0)
+  - CryptoSwift (1.8.3)
+  - SQLCipher (4.5.7):
+    - SQLCipher/standard (= 4.5.7)
+  - SQLCipher/common (4.5.7)
+  - SQLCipher/standard (4.5.7):
+    - SQLCipher/common
+  - SwiftProtobuf (1.30.0)
+  - XMTP (4.9.0):
+    - Connect-Swift (~> 1.2.0)
+    - CryptoSwift (= 1.8.3)
+    - SQLCipher (= 4.5.7)
+
+DEPENDENCIES:
+  - XMTP (~> 4.9.0)
+
+SPEC REPOS:
+  trunk:
+    - Connect-Swift
+    - CryptoSwift
+    - SQLCipher
+    - SwiftProtobuf
+    - XMTP
+
+SPEC CHECKSUMS:
+  Connect-Swift: 82bcc0834587bd537f17a9720f62ea9fc7d9f3a5
+  CryptoSwift: 967f37cea5a3294d9cce358f78861652155be483
+  SQLCipher: 5e6bfb47323635c8b657b1b27d25c5f1baf63bf5
+  SwiftProtobuf: 3697407f0d5b23bedeba9c2eaaf3ec6fdff69349
+  XMTP: 322f5be971dca2b1f402727ffda2f62d4ab7f71d
+
+PODFILE CHECKSUM: c41012e14c9e7f7be9d4cafcd676efe97c54ec9f
+
+COCOAPODS: 1.16.2

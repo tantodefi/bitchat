@@ -1,7 +1,8 @@
 import BitLogger
 import Foundation
 
-/// Routes messages using available transports (Mesh, Nostr, etc.)
+/// Routes messages using available transports (Mesh, XMTP, etc.)
+/// Transport priority: BLE (direct) > XMTP (internet) > Queue (offline)
 @MainActor
 final class MessageRouter {
     private let transports: [Transport]
@@ -23,7 +24,7 @@ final class MessageRouter {
     init(transports: [Transport]) {
         self.transports = transports
 
-        // Observe favorites changes to learn Nostr mapping and flush queued messages
+        // Observe favorites changes to learn XMTP mapping and flush queued messages
         NotificationCenter.default.addObserver(
             forName: .favoriteStatusChanged,
             object: nil,
@@ -44,24 +45,50 @@ final class MessageRouter {
                     self.flushOutbox(for: peerID)
                 }
             }
+            // Handle XMTP inbox ID updates
+            if let _ = note.userInfo?["xmtpInboxId"] as? String {
+                if let data = note.userInfo?["peerPublicKey"] as? Data {
+                    let peerID = PeerID(publicKey: data)
+                    Task { @MainActor in
+                        self.flushOutbox(for: peerID)
+                    }
+                }
+            }
         }
     }
 
     // MARK: - Transport Selection
-
-    private func reachableTransport(for peerID: PeerID) -> Transport? {
-        transports.first { $0.isPeerReachable(peerID) }
-    }
-
+    
+    /// Find a transport that can reach the peer directly (BLE connected)
     private func connectedTransport(for peerID: PeerID) -> Transport? {
         transports.first { $0.isPeerConnected(peerID) }
+    }
+
+    /// Find any transport that can reach the peer (BLE or XMTP)
+    /// Priority: BLE first (lower latency), then XMTP
+    private func reachableTransport(for peerID: PeerID) -> Transport? {
+        // First try to find a directly connected BLE transport
+        if let connected = transports.first(where: { $0.isPeerConnected(peerID) }) {
+            return connected
+        }
+        // Then try any reachable transport (includes XMTP)
+        return transports.first { $0.isPeerReachable(peerID) }
+    }
+    
+    /// Get the preferred transport type name for logging
+    private func transportTypeName(_ transport: Transport) -> String {
+        let typeName = String(describing: type(of: transport))
+        if typeName.contains("BLE") { return "BLE" }
+        if typeName.contains("XMTP") { return "XMTP" }
+        return typeName
     }
 
     // MARK: - Message Sending
 
     func sendPrivate(_ content: String, to peerID: PeerID, recipientNickname: String, messageID: String) {
         if let transport = reachableTransport(for: peerID) {
-            SecureLogger.debug("Routing PM via \(type(of: transport)) to \(peerID.id.prefix(8))… id=\(messageID.prefix(8))…", category: .session)
+            let transportName = transportTypeName(transport)
+            SecureLogger.debug("Routing PM via \(transportName) to \(peerID.id.prefix(8))… id=\(messageID.prefix(8))…", category: .session)
             transport.sendPrivateMessage(content, to: peerID, recipientNickname: recipientNickname, messageID: messageID)
         } else {
             // Queue for later with timestamp for TTL tracking
@@ -82,7 +109,8 @@ final class MessageRouter {
 
     func sendReadReceipt(_ receipt: ReadReceipt, to peerID: PeerID) {
         if let transport = reachableTransport(for: peerID) {
-            SecureLogger.debug("Routing READ ack via \(type(of: transport)) to \(peerID.id.prefix(8))… id=\(receipt.originalMessageID.prefix(8))…", category: .session)
+            let transportName = transportTypeName(transport)
+            SecureLogger.debug("Routing READ ack via \(transportName) to \(peerID.id.prefix(8))… id=\(receipt.originalMessageID.prefix(8))…", category: .session)
             transport.sendReadReceipt(receipt, to: peerID)
         } else if !transports.isEmpty {
             SecureLogger.debug("No reachable transport for READ ack to \(peerID.id.prefix(8))…", category: .session)
@@ -91,7 +119,8 @@ final class MessageRouter {
 
     func sendDeliveryAck(_ messageID: String, to peerID: PeerID) {
         if let transport = reachableTransport(for: peerID) {
-            SecureLogger.debug("Routing DELIVERED ack via \(type(of: transport)) to \(peerID.id.prefix(8))… id=\(messageID.prefix(8))…", category: .session)
+            let transportName = transportTypeName(transport)
+            SecureLogger.debug("Routing DELIVERED ack via \(transportName) to \(peerID.id.prefix(8))… id=\(messageID.prefix(8))…", category: .session)
             transport.sendDeliveryAck(for: messageID, to: peerID)
         }
     }
@@ -121,7 +150,8 @@ final class MessageRouter {
             }
 
             if let transport = reachableTransport(for: peerID) {
-                SecureLogger.debug("Outbox -> \(type(of: transport)) for \(peerID.id.prefix(8))… id=\(message.messageID.prefix(8))…", category: .session)
+                let transportName = transportTypeName(transport)
+                SecureLogger.debug("Outbox -> \(transportName) for \(peerID.id.prefix(8))… id=\(message.messageID.prefix(8))…", category: .session)
                 transport.sendPrivateMessage(message.content, to: peerID, recipientNickname: message.nickname, messageID: message.messageID)
             } else {
                 remaining.append(message)
