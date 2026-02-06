@@ -120,6 +120,189 @@ actor EmbeddedWallet {
         keychain.load(key: privateKeyName, service: keychainService) != nil
     }
     
+    // MARK: - Transaction Signing
+    
+    /// Sign an EIP-1559 transaction and return the RLP-encoded signed transaction
+    /// - Parameters:
+    ///   - chainId: Chain ID (e.g., 1 for mainnet, 11155111 for Sepolia)
+    ///   - nonce: Transaction nonce
+    ///   - maxPriorityFeePerGas: Max priority fee in wei
+    ///   - maxFeePerGas: Max fee per gas in wei
+    ///   - gasLimit: Gas limit
+    ///   - to: Destination address (hex string with 0x prefix)
+    ///   - value: Value in wei
+    ///   - data: Call data (empty for simple transfers)
+    /// - Returns: RLP-encoded signed transaction ready for broadcast
+    func signTransaction(
+        chainId: UInt64,
+        nonce: UInt64,
+        maxPriorityFeePerGas: UInt64,
+        maxFeePerGas: UInt64,
+        gasLimit: UInt64,
+        to: String,
+        value: UInt64,
+        data: Data = Data()
+    ) throws -> Data {
+        let privateKey = try getOrCreatePrivateKey()
+        
+        // Build unsigned EIP-1559 transaction (type 2)
+        // RLP([chainId, nonce, maxPriorityFeePerGas, maxFeePerGas, gasLimit, to, value, data, accessList])
+        let toAddress = Data(hexString: to.hasPrefix("0x") ? String(to.dropFirst(2)) : to) ?? Data()
+        
+        let unsignedTx: [Any] = [
+            rlpEncode(chainId),
+            rlpEncode(nonce),
+            rlpEncode(maxPriorityFeePerGas),
+            rlpEncode(maxFeePerGas),
+            rlpEncode(gasLimit),
+            toAddress,
+            rlpEncode(value),
+            data,
+            [] as [Any] // Empty access list
+        ]
+        
+        // RLP encode the unsigned transaction
+        let encodedUnsigned = rlpEncodeList(unsignedTx)
+        
+        // Hash with EIP-1559 type prefix (0x02)
+        var toHash = Data([0x02])
+        toHash.append(encodedUnsigned)
+        let txHash = keccak256(toHash)
+        
+        // Sign the hash
+        let signature = try signTransactionHash(txHash, privateKey: privateKey)
+        
+        // Extract r, s, v from signature
+        // Important: Convert slices to fresh Data and strip leading zeros for canonical encoding
+        var r = Data(signature[0..<32])
+        var s = Data(signature[32..<64])
+        let v = signature[64] // Recovery ID (0 or 1 for EIP-1559)
+        
+        // Strip leading zeros from r and s (required for canonical RLP encoding)
+        while r.first == 0 && r.count > 1 {
+            r.removeFirst()
+        }
+        while s.first == 0 && s.count > 1 {
+            s.removeFirst()
+        }
+        
+        // Build signed transaction
+        // RLP([chainId, nonce, maxPriorityFeePerGas, maxFeePerGas, gasLimit, to, value, data, accessList, v, r, s])
+        let signedTx: [Any] = [
+            rlpEncode(chainId),
+            rlpEncode(nonce),
+            rlpEncode(maxPriorityFeePerGas),
+            rlpEncode(maxFeePerGas),
+            rlpEncode(gasLimit),
+            toAddress,
+            rlpEncode(value),
+            data,
+            [] as [Any], // Empty access list
+            rlpEncode(UInt64(v)), // Recovery ID (0 or 1)
+            r,
+            s
+        ]
+        
+        let encodedSigned = rlpEncodeList(signedTx)
+        
+        // Prepend type byte for EIP-1559
+        var result = Data([0x02])
+        result.append(encodedSigned)
+        
+        return result
+    }
+    
+    /// Sign a transaction hash (keccak256 of unsigned tx)
+    /// Returns 65-byte signature: r (32) || s (32) || v (1) where v is raw recovery ID (0 or 1)
+    private func signTransactionHash(_ hash: Data, privateKey: Data) throws -> Data {
+        guard hash.count == 32, privateKey.count == 32 else {
+            throw WalletError.invalidSignatureInput
+        }
+        
+        do {
+            // Use P256K.Recovery for recoverable secp256k1 signature
+            let privKey = try P256K.Recovery.PrivateKey(dataRepresentation: privateKey, format: .uncompressed)
+            
+            // CRITICAL: Use HashDigest (which conforms to Digest) to sign the RAW hash
+            // If we pass Data directly, P256K will SHA256 hash it again (double-hashing = wrong signature)
+            let digest = HashDigest(Array(hash))
+            let recoverySignature = try privKey.signature(for: digest)
+            
+            // Log the address being used for debugging
+            if let knownAddress = cachedAddress {
+                // Use print for unredacted address logging during debug
+                print("📍 [TX DEBUG] Signing with cached address: \(knownAddress)")
+                SecureLogger.debug("📍 Signing tx hash with address: \(knownAddress)", category: .session)
+            }
+            
+            // Get compact representation with recovery ID
+            let compact = try recoverySignature.compactRepresentation
+            
+            // EIP-1559 transaction format: r (32 bytes) || s (32 bytes) || v (1 byte)
+            // v = raw recoveryId (0 or 1), NOT the legacy 27/28 format
+            var fullSignature = compact.signature  // 64 bytes: r || s
+            let v = UInt8(compact.recoveryId)      // 0 or 1
+            fullSignature.append(v)
+            
+            SecureLogger.debug("📍 Signature v (recovery ID): \(v)", category: .session)
+            
+            return fullSignature // 65 bytes total
+        } catch {
+            throw WalletError.signingFailed
+        }
+    }
+    
+    // MARK: - RLP Encoding Helpers
+    
+    private func rlpEncode(_ value: UInt64) -> Data {
+        if value == 0 {
+            return Data() // Empty data represents 0 - will be encoded as 0x80 by rlpEncodeBytes
+        }
+        var bytes = withUnsafeBytes(of: value.bigEndian) { Data($0) }
+        // Remove leading zeros
+        while bytes.first == 0 && bytes.count > 1 {
+            bytes.removeFirst()
+        }
+        return bytes
+    }
+    
+    private func rlpEncodeList(_ items: [Any]) -> Data {
+        var payload = Data()
+        for item in items {
+            if let data = item as? Data {
+                payload.append(rlpEncodeBytes(data))
+            } else if let list = item as? [Any] {
+                payload.append(rlpEncodeList(list))
+            }
+        }
+        return rlpEncodeLength(payload.count, offset: 0xc0) + payload
+    }
+    
+    private func rlpEncodeBytes(_ data: Data) -> Data {
+        // Empty data is encoded as 0x80
+        if data.isEmpty {
+            return Data([0x80])
+        }
+        // Single byte < 0x80 is encoded as itself
+        // Use .first to handle Data slices with non-zero startIndex
+        if data.count == 1, let firstByte = data.first, firstByte < 0x80 {
+            return Data([firstByte])
+        }
+        // Ensure we return fresh Data (not a slice) for proper concatenation
+        return rlpEncodeLength(data.count, offset: 0x80) + Data(data)
+    }
+    
+    private func rlpEncodeLength(_ length: Int, offset: UInt8) -> Data {
+        if length < 56 {
+            return Data([offset + UInt8(length)])
+        }
+        var lenBytes = withUnsafeBytes(of: UInt64(length).bigEndian) { Data($0) }
+        while lenBytes.first == 0 {
+            lenBytes.removeFirst()
+        }
+        return Data([offset + 55 + UInt8(lenBytes.count)]) + lenBytes
+    }
+    
     // MARK: - Private Helpers
     
     private func derivePublicKey(from privateKey: Data) throws -> Data {

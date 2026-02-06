@@ -113,6 +113,10 @@ final class CommandProcessor {
             return handleXMTPSync()
         case "/xmtp-list":
             return handleXMTPList()
+        case "/tx":
+            return handleTxStatus()
+        case "/wallet":
+            return handleWalletStatus()
         default:
             return .error(message: "unknown command: \(cmd)")
         }
@@ -475,6 +479,59 @@ final class CommandProcessor {
         }
         
         return .handled
+    }
+    
+    // MARK: - Transaction Commands
+    
+    private func handleTxStatus() -> CommandResult {
+        guard XMTPServiceContainer.isConfigured, XMTPServiceContainer.shared.isInitialized else {
+            return .error(message: "XMTP not connected. Enable XMTP in Settings first.")
+        }
+        
+        let relay = XMTPServiceContainer.shared.meshTransactionRelay
+        let pending = relay.pendingRelays
+        
+        if pending.isEmpty {
+            return .success(message: "📋 No pending transactions.\nUse Wallet → Send to create a transaction.")
+        }
+        
+        var status = "📋 Pending Transactions (\(pending.count)):\n"
+        for (index, tx) in pending.prefix(5).enumerated() {
+            let chainId = tx.payload.chainId
+            let chainName = chainId == 1 ? "ETH" : (chainId == 11155111 ? "Sepolia" : "Chain \(chainId)")
+            let desc = tx.payload.description ?? "Transaction"
+            status += "  \(index + 1). \(desc) [\(chainName)]\n"
+            status += "     Nonce: \(tx.payload.nonce), Gas: \(tx.payload.gasLimit), Status: \(tx.status.rawValue)\n"
+        }
+        if pending.count > 5 {
+            status += "  … and \(pending.count - 5) more"
+        }
+        
+        return .success(message: status)
+    }
+    
+    private func handleWalletStatus() -> CommandResult {
+        guard XMTPServiceContainer.isConfigured, XMTPServiceContainer.shared.isInitialized else {
+            return .error(message: "XMTP/Wallet not connected. Enable XMTP in Settings first.")
+        }
+        
+        let balance = XMTPServiceContainer.shared.balanceService
+        let network = balance.useTestnet ? "Sepolia Testnet" : "Ethereum Mainnet"
+        
+        var status = "💰 Wallet Status\n"
+        status += "  Network: \(network)\n"
+        
+        // Show balances
+        let networks = balance.useTestnet ? EthereumBalanceService.Network.testnets : EthereumBalanceService.Network.mainnets
+        for net in networks {
+            if let bal = balance.balances[net] {
+                status += "  \(net.rawValue): \(bal.formattedETH) ETH\n"
+            }
+        }
+        
+        status += "\nUse Wallet view to send/receive."
+        
+        return .success(message: status)
     }
     
 }

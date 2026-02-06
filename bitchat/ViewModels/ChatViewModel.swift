@@ -466,6 +466,11 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         loadVerifiedFingerprints()
         meshService.delegate = self
         
+        // Wire up XMTP location channels delegate if available
+        if XMTPServiceContainer.isConfigured {
+            XMTPServiceContainer.shared.locationChannels.delegate = self
+        }
+        
         // Log startup info
         
         // Log fingerprint after a delay to ensure encryption service is ready
@@ -3689,6 +3694,30 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
     @MainActor
     func sendPublicRaw(_ content: String) {
         if case .location(let ch) = activeChannel {
+            // Check if we should use XMTP for geo channels
+            if TransportPreferences.shared.geoTransport == .xmtp,
+               XMTPServiceContainer.isConfigured,
+               XMTPServiceContainer.shared.isInitialized {
+                Task { @MainActor in
+                    do {
+                        let locationChannels = XMTPServiceContainer.shared.locationChannels
+                        
+                        // Ensure we're in the channel
+                        if locationChannels.activeChannels[ch.geohash]?.isJoined != true {
+                            try await locationChannels.joinChannel(geohash: ch.geohash)
+                        }
+                        
+                        // Send the message
+                        try await locationChannels.sendMessage(content, to: ch.geohash)
+                        SecureLogger.debug("📍 Sent XMTP geo raw message to \(ch.geohash)", category: .session)
+                    } catch {
+                        SecureLogger.error("❌ XMTP geo raw send failed: \(error.localizedDescription)", category: .session)
+                    }
+                }
+                return
+            }
+            
+            // Default: send via Nostr
             Task { @MainActor in
                 do {
                     let identity = try idBridge.deriveIdentity(forGeohash: ch.geohash)

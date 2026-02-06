@@ -226,6 +226,20 @@ extension ChatViewModel {
         currentGeohash = ch.geohash
         participantTracker.setActiveGeohash(ch.geohash)
         
+        // Join XMTP location channel if using XMTP for geo
+        if TransportPreferences.shared.geoTransport == .xmtp,
+           XMTPServiceContainer.isConfigured,
+           XMTPServiceContainer.shared.isInitialized {
+            Task {
+                do {
+                    try await XMTPServiceContainer.shared.locationChannels.joinChannel(geohash: ch.geohash)
+                    SecureLogger.info("📍 Joined XMTP geo channel: \(ch.geohash)", category: .session)
+                } catch {
+                    SecureLogger.error("❌ Failed to join XMTP geo channel: \(error.localizedDescription)", category: .session)
+                }
+            }
+        }
+        
         // Ensure self appears immediately in the people list; mark teleported state only when truly teleported
         if let id = try? idBridge.deriveIdentity(forGeohash: ch.geohash) {
             participantTracker.recordParticipant(pubkeyHex: id.publicKeyHex)
@@ -409,6 +423,48 @@ extension ChatViewModel {
 
     @MainActor
     func sendGeohash(context: GeoOutgoingContext) {
+        let ch = context.channel
+        let event = context.event
+        let identity = context.identity
+        
+        // Check if we should use XMTP for geo channels
+        if TransportPreferences.shared.geoTransport == .xmtp,
+           XMTPServiceContainer.isConfigured,
+           XMTPServiceContainer.shared.isInitialized {
+            // Send via XMTP location channels
+            Task { @MainActor in
+                do {
+                    let locationChannels = XMTPServiceContainer.shared.locationChannels
+                    
+                    // Ensure we're in the channel
+                    if locationChannels.activeChannels[ch.geohash]?.isJoined != true {
+                        try await locationChannels.joinChannel(geohash: ch.geohash)
+                    }
+                    
+                    // Send the message
+                    try await locationChannels.sendMessage(event.content, to: ch.geohash)
+                    
+                    // Track ourselves
+                    if let myInboxId = XMTPServiceContainer.shared.clientService.inboxId {
+                        participantTracker.recordXMTPParticipant(inboxId: myInboxId, nickname: nickname)
+                    }
+                    
+                    SecureLogger.debug("📍 Sent XMTP geo message to \(ch.geohash)", category: .session)
+                } catch {
+                    SecureLogger.error("❌ XMTP geo send failed: \(error.localizedDescription)", category: .session)
+                    // Fall back to Nostr on error
+                    sendGeohashViaNostr(context: context)
+                }
+            }
+            return
+        }
+        
+        // Default: send via Nostr
+        sendGeohashViaNostr(context: context)
+    }
+    
+    @MainActor
+    private func sendGeohashViaNostr(context: GeoOutgoingContext) {
         let ch = context.channel
         let event = context.event
         let identity = context.identity

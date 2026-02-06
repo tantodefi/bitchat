@@ -1,0 +1,586 @@
+//
+// MeshTransactionRelay.swift
+// bitchat
+//
+// Handles offline transaction relay through BLE mesh network.
+// Signs transactions locally and relays through peers with internet.
+//
+// This is free and unencumbered software released into the public domain.
+// For more information, see <https://unlicense.org>
+//
+
+import BitLogger
+import Combine
+import Foundation
+
+/// Service for relaying signed transactions through BLE mesh
+@MainActor
+final class MeshTransactionRelay: ObservableObject {
+    
+    // MARK: - Properties
+    
+    /// Pending transactions awaiting confirmation
+    @Published private(set) var pendingRelays: [PendingRelay] = []
+    
+    /// Recently confirmed transactions
+    @Published private(set) var confirmedTransactions: [ConfirmedTransaction] = []
+    
+    /// Relay strategy setting
+    @Published var allowMeshRelay: Bool {
+        didSet {
+            UserDefaults.standard.set(allowMeshRelay, forKey: "mesh-tx-relay-enabled")
+        }
+    }
+    
+    private let keychain: KeychainManagerProtocol
+    private weak var bleService: BLEService?
+    private let storageKey = "mesh-tx-pending-relays"
+    private var retryTask: Task<Void, Never>?
+    private var retryScheduled = false
+    
+    // Retry configuration
+    private let retryInterval: TimeInterval = 30 // Retry every 30 seconds
+    private let maxRetryAge: TimeInterval = 24 * 60 * 60 // Give up after 24 hours
+    
+    // RPC endpoints for broadcasting (prefer MEV-protected)
+    // Primary endpoints - use reliable RPCs
+    private let rpcEndpoints: [UInt64: String] = [
+        1: "https://rpc.flashbots.net",                      // Ethereum mainnet (Flashbots Protect)
+        11155111: "https://sepolia.drpc.org",                 // Sepolia testnet (dRPC - reliable)
+        8453: "https://mainnet.base.org"                     // Base mainnet
+    ]
+    
+    // Fallback RPC endpoints for reliability
+    private let fallbackRPCs: [UInt64: [String]] = [
+        1: ["https://eth.llamarpc.com", "https://rpc.ankr.com/eth"],
+        11155111: ["https://rpc2.sepolia.org", "https://1rpc.io/sepolia"],
+        8453: ["https://base.llamarpc.com", "https://rpc.ankr.com/base"]
+    ]
+    
+    // MARK: - Types
+    
+    struct PendingRelay: Codable, Identifiable {
+        let id: String
+        let payload: TxSignedPayload
+        let createdAt: Date
+        var relayedVia: String?
+        var status: RelayStatus
+        var retryCount: Int = 0
+    }
+    
+    enum RelayStatus: String, Codable {
+        case queued
+        case relaying
+        case awaitingConfirmation
+        case confirmed
+        case failed
+    }
+    
+    struct ConfirmedTransaction: Codable, Identifiable {
+        let id: String
+        let txHash: String
+        let chainId: UInt64
+        let toAddress: String
+        let amount: UInt64?
+        let currency: String?
+        let confirmedAt: Date
+        let blockNumber: UInt64?
+    }
+    
+    // MARK: - Initialization
+    
+    init(keychain: KeychainManagerProtocol) {
+        self.keychain = keychain
+        self.allowMeshRelay = UserDefaults.standard.bool(forKey: "mesh-tx-relay-enabled")
+        loadPendingRelays()
+        
+        // Start retry loop for any queued transactions
+        if !pendingRelays.isEmpty {
+            scheduleRetry()
+        }
+    }
+    
+    func configure(bleService: BLEService?) {
+        self.bleService = bleService
+    }
+    
+    // MARK: - Queue Management
+    
+    /// Queue a signed transaction for mesh relay
+    func queueTransaction(_ payload: TxSignedPayload) {
+        let relay = PendingRelay(
+            id: payload.requestId,
+            payload: payload,
+            createdAt: Date(),
+            relayedVia: nil,
+            status: .queued,
+            retryCount: 0
+        )
+        
+        pendingRelays.append(relay)
+        savePendingRelays()
+        
+        SecureLogger.info("📤 Queued tx for mesh relay: \(payload.requestId.prefix(8))…", category: .session)
+        
+        // Try to relay immediately
+        Task {
+            await attemptRelay(relay)
+        }
+    }
+    
+    /// Attempt to relay a pending transaction
+    private func attemptRelay(_ relay: PendingRelay) async {
+        // Always try direct broadcast first if we have internet
+        if await hasInternetConnectivity() {
+            SecureLogger.debug("Internet available, broadcasting tx directly", category: .session)
+            await broadcastTransaction(relay)
+            return
+        }
+        
+        // No internet - try mesh relay if enabled
+        guard allowMeshRelay else {
+            SecureLogger.debug("No internet and mesh relay disabled, keeping tx in queue for later", category: .session)
+            scheduleRetry()
+            return
+        }
+        
+        // Find a peer with internet for mesh relay
+        guard let peerWithInternet = findRelayPeer() else {
+            SecureLogger.debug("No relay peer available for tx \(relay.id.prefix(8))…", category: .session)
+            scheduleRetry()
+            return
+        }
+        
+        // Send via BLE mesh
+        await relayViaMesh(relay, to: peerWithInternet)
+    }
+    
+    /// Send transaction to a relay peer via BLE
+    private func relayViaMesh(_ relay: PendingRelay, to peerID: PeerID) async {
+        guard let bleService = bleService else { return }
+        
+        // Update status
+        updateRelayStatus(relay.id, status: .relaying, relayedVia: peerID.id)
+        
+        guard let payloadData = relay.payload.encode() else {
+            SecureLogger.error("Failed to encode tx payload for relay", category: .session)
+            return
+        }
+        
+        // Create BitChat packet
+        let packet = BitchatPacket(
+            type: MessageType.txSigned.rawValue,
+            ttl: 2, // Limit hops for security
+            senderID: bleService.myPeerID,
+            payload: payloadData,
+            isRSR: false
+        )
+        
+        // Send via BLEService
+        bleService.sendPacket(to: peerID, packet: packet)
+        
+        updateRelayStatus(relay.id, status: .awaitingConfirmation, relayedVia: peerID.id)
+        SecureLogger.info("🔀 Relayed tx via \(peerID.id.prefix(8))…: \(relay.id.prefix(8))…", category: .session)
+    }
+    
+    // MARK: - Incoming Packet Handling
+    
+    /// Handle incoming signed transaction (we are the relay peer)
+    func handleIncomingTxSigned(_ data: Data, from senderPeerID: PeerID) async {
+        guard let payload = TxSignedPayload.decode(data) else {
+            SecureLogger.warning("Invalid TxSigned packet from \(senderPeerID.id.prefix(8))…", category: .session)
+            return
+        }
+        
+        SecureLogger.info("📥 Received tx relay request: \(payload.requestId.prefix(8))…", category: .session)
+        
+        // Validate we support this chain
+        guard rpcEndpoints[payload.chainId] != nil else {
+            await sendTxReject(to: senderPeerID, requestId: payload.requestId, reason: .unsupportedChain)
+            return
+        }
+        
+        // Check if we have internet
+        guard await hasInternetConnectivity() else {
+            await sendTxReject(to: senderPeerID, requestId: payload.requestId, reason: .noInternet)
+            return
+        }
+        
+        // Broadcast the transaction
+        do {
+            let txHash = try await broadcastToRPC(payload)
+            await sendTxConfirm(to: senderPeerID, requestId: payload.requestId, txHash: txHash, status: .pending)
+        } catch {
+            SecureLogger.error("Tx broadcast failed: \(error.localizedDescription)", category: .session)
+            await sendTxReject(to: senderPeerID, requestId: payload.requestId, reason: .invalidTx, message: error.localizedDescription)
+        }
+    }
+    
+    /// Handle incoming transaction confirmation
+    func handleIncomingTxConfirm(_ data: Data, from senderPeerID: PeerID) {
+        guard let confirm = TxConfirmPayload.decode(data) else {
+            SecureLogger.warning("Invalid TxConfirm packet from \(senderPeerID.id.prefix(8))…", category: .session)
+            return
+        }
+        
+        SecureLogger.info("✅ Tx confirmed: \(confirm.requestId.prefix(8))… hash=\(confirm.txHash.prefix(16))…", category: .session)
+        
+        // Update pending relay
+        if let idx = pendingRelays.firstIndex(where: { $0.id == confirm.requestId }) {
+            let relay = pendingRelays[idx]
+            
+            // Add to confirmed
+            let confirmed = ConfirmedTransaction(
+                id: confirm.requestId,
+                txHash: confirm.txHash,
+                chainId: relay.payload.chainId,
+                toAddress: relay.payload.toAddress,
+                amount: relay.payload.amount,
+                currency: relay.payload.currency,
+                confirmedAt: Date(),
+                blockNumber: confirm.blockNumber
+            )
+            confirmedTransactions.append(confirmed)
+            
+            // Remove from pending
+            pendingRelays.remove(at: idx)
+            savePendingRelays()
+        }
+    }
+    
+    /// Handle incoming transaction rejection
+    func handleIncomingTxReject(_ data: Data, from senderPeerID: PeerID) {
+        guard let reject = TxRejectPayload.decode(data) else {
+            SecureLogger.warning("Invalid TxReject packet from \(senderPeerID.id.prefix(8))…", category: .session)
+            return
+        }
+        
+        SecureLogger.warning("❌ Tx rejected: \(reject.requestId.prefix(8))… reason=\(reject.reason.rawValue)", category: .session)
+        
+        // Mark as failed, will retry with different peer
+        updateRelayStatus(reject.requestId, status: .queued, relayedVia: nil)
+    }
+    
+    // MARK: - RPC Broadcasting
+    
+    /// Broadcast signed transaction to RPC endpoint with fallback support
+    private func broadcastToRPC(_ payload: TxSignedPayload) async throws -> String {
+        guard let primaryRPC = rpcEndpoints[payload.chainId] else {
+            throw TransactionError.unsupportedChain
+        }
+        
+        // Build list of RPCs to try: primary + fallbacks
+        var rpcsToTry = [primaryRPC]
+        if let fallbacks = fallbackRPCs[payload.chainId] {
+            rpcsToTry.append(contentsOf: fallbacks)
+        }
+        
+        // Prepare eth_sendRawTransaction request
+        let txHex = "0x" + payload.signedTx.map { String(format: "%02x", $0) }.joined()
+        
+        let requestBody: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_sendRawTransaction",
+            "params": [txHex]
+        ]
+        
+        var lastError: Error = TransactionError.rpcFailed
+        
+        for rpcURL in rpcsToTry {
+            guard let url = URL(string: rpcURL) else { continue }
+            
+            do {
+                var request = URLRequest(url: url)
+                request.httpMethod = "POST"
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
+                request.timeoutInterval = 15 // Shorter timeout for faster fallback
+                
+                let (data, response) = try await URLSession.shared.data(for: request)
+                
+                guard let httpResponse = response as? HTTPURLResponse,
+                      httpResponse.statusCode == 200 else {
+                    SecureLogger.debug("RPC \(url.host ?? "unknown") returned non-200", category: .network)
+                    continue
+                }
+                
+                // Parse response
+                guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    continue
+                }
+                
+                if let error = json["error"] as? [String: Any],
+                   let message = error["message"] as? String {
+                    // Real RPC error (not connectivity) - don't retry on other RPCs
+                    throw TransactionError.rpcError(message)
+                }
+                
+                guard let txHash = json["result"] as? String else {
+                    continue
+                }
+                
+                SecureLogger.info("📡 Broadcast tx to RPC (\(url.host ?? "unknown")): \(txHash.prefix(16))…", category: .network)
+                return txHash
+                
+            } catch let error as TransactionError {
+                // Real transaction error, don't retry
+                throw error
+            } catch {
+                SecureLogger.debug("RPC \(url.host ?? "unknown") failed: \(error.localizedDescription)", category: .network)
+                lastError = error
+                continue
+            }
+        }
+        
+        throw lastError
+    }
+    
+    /// Broadcast our own pending transaction
+    private func broadcastTransaction(_ relay: PendingRelay) async {
+        updateRelayStatus(relay.id, status: .relaying, relayedVia: nil)
+        
+        // Log transaction details for debugging
+        let txHex = "0x" + relay.payload.signedTx.map { String(format: "%02x", $0) }.joined()
+        // Use print for unredacted logging during debug
+        print("📍 [TX DEBUG] Broadcasting to: \(relay.payload.toAddress), chain: \(relay.payload.chainId), nonce: \(relay.payload.nonce)")
+        print("📍 [TX DEBUG] Raw tx hex: \(txHex)")
+        SecureLogger.debug("📡 Broadcasting tx to \(relay.payload.toAddress), chain \(relay.payload.chainId), nonce \(relay.payload.nonce)", category: .session)
+        SecureLogger.debug("📡 Raw tx (first 100 chars): \(String(txHex.prefix(100)))...", category: .session)
+        
+        do {
+            let txHash = try await broadcastToRPC(relay.payload)
+            
+            // Add to confirmed
+            let confirmed = ConfirmedTransaction(
+                id: relay.id,
+                txHash: txHash,
+                chainId: relay.payload.chainId,
+                toAddress: relay.payload.toAddress,
+                amount: relay.payload.amount,
+                currency: relay.payload.currency,
+                confirmedAt: Date(),
+                blockNumber: nil
+            )
+            confirmedTransactions.append(confirmed)
+            
+            // Remove from pending
+            pendingRelays.removeAll { $0.id == relay.id }
+            savePendingRelays()
+            
+            SecureLogger.info("✅ Direct broadcast tx: \(txHash.prefix(16))…", category: .session)
+        } catch let error as TransactionError {
+            // Check if it's a real transaction error vs network error
+            switch error {
+            case .rpcError(let message):
+                // Real blockchain error - mark as failed (invalid nonce, insufficient funds, etc.)
+                updateRelayStatus(relay.id, status: .failed, relayedVia: nil)
+                SecureLogger.error("❌ Transaction rejected by network: \(message)", category: .session)
+            default:
+                // Network/connectivity error - keep queued for retry
+                updateRelayStatus(relay.id, status: .queued, relayedVia: nil)
+                SecureLogger.warning("📶 Broadcast failed (will retry): \(error.localizedDescription)", category: .session)
+                scheduleRetry()
+            }
+        } catch {
+            // Network error (timeout, no connection) - keep queued for retry
+            updateRelayStatus(relay.id, status: .queued, relayedVia: nil)
+            SecureLogger.warning("📶 Broadcast failed (will retry): \(error.localizedDescription)", category: .session)
+            scheduleRetry()
+        }
+    }
+    
+    // MARK: - Response Sending
+    
+    private func sendTxConfirm(to peerID: PeerID, requestId: String, txHash: String, status: TxStatus) async {
+        guard let bleService = bleService else { return }
+        
+        let confirm = TxConfirmPayload(requestId: requestId, txHash: txHash, status: status)
+        guard let payloadData = confirm.encode() else { return }
+        
+        let packet = BitchatPacket(
+            type: MessageType.txConfirm.rawValue,
+            ttl: 2,
+            senderID: bleService.myPeerID,
+            payload: payloadData,
+            isRSR: false
+        )
+        
+        bleService.sendPacket(to: peerID, packet: packet)
+    }
+    
+    private func sendTxReject(to peerID: PeerID, requestId: String, reason: TxRejectReason, message: String? = nil) async {
+        guard let bleService = bleService else { return }
+        
+        let reject = TxRejectPayload(requestId: requestId, reason: reason, message: message)
+        guard let payloadData = reject.encode() else { return }
+        
+        let packet = BitchatPacket(
+            type: MessageType.txReject.rawValue,
+            ttl: 2,
+            senderID: bleService.myPeerID,
+            payload: payloadData,
+            isRSR: false
+        )
+        
+        bleService.sendPacket(to: peerID, packet: packet)
+    }
+    
+    // MARK: - Helpers
+    
+    private func findRelayPeer() -> PeerID? {
+        guard let bleService = bleService else { return nil }
+        let peers = bleService.currentPeerSnapshots()
+        // Return any connected peer (they may have internet)
+        return peers.first(where: { $0.isConnected })?.peerID
+    }
+    
+    private func hasInternetConnectivity() async -> Bool {
+        // Quick connectivity check using reliable public endpoints
+        let checkURLs = [
+            "https://sepolia.drpc.org",     // Fast, reliable public endpoint
+            "https://rpc.flashbots.net"     // Fallback
+        ]
+        
+        for urlString in checkURLs {
+            guard let url = URL(string: urlString) else { continue }
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            // Simple eth_chainId request
+            request.httpBody = try? JSONSerialization.data(withJSONObject: [
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_chainId",
+                "params": []
+            ])
+            request.timeoutInterval = 5
+            
+            do {
+                let (_, response) = try await URLSession.shared.data(for: request)
+                if (response as? HTTPURLResponse)?.statusCode == 200 {
+                    return true
+                }
+            } catch {
+                continue
+            }
+        }
+        return false
+    }
+    
+    private func updateRelayStatus(_ id: String, status: RelayStatus, relayedVia: String?) {
+        if let idx = pendingRelays.firstIndex(where: { $0.id == id }) {
+            pendingRelays[idx].status = status
+            pendingRelays[idx].relayedVia = relayedVia
+            if status == .queued {
+                pendingRelays[idx].retryCount += 1
+            }
+            savePendingRelays()
+        }
+    }
+    
+    // MARK: - Retry Logic
+    
+    /// Schedule a retry for queued transactions
+    private func scheduleRetry() {
+        guard !retryScheduled else { return }
+        retryScheduled = true
+        
+        retryTask?.cancel()
+        retryTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(30 * 1_000_000_000)) // 30 seconds
+            guard !Task.isCancelled else { return }
+            await self?.retryQueuedTransactions()
+        }
+    }
+    
+    /// Retry all queued transactions
+    private func retryQueuedTransactions() async {
+        retryScheduled = false
+        
+        let queuedRelays = pendingRelays.filter { $0.status == .queued }
+        guard !queuedRelays.isEmpty else { return }
+        
+        SecureLogger.info("🔄 Retrying \(queuedRelays.count) queued transaction(s)...", category: .session)
+        
+        // Check for stale transactions (older than maxRetryAge)
+        let now = Date()
+        for relay in queuedRelays {
+            if now.timeIntervalSince(relay.createdAt) > maxRetryAge {
+                SecureLogger.warning("⏰ Transaction \(relay.id.prefix(8))… expired after 24h", category: .session)
+                updateRelayStatus(relay.id, status: .failed, relayedVia: nil)
+                continue
+            }
+            
+            // Always try direct broadcast first if we have internet
+            if await hasInternetConnectivity() {
+                await broadcastTransaction(relay)
+            } else if allowMeshRelay, let peer = findRelayPeer() {
+                // No internet - try mesh relay if enabled
+                await relayViaMesh(relay, to: peer)
+            }
+            // If no internet and mesh relay disabled, just keep in queue for next retry
+        }
+        
+        // Schedule another retry if there are still queued transactions
+        let stillQueued = pendingRelays.filter { $0.status == .queued }
+        if !stillQueued.isEmpty {
+            scheduleRetry()
+        }
+    }
+    
+    /// Manually trigger retry (e.g., when network becomes available)
+    func retryNow() {
+        Task {
+            await retryQueuedTransactions()
+        }
+    }
+    
+    /// Get count of transactions awaiting broadcast
+    var queuedCount: Int {
+        pendingRelays.filter { $0.status == .queued }.count
+    }
+    
+    /// Clear all pending relays (panic mode)
+    func clearAll() {
+        pendingRelays.removeAll()
+        savePendingRelays()
+        SecureLogger.warning("🧹 Cleared all pending mesh relays", category: .session)
+    }
+    
+    // MARK: - Persistence
+    
+    private func loadPendingRelays() {
+        guard let data = UserDefaults.standard.data(forKey: storageKey),
+              let relays = try? JSONDecoder().decode([PendingRelay].self, from: data) else {
+            return
+        }
+        pendingRelays = relays
+    }
+    
+    private func savePendingRelays() {
+        if let data = try? JSONEncoder().encode(pendingRelays) {
+            UserDefaults.standard.set(data, forKey: storageKey)
+        }
+    }
+}
+
+// MARK: - Errors
+
+enum TransactionError: Error, LocalizedError {
+    case unsupportedChain
+    case rpcFailed
+    case invalidResponse
+    case rpcError(String)
+    case signingFailed
+    
+    var errorDescription: String? {
+        switch self {
+        case .unsupportedChain: return "Unsupported chain"
+        case .rpcFailed: return "RPC request failed"
+        case .invalidResponse: return "Invalid RPC response"
+        case .rpcError(let msg): return "RPC error: \(msg)"
+        case .signingFailed: return "Transaction signing failed"
+        }
+    }
+}

@@ -114,8 +114,9 @@ struct MessagingSettingsView: View {
                 Section {
                     NavigationLink {
                         XMTPSettingsView(
-                            transactionQueue: xmtpContainer.transactionQueue,
+                            meshTransactionRelay: xmtpContainer.meshTransactionRelay,
                             clientService: xmtpContainer.clientService,
+                            balanceService: xmtpContainer.balanceService,
                             wallet: xmtpContainer.wallet
                         )
                     } label: {
@@ -125,7 +126,7 @@ struct MessagingSettingsView: View {
                     NavigationLink {
                         WalletView(wallet: xmtpContainer.wallet)
                     } label: {
-                        Label("Wallet", systemImage: "wallet.pass")
+                        Label("Wallet", systemImage: "creditcard.fill")
                     }
                 } header: {
                     Text("XMTP Configuration")

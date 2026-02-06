@@ -238,6 +238,9 @@ final class GeoRelayDirectory {
         return []
     }
 
+    /// Parses CSV relay data, stripping all URL schemes to extract bare hostnames.
+    /// Security: All protocol prefixes are stripped; closestRelays() methods
+    /// reconstruct URLs using only wss:// (secure WebSocket) to prevent MITM attacks.
     nonisolated static func parseCSV(_ text: String) -> [Entry] {
         var result: Set<Entry> = []
         let lines = text.split(whereSeparator: { $0.isNewline })
@@ -248,6 +251,7 @@ final class GeoRelayDirectory {
             let parts = line.split(separator: ",").map { String($0).trimmingCharacters(in: .whitespaces) }
             guard parts.count >= 3 else { continue }
             var host = parts[0]
+            // Strip all protocol prefixes - we always use wss:// when constructing URLs
             host = host.replacingOccurrences(of: "https://", with: "")
             host = host.replacingOccurrences(of: "http://", with: "")
             host = host.replacingOccurrences(of: "wss://", with: "")

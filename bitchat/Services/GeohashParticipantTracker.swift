@@ -92,6 +92,28 @@ public final class GeohashParticipantTracker: ObservableObject {
             refresh()
         }
     }
+    
+    /// Record activity from an XMTP participant in the current active geohash
+    public func recordXMTPParticipant(inboxId: String, nickname: String?) {
+        guard let gh = activeGeohash else { return }
+        // Use inbox ID as a pseudo-pubkey for XMTP participants
+        // Prefix with "xmtp:" to distinguish from Nostr pubkeys
+        let key = "xmtp:\(inboxId)".lowercased()
+        var map = participants[gh] ?? [:]
+        map[key] = Date()
+        participants[gh] = map
+        
+        // Store nickname mapping if provided
+        if let nick = nickname {
+            xmtpNicknames[inboxId] = nick
+        }
+        
+        objectWillChange.send()
+        refresh()
+    }
+    
+    /// Nickname mapping for XMTP participants
+    private var xmtpNicknames: [String: String] = [:]
 
     /// Remove a participant from all geohashes (used when blocking)
     public func removeParticipant(pubkeyHex: String) {

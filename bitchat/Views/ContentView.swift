@@ -65,6 +65,7 @@ struct ContentView: View {
     @State private var recordingDuration: TimeInterval = 0
     @State private var recordingTimer: Timer?
     @State private var showWalletView = false
+    @State private var showSettings = false
     @State private var recordingStartDate: Date?
 #if os(iOS)
     @State private var showImagePicker = false
@@ -200,6 +201,17 @@ struct ContentView: View {
                     .toolbar {
                         ToolbarItem(placement: .cancellationAction) {
                             Button("Done") { showWalletView = false }
+                        }
+                    }
+            }
+        }
+        .sheet(isPresented: $showSettings) {
+            NavigationStack {
+                MessagingSettingsView()
+                    .environmentObject(xmtpContainer)
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Done") { showSettings = false }
                         }
                     }
             }
@@ -1080,7 +1092,7 @@ struct ContentView: View {
                             .foregroundColor(textColor)
                             .accessibilityLabel(String(localized: "content.accessibility.reachable_mesh", comment: "Accessibility label for mesh-reachable peer indicator"))
                     case .xmtpAvailable:
-                        Image(systemName: "wallet.pass.fill")
+                        Image(systemName: "creditcard.fill")
                             .font(.bitchatSystem(size: 14))
                             .foregroundColor(.blue)
                             .accessibilityLabel(String(localized: "content.accessibility.available_xmtp", comment: "Accessibility label for XMTP-available peer indicator"))
@@ -1271,9 +1283,18 @@ struct ContentView: View {
             }()
 
             HStack(spacing: 10) {
+                // Settings gear icon
+                Button(action: { showSettings = true }) {
+                    Image(systemName: "gearshape")
+                        .font(.bitchatSystem(size: 12))
+                        .foregroundColor(Color.secondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Settings")
+                
                 // XMTP/Wallet status indicator
                 Button(action: { showWalletView = true }) {
-                    Image(systemName: xmtpContainer.clientService.isConnected ? "wallet.pass.fill" : "wallet.pass")
+                    Image(systemName: xmtpContainer.clientService.isConnected ? "creditcard.fill" : "creditcard")
                         .font(.bitchatSystem(size: 12))
                         .foregroundColor(xmtpContainer.clientService.isConnected ? Color.green : Color.secondary)
                 }

@@ -349,3 +349,64 @@ extension ChatViewModel {
         }
     }
 }
+
+// MARK: - XMTP Location Channels Delegate
+
+extension ChatViewModel: XMTPLocationChannelsDelegate {
+    
+    /// Called when a message is received on an XMTP location channel
+    @MainActor
+    func locationChannels(_ service: XMTPLocationChannels, didReceiveMessage message: XMTPLocationChannels.LocationMessage) {
+        // Ignore our own messages
+        if let myInboxId = XMTPServiceContainer.shared.clientService.inboxId,
+           message.senderInboxId == myInboxId {
+            return
+        }
+        
+        // Find the matching geohash channel
+        guard let channel = LocationChannelManager.shared.availableChannels.first(where: { $0.geohash == message.geohash }) else {
+            SecureLogger.debug("XMTP geo: received message for unknown geohash \(message.geohash)", category: .network)
+            return
+        }
+        
+        // Check for duplicates
+        if deduplicationService.hasSeenMessage(message.id) {
+            return
+        }
+        deduplicationService.recordNostrEvent(message.id)
+        
+        // Create sender display name
+        let senderDisplay = message.senderNickname ?? "XMTP:\(message.senderInboxId.prefix(6))…"
+        let senderPeerID = PeerID(xmtp: message.senderInboxId)
+        
+        // Create BitchatMessage
+        let bitchatMessage = BitchatMessage(
+            id: message.id,
+            sender: senderDisplay,
+            content: message.content,
+            timestamp: message.timestamp,
+            isRelay: false,
+            senderPeerID: senderPeerID
+        )
+        
+        // Add to timeline
+        let channelID = ChannelID.location(channel)
+        timelineStore.append(bitchatMessage, to: channelID)
+        
+        // Update visible messages if this is the active channel
+        if activeChannel == channelID {
+            refreshVisibleMessages(from: channelID)
+        }
+        
+        // Track participant
+        participantTracker.recordXMTPParticipant(inboxId: message.senderInboxId, nickname: message.senderNickname)
+        
+        SecureLogger.debug("📍 XMTP geo message in \(message.geohash): \(message.content.prefix(30))…", category: .network)
+    }
+    
+    /// Called when an XMTP location channel is updated
+    @MainActor
+    func locationChannels(_ service: XMTPLocationChannels, didUpdateChannel channel: XMTPLocationChannels.LocationChannel) {
+        SecureLogger.debug("📍 XMTP geo channel updated: \(channel.geohash) (\(channel.memberCount) members)", category: .session)
+    }
+}

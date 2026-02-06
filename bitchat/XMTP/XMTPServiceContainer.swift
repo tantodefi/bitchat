@@ -26,8 +26,9 @@ final class XMTPServiceContainer: ObservableObject {
     let identityBridge: XMTPIdentityBridge
     let clientService: XMTPClientService
     let transport: XMTPTransport
-    let transactionQueue: OfflineTransactionQueue
     let locationChannels: XMTPLocationChannels
+    let balanceService: EthereumBalanceService
+    let meshTransactionRelay: MeshTransactionRelay
     
     // MARK: - Private
     
@@ -86,17 +87,25 @@ final class XMTPServiceContainer: ObservableObject {
             clientService: clientService
         )
         
-        // Create transaction queue
-        self.transactionQueue = OfflineTransactionQueue(keychain: keychain)
-        
         // Create location channels
         self.locationChannels = XMTPLocationChannels(
             identityBridge: identityBridge,
             clientService: clientService
         )
         
-        // Wire up transaction queue with client service
-        transactionQueue.configure(bleService: nil, xmtpClient: clientService)
+        // Create balance service
+        self.balanceService = EthereumBalanceService()
+        
+        // Create mesh transaction relay
+        self.meshTransactionRelay = MeshTransactionRelay(keychain: keychain)
+    }
+    
+    // MARK: - BLE Service Configuration
+    
+    /// Configure BLE service reference for transaction relay
+    /// Call this after BLEService is initialized
+    func configureBLEService(_ bleService: BLEService?) {
+        meshTransactionRelay.configure(bleService: bleService)
     }
     
     // MARK: - Lifecycle
@@ -202,10 +211,6 @@ final class XMTPServiceContainer: ObservableObject {
         SecureLogger.info("XMTP: Services shut down", category: .session)
     }
     
-    /// Configure BLE service for transaction relay
-    func configureBLEService(_ bleService: BLEService) {
-        transactionQueue.configure(bleService: bleService, xmtpClient: clientService)
-    }
 }
 
 // MARK: - App Integration Extension

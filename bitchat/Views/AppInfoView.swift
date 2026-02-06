@@ -302,7 +302,7 @@ struct AppInfoView: View {
                     showWalletView = true
                 } label: {
                     HStack(spacing: 12) {
-                        Image(systemName: "wallet.pass.fill")
+                        Image(systemName: "creditcard.fill")
                             .font(.bitchatSystem(size: 20))
                             .foregroundColor(textColor)
                             .frame(width: 30)
@@ -385,8 +385,9 @@ struct AppInfoView: View {
         .sheet(isPresented: $showXMTPSettings) {
             NavigationStack {
                 XMTPSettingsView(
-                    transactionQueue: xmtpContainer.transactionQueue,
+                    meshTransactionRelay: xmtpContainer.meshTransactionRelay,
                     clientService: xmtpContainer.clientService,
+                    balanceService: xmtpContainer.balanceService,
                     wallet: xmtpContainer.wallet
                 )
             }

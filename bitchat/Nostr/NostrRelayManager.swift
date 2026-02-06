@@ -377,6 +377,12 @@ final class NostrRelayManager: ObservableObject {
         var seen = Set<String>()
         var result: [String] = []
         for url in urls {
+            // Security: Only allow secure WebSocket connections (wss://)
+            // Reject insecure ws:// URLs to prevent MITM attacks
+            guard url.lowercased().hasPrefix("wss://") else {
+                SecureLogger.warning("Rejected insecure relay URL (must use wss://): \(url)", category: .session)
+                continue
+            }
             if !allowDefaultRelays && Self.defaultRelaySet.contains(url) { continue }
             if seen.insert(url).inserted {
                 result.append(url)
@@ -414,6 +420,14 @@ final class NostrRelayManager: ObservableObject {
     private func connectToRelay(_ urlString: String) {
         // Global network policy gate
         guard networkService.activationAllowed else { return }
+        
+        // Security: Only allow secure WebSocket connections (wss://)
+        // This is a defense-in-depth check - allowedRelayList should filter first
+        guard urlString.lowercased().hasPrefix("wss://") else {
+            SecureLogger.error("Blocked insecure WebSocket connection (must use wss://): \(urlString)", category: .session)
+            return
+        }
+        
         guard let url = URL(string: urlString) else { 
             SecureLogger.warning("Invalid relay URL: \(urlString)", category: .session)
             return 

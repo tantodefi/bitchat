@@ -12,8 +12,9 @@ import SwiftUI
 
 /// Settings view for XMTP and transaction relay configuration
 struct XMTPSettingsView: View {
-    @ObservedObject var transactionQueue: OfflineTransactionQueue
+    @ObservedObject var meshTransactionRelay: MeshTransactionRelay
     @ObservedObject var clientService: XMTPClientService
+    @ObservedObject var balanceService: EthereumBalanceService
     let wallet: EmbeddedWallet
     
     @State private var showingWalletInfo = false
@@ -54,33 +55,35 @@ struct XMTPSettingsView: View {
             
             // MARK: - Transaction Relay Settings
             Section {
-                Picker("Offline Transactions", selection: $transactionQueue.relayStrategy) {
-                    ForEach(TransactionRelayStrategy.allCases, id: \.self) { strategy in
-                        Text(strategy.displayName).tag(strategy)
+                Toggle(isOn: $meshTransactionRelay.allowMeshRelay) {
+                    Label {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Mesh Relay")
+                            Text(meshTransactionRelay.allowMeshRelay ? "Transactions can relay through nearby peers" : "Transactions only broadcast when online")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    } icon: {
+                        Image(systemName: "antenna.radiowaves.left.and.right")
                     }
                 }
-                .pickerStyle(.menu)
-                
-                Text(transactionQueue.relayStrategy.description)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
             } header: {
                 Text("Transaction Relay")
             } footer: {
-                Text("Controls how pending transactions are handled when you don't have direct internet access.")
+                Text("When enabled, signed transactions can be relayed through nearby Bluetooth peers who have internet. Peers see transaction data but cannot modify it.")
             }
             
             // MARK: - Pending Transactions
-            if !transactionQueue.pendingTransactions.isEmpty {
+            if !meshTransactionRelay.pendingRelays.isEmpty {
                 Section {
-                    ForEach(transactionQueue.pendingTransactions) { tx in
-                        PendingTransactionRow(transaction: tx)
+                    ForEach(meshTransactionRelay.pendingRelays, id: \.id) { relay in
+                        MeshRelayRow(relay: relay)
                     }
                 } header: {
                     HStack {
                         Text("Pending Transactions")
                         Spacer()
-                        Text("\(transactionQueue.pendingTransactions.count)")
+                        Text("\(meshTransactionRelay.pendingRelays.count)")
                             .foregroundColor(.secondary)
                     }
                 }
@@ -88,10 +91,25 @@ struct XMTPSettingsView: View {
             
             // MARK: - Wallet Info
             Section {
+                // Network mode toggle
+                Toggle(isOn: $balanceService.useTestnet) {
+                    Label {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Testnet Mode")
+                            Text(balanceService.useTestnet ? "Using Sepolia testnet" : "Using Ethereum & Base mainnet")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    } icon: {
+                        Image(systemName: balanceService.useTestnet ? "testtube.2" : "network")
+                    }
+                }
+                .tint(.orange)
+                
                 NavigationLink {
                     WalletView(wallet: wallet)
                 } label: {
-                    Label("View Wallet", systemImage: "wallet.pass")
+                    Label("View Wallet", systemImage: "creditcard.fill")
                 }
                 
                 Button(role: .destructive) {
@@ -99,9 +117,11 @@ struct XMTPSettingsView: View {
                 } label: {
                     Label("Clear Pending Transactions", systemImage: "trash")
                 }
-                .disabled(transactionQueue.pendingTransactions.isEmpty)
+                .disabled(meshTransactionRelay.pendingRelays.isEmpty)
             } header: {
                 Text("Wallet")
+            } footer: {
+                Text("Testnet mode uses Sepolia for testing without real funds.")
             }
             
             // MARK: - Privacy Info
@@ -126,7 +146,7 @@ struct XMTPSettingsView: View {
             titleVisibility: .visible
         ) {
             Button("Clear All", role: .destructive) {
-                transactionQueue.clearAll()
+                meshTransactionRelay.clearAll()
             }
             Button("Cancel", role: .cancel) {}
         } message: {
@@ -135,33 +155,34 @@ struct XMTPSettingsView: View {
     }
 }
 
-// MARK: - Pending Transaction Row
+// MARK: - Mesh Relay Row
 
-struct PendingTransactionRow: View {
-    let transaction: PendingTransaction
+struct MeshRelayRow: View {
+    let relay: MeshTransactionRelay.PendingRelay
     
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
-                Text(transaction.request.calls.first?.metadata?.description ?? "Transaction")
+                Text(relay.payload.description ?? "Transaction")
                     .font(.subheadline)
                 Spacer()
-                StatusBadge(status: transaction.status)
+                MeshStatusBadge(status: relay.status)
             }
             
             HStack {
-                Text("To: \(transaction.recipientInboxId.prefix(12))…")
+                let chainName = relay.payload.chainId == 1 ? "ETH" : (relay.payload.chainId == 11155111 ? "Sepolia" : "Chain \(relay.payload.chainId)")
+                Text("To: \(relay.payload.toAddress.prefix(10))… • \(chainName)")
                     .font(.caption)
                     .foregroundColor(.secondary)
                 
                 Spacer()
                 
-                Text(transaction.createdAt, style: .relative)
+                Text(relay.createdAt, style: .relative)
                     .font(.caption2)
                     .foregroundColor(.secondary)
             }
             
-            if let relayedVia = transaction.relayedVia {
+            if let relayedVia = relay.relayedVia {
                 Text("Relayed via: \(relayedVia.prefix(8))…")
                     .font(.caption2)
                     .foregroundColor(.orange)
@@ -171,10 +192,10 @@ struct PendingTransactionRow: View {
     }
 }
 
-// MARK: - Status Badge
+// MARK: - Mesh Status Badge
 
-struct StatusBadge: View {
-    let status: PendingTransactionStatus
+struct MeshStatusBadge: View {
+    let status: MeshTransactionRelay.RelayStatus
     
     var body: some View {
         Text(status.displayText)
@@ -188,13 +209,12 @@ struct StatusBadge: View {
     }
 }
 
-extension PendingTransactionStatus {
+extension MeshTransactionRelay.RelayStatus {
     var displayText: String {
         switch self {
-        case .pending: return "Pending"
+        case .queued: return "Queued"
         case .relaying: return "Relaying"
-        case .relayed: return "Relayed"
-        case .submitted: return "Submitted"
+        case .awaitingConfirmation: return "Awaiting"
         case .confirmed: return "Confirmed"
         case .failed: return "Failed"
         }
@@ -202,10 +222,9 @@ extension PendingTransactionStatus {
     
     var color: Color {
         switch self {
-        case .pending: return .orange
+        case .queued: return .orange
         case .relaying: return .blue
-        case .relayed: return .purple
-        case .submitted: return .cyan
+        case .awaitingConfirmation: return .purple
         case .confirmed: return .green
         case .failed: return .red
         }

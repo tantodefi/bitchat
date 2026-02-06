@@ -22,11 +22,13 @@ final class EthereumBalanceService: ObservableObject {
     enum Network: String, CaseIterable {
         case ethereum = "Ethereum"
         case base = "Base"
+        case sepolia = "Sepolia"
         
         var chainId: Int {
             switch self {
             case .ethereum: return 1
             case .base: return 8453
+            case .sepolia: return 11155111
             }
         }
         
@@ -39,7 +41,55 @@ final class EthereumBalanceService: ObservableObject {
             case .base:
                 // Base public RPC (consider privacy alternatives in production)
                 return URL(string: "https://mainnet.base.org")!
+            case .sepolia:
+                // Sepolia testnet - use dRPC (reliable public endpoint)
+                return URL(string: "https://sepolia.drpc.org")!
             }
+        }
+        
+        /// Fallback RPC URLs for each network
+        var fallbackRPCs: [URL] {
+            switch self {
+            case .ethereum:
+                return [
+                    URL(string: "https://eth.llamarpc.com")!,
+                    URL(string: "https://rpc.ankr.com/eth")!
+                ]
+            case .base:
+                return [
+                    URL(string: "https://base.llamarpc.com")!,
+                    URL(string: "https://rpc.ankr.com/base")!
+                ]
+            case .sepolia:
+                return [
+                    URL(string: "https://rpc2.sepolia.org")!,
+                    URL(string: "https://1rpc.io/sepolia")!
+                ]
+            }
+        }
+        
+        var isTestnet: Bool {
+            switch self {
+            case .ethereum, .base: return false
+            case .sepolia: return true
+            }
+        }
+        
+        var symbol: String {
+            switch self {
+            case .ethereum, .sepolia: return "ETH"
+            case .base: return "ETH"
+            }
+        }
+        
+        /// Networks shown in mainnet mode
+        static var mainnets: [Network] {
+            [.ethereum, .base]
+        }
+        
+        /// Networks shown in testnet mode
+        static var testnets: [Network] {
+            [.sepolia]
         }
     }
     
@@ -68,10 +118,26 @@ final class EthereumBalanceService: ObservableObject {
     @Published private(set) var balances: [Network: Balance] = [:]
     @Published private(set) var isLoading: Bool = false
     @Published private(set) var lastError: String?
+    @Published var useTestnet: Bool = false {
+        didSet {
+            UserDefaults.standard.set(useTestnet, forKey: "wallet-use-testnet")
+            // Clear balances when switching network mode
+            balances.removeAll()
+        }
+    }
     
     // MARK: - Properties
     
-    private let defaultNetworks: [Network] = [.ethereum, .base]
+    private var activeNetworks: [Network] {
+        useTestnet ? Network.testnets : Network.mainnets
+    }
+    
+    // MARK: - Initialization
+    
+    init() {
+        // Load saved testnet preference
+        self.useTestnet = UserDefaults.standard.bool(forKey: "wallet-use-testnet")
+    }
     
     // MARK: - Public Methods
     
@@ -86,7 +152,7 @@ final class EthereumBalanceService: ObservableObject {
         lastError = nil
         
         await withTaskGroup(of: (Network, Balance?).self) { group in
-            for network in defaultNetworks {
+            for network in activeNetworks {
                 group.addTask { [weak self] in
                     guard let self = self else { return (network, nil) }
                     let balance = await self.fetchBalance(for: address, network: network)
@@ -106,7 +172,9 @@ final class EthereumBalanceService: ObservableObject {
     
     /// Fetches balance for a specific network
     func fetchBalance(for address: String, network: Network) async -> Balance? {
-        let session = TorURLSession.shared.session
+        // Use regular URLSession for testnets (Tor can be slow/unreliable for testnet RPCs)
+        // Use Tor for mainnets for privacy
+        let session = network.isTestnet ? URLSession.shared : TorURLSession.shared.session
         
         let payload: [String: Any] = [
             "jsonrpc": "2.0",
@@ -120,43 +188,52 @@ final class EthereumBalanceService: ObservableObject {
             return nil
         }
         
-        var request = URLRequest(url: network.rpcURL)
-        request.httpMethod = "POST"
-        request.httpBody = jsonData
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 30
+        // Try primary RPC first, then fallbacks
+        let allRPCs = [network.rpcURL] + network.fallbackRPCs
         
-        do {
-            let (data, response) = try await session.data(for: request)
+        for rpcURL in allRPCs {
+            var request = URLRequest(url: rpcURL)
+            request.httpMethod = "POST"
+            request.httpBody = jsonData
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.timeoutInterval = 15 // Shorter timeout for faster fallback
             
-            guard let httpResponse = response as? HTTPURLResponse,
-                  httpResponse.statusCode == 200 else {
-                SecureLogger.warning("EthereumBalanceService: Bad response for \(network.rawValue)", category: .network)
-                return nil
+            do {
+                let (data, response) = try await session.data(for: request)
+                
+                guard let httpResponse = response as? HTTPURLResponse,
+                      httpResponse.statusCode == 200 else {
+                    SecureLogger.warning("EthereumBalanceService: Bad response from \(rpcURL.host ?? "unknown") for \(network.rawValue)", category: .network)
+                    continue // Try next RPC
+                }
+                
+                guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let resultHex = json["result"] as? String else {
+                    SecureLogger.warning("EthereumBalanceService: Invalid JSON from \(rpcURL.host ?? "unknown") for \(network.rawValue)", category: .network)
+                    continue // Try next RPC
+                }
+                
+                // Parse hex balance
+                guard let wei = BigUInt(hexString: resultHex) else {
+                    SecureLogger.warning("EthereumBalanceService: Failed to parse balance hex", category: .network)
+                    continue // Try next RPC
+                }
+                
+                SecureLogger.debug("EthereumBalanceService: \(network.rawValue) balance = \(wei) (via \(rpcURL.host ?? "unknown"))", category: .network)
+                
+                return Balance(network: network, wei: wei, lastUpdated: Date())
+            } catch {
+                SecureLogger.warning("EthereumBalanceService: \(rpcURL.host ?? "unknown") failed: \(error.localizedDescription)", category: .network)
+                continue // Try next RPC
             }
-            
-            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let resultHex = json["result"] as? String else {
-                SecureLogger.warning("EthereumBalanceService: Invalid JSON for \(network.rawValue)", category: .network)
-                return nil
-            }
-            
-            // Parse hex balance
-            guard let wei = BigUInt(hexString: resultHex) else {
-                SecureLogger.warning("EthereumBalanceService: Failed to parse balance hex", category: .network)
-                return nil
-            }
-            
-            SecureLogger.debug("EthereumBalanceService: \(network.rawValue) balance = \(wei)", category: .network)
-            
-            return Balance(network: network, wei: wei, lastUpdated: Date())
-        } catch {
-            SecureLogger.error("EthereumBalanceService: \(error.localizedDescription)", category: .network)
-            await MainActor.run {
-                lastError = error.localizedDescription
-            }
-            return nil
         }
+        
+        // All RPCs failed
+        SecureLogger.error("EthereumBalanceService: All RPCs failed for \(network.rawValue)", category: .network)
+        await MainActor.run {
+            lastError = "Failed to connect to \(network.rawValue) RPC"
+        }
+        return nil
     }
     
     /// Clears all cached balances

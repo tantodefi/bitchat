@@ -16,13 +16,22 @@ import SwiftUI
 struct WalletView: View {
     let wallet: EmbeddedWallet
     @EnvironmentObject var xmtpContainer: XMTPServiceContainer
-    @StateObject private var balanceService = EthereumBalanceService()
+    
+    /// Use the balance service from the container for shared testnet mode state
+    private var balanceService: EthereumBalanceService {
+        xmtpContainer.balanceService
+    }
     
     @State private var address: String = ""
     @State private var isLoading: Bool = true
     @State private var loadError: String?
     @State private var showCopiedToast: Bool = false
     @State private var copiedText: String = "Address copied!"
+    @State private var showSendSheet: Bool = false
+    @State private var showHistorySheet: Bool = false
+    
+    // Auto-refresh timer
+    private let refreshInterval: TimeInterval = 15
     
     var body: some View {
         ScrollView {
@@ -54,6 +63,11 @@ struct WalletView: View {
                 if !address.isEmpty {
                     balancesSection
                 }
+                
+                // MARK: - Actions
+                if !address.isEmpty && !isLoading {
+                    actionsSection
+                }
             }
             .padding()
         }
@@ -64,6 +78,10 @@ struct WalletView: View {
         .task {
             await loadWallet()
         }
+        .task {
+            // Auto-refresh balances periodically
+            await autoRefreshBalances()
+        }
         .overlay(alignment: .bottom) {
             if showCopiedToast {
                 copiedToast
@@ -71,6 +89,19 @@ struct WalletView: View {
             }
         }
         .animation(.easeInOut, value: showCopiedToast)
+        .sheet(isPresented: $showSendSheet) {
+            SendTransactionView(
+                wallet: wallet,
+                balanceService: balanceService,
+                meshRelay: xmtpContainer.meshTransactionRelay
+            )
+        }
+        .sheet(isPresented: $showHistorySheet) {
+            TransactionHistoryView(
+                meshRelay: xmtpContainer.meshTransactionRelay,
+                balanceService: balanceService
+            )
+        }
     }
     
     // MARK: - Sections
@@ -171,13 +202,120 @@ struct WalletView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             
-            ForEach(EthereumBalanceService.Network.allCases, id: \.self) { network in
+            // Show active networks based on mainnet/testnet mode
+            let networks = balanceService.useTestnet ? EthereumBalanceService.Network.testnets : EthereumBalanceService.Network.mainnets
+            ForEach(networks, id: \.self) { network in
                 balanceRow(for: network)
             }
             
-            Text("Balances fetched privately via Tor")
-                .font(.caption2)
-                .foregroundColor(.secondary)
+            HStack {
+                Image(systemName: balanceService.useTestnet ? "testtube.2" : "shield.checkered")
+                    .foregroundColor(balanceService.useTestnet ? .orange : .green)
+                Text(balanceService.useTestnet ? "Testnet Mode" : "Mainnet")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+        }
+    }
+    
+    private var actionsSection: some View {
+        VStack(spacing: 12) {
+            Text("Actions")
+                .font(.headline)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            
+            HStack(spacing: 16) {
+                Button {
+                    showSendSheet = true
+                } label: {
+                    VStack(spacing: 8) {
+                        Image(systemName: "arrow.up.circle.fill")
+                            .font(.title)
+                        Text("Send")
+                            .font(.caption)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding()
+                    .background(Color.accentColor.opacity(0.1))
+                    .cornerRadius(12)
+                }
+                .buttonStyle(.plain)
+                
+                Button {
+                    copyAddress()
+                } label: {
+                    VStack(spacing: 8) {
+                        Image(systemName: "arrow.down.circle.fill")
+                            .font(.title)
+                        Text("Receive")
+                            .font(.caption)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding()
+                    .background(Color.green.opacity(0.1))
+                    .cornerRadius(12)
+                }
+                .buttonStyle(.plain)
+                
+                Button {
+                    showHistorySheet = true
+                } label: {
+                    VStack(spacing: 8) {
+                        ZStack(alignment: .topTrailing) {
+                            Image(systemName: "clock.arrow.circlepath")
+                                .font(.title)
+                            
+                            // Badge for pending transactions
+                            let pendingCount = xmtpContainer.meshTransactionRelay.pendingRelays.count
+                            if pendingCount > 0 {
+                                Text("\(pendingCount)")
+                                    .font(.caption2)
+                                    .fontWeight(.bold)
+                                    .foregroundColor(.white)
+                                    .padding(4)
+                                    .background(Color.orange)
+                                    .clipShape(Circle())
+                                    .offset(x: 8, y: -4)
+                            }
+                        }
+                        Text("History")
+                            .font(.caption)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding()
+                    .background(Color.purple.opacity(0.1))
+                    .cornerRadius(12)
+                }
+                .buttonStyle(.plain)
+            }
+            
+            // Pending transactions indicator
+            let txCount = xmtpContainer.meshTransactionRelay.pendingRelays.count + xmtpContainer.meshTransactionRelay.confirmedTransactions.count
+            if txCount > 0 {
+                Button {
+                    showHistorySheet = true
+                } label: {
+                    HStack {
+                        if xmtpContainer.meshTransactionRelay.pendingRelays.isEmpty {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundColor(.green)
+                            Text("\(xmtpContainer.meshTransactionRelay.confirmedTransactions.count) confirmed transaction(s)")
+                        } else {
+                            Image(systemName: "clock.badge.fill")
+                                .foregroundColor(.orange)
+                            Text("\(xmtpContainer.meshTransactionRelay.pendingRelays.count) pending transaction(s)")
+                        }
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .padding(.top, 8)
+                }
+                .buttonStyle(.plain)
+            }
         }
     }
     
@@ -318,6 +456,18 @@ struct WalletView: View {
         }
         
         isLoading = false
+    }
+    
+    private func autoRefreshBalances() async {
+        // Keep refreshing while view is active
+        while !Task.isCancelled {
+            try? await Task.sleep(for: .seconds(refreshInterval))
+            
+            guard !Task.isCancelled, !address.isEmpty else { break }
+            
+            // Silently refresh balances in background
+            await balanceService.fetchBalances(for: address)
+        }
     }
     
     private func copyAddress() {

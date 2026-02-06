@@ -888,7 +888,8 @@ final class BLEService: NSObject {
         switch MessageType(rawValue: type) {
         case .noiseEncrypted, .noiseHandshake:
             return true
-        case .none, .announce, .message, .leave, .requestSync, .fragment, .fileTransfer:
+        case .none, .announce, .message, .leave, .requestSync, .fragment, .fileTransfer,
+             .txRequest, .txSigned, .txConfirm, .txReject:
             return false
         }
     }
@@ -1334,6 +1335,41 @@ final class BLEService: NSObject {
             
             self.delegate?.didDisconnectFromPeer(peerID)
             self.delegate?.didUpdatePeerList(currentPeerIDs)
+        }
+    }
+    
+    // MARK: - Transaction Relay Handlers
+    
+    private func handleTxSigned(_ packet: BitchatPacket, from peerID: PeerID) {
+        // Transaction relay request - forward to MeshTransactionRelay service
+        SecureLogger.info("📥 Received txSigned packet from \(peerID.id.prefix(8))…", category: .session)
+        
+        Task { @MainActor in
+            guard XMTPServiceContainer.isConfigured else {
+                SecureLogger.warning("XMTP container not configured, cannot handle tx relay", category: .session)
+                return
+            }
+            await XMTPServiceContainer.shared.meshTransactionRelay.handleIncomingTxSigned(packet.payload, from: peerID)
+        }
+    }
+    
+    private func handleTxConfirm(_ packet: BitchatPacket, from peerID: PeerID) {
+        // Transaction confirmation from relay peer
+        SecureLogger.info("📥 Received txConfirm packet from \(peerID.id.prefix(8))…", category: .session)
+        
+        Task { @MainActor in
+            guard XMTPServiceContainer.isConfigured else { return }
+            XMTPServiceContainer.shared.meshTransactionRelay.handleIncomingTxConfirm(packet.payload, from: peerID)
+        }
+    }
+    
+    private func handleTxReject(_ packet: BitchatPacket, from peerID: PeerID) {
+        // Transaction rejected by relay peer
+        SecureLogger.info("📥 Received txReject packet from \(peerID.id.prefix(8))…", category: .session)
+        
+        Task { @MainActor in
+            guard XMTPServiceContainer.isConfigured else { return }
+            XMTPServiceContainer.shared.meshTransactionRelay.handleIncomingTxReject(packet.payload, from: peerID)
         }
     }
     
@@ -3783,6 +3819,15 @@ extension BLEService {
             
         case .leave:
             handleLeave(packet, from: senderID)
+            
+        case .txRequest, .txSigned:
+            handleTxSigned(packet, from: senderID)
+            
+        case .txConfirm:
+            handleTxConfirm(packet, from: senderID)
+            
+        case .txReject:
+            handleTxReject(packet, from: senderID)
             
         case .none:
             SecureLogger.warning("⚠️ Unknown message type: \(packet.type)", category: .session)

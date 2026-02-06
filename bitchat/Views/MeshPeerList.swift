@@ -8,14 +8,18 @@ struct MeshPeerList: View {
     let onToggleFavorite: (PeerID) -> Void
     let onShowFingerprint: (PeerID) -> Void
     @Environment(\.colorScheme) var colorScheme
+    @EnvironmentObject var xmtpContainer: XMTPServiceContainer
 
     @State private var orderedIDs: [String] = []
+    @State private var showXMTPConversations: Bool = false
 
     private enum Strings {
         static let noneNearby: LocalizedStringKey = "geohash_people.none_nearby"
         static let blockedTooltip = String(localized: "geohash_people.tooltip.blocked", comment: "Tooltip shown next to a blocked peer indicator")
         static let newMessagesTooltip = String(localized: "mesh_peers.tooltip.new_messages", comment: "Tooltip for the unread messages indicator")
     }
+    
+    private var xmtpOrange: Color { .orange }
 
     var body: some View {
         let myPeerID = viewModel.meshService.myPeerID
@@ -39,6 +43,11 @@ struct MeshPeerList: View {
                     .foregroundColor(secondaryTextColor)
                     .padding(.horizontal)
                     .padding(.top, 12)
+                
+                // XMTP Conversations Section even when no mesh peers
+                xmtpSection
+                    .padding(.horizontal)
+                    .padding(.top, 16)
             }
         } else {
             VStack(alignment: .leading, spacing: 0) {
@@ -65,7 +74,7 @@ struct MeshPeerList: View {
                                 .foregroundColor(baseColor)
                         } else if peer.isMutualFavorite && peer.isXMTPReachable {
                             // Mutual favorite reachable via XMTP: wallet icon (blue)
-                            Image(systemName: "wallet.pass.fill")
+                            Image(systemName: "creditcard.fill")
                                 .font(.bitchatSystem(size: 10))
                                 .foregroundColor(.blue)
                         } else if peer.isMutualFavorite {
@@ -162,6 +171,139 @@ struct MeshPeerList: View {
                 for id in ids where !newOrder.contains(id) { newOrder.append(id) }
                 if newOrder != orderedIDs { orderedIDs = newOrder }
             }
+            
+            // XMTP Conversations Section
+            xmtpSection
+                .padding(.horizontal)
+                .padding(.top, 16)
         }
+    }
+    
+    // MARK: - XMTP Section
+    
+    private var xmtpSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button(action: { showXMTPConversations.toggle() }) {
+                HStack {
+                    Text("#xmtp")
+                        .font(.bitchatSystem(size: 14, weight: .semibold, design: .monospaced))
+                        .foregroundColor(xmtpOrange)
+                    
+                    if xmtpContainer.isInitialized {
+                        let contactCount = xmtpContainer.clientService.savedContacts.count
+                        Text("[\(contactCount) saved]")
+                            .font(.bitchatSystem(size: 12, design: .monospaced))
+                            .foregroundColor(.secondary)
+                    } else {
+                        Text("[not connected]")
+                            .font(.bitchatSystem(size: 12, design: .monospaced))
+                            .foregroundColor(.secondary)
+                    }
+                    
+                    Spacer()
+                    
+                    Image(systemName: showXMTPConversations ? "chevron.up" : "chevron.down")
+                        .font(.bitchatSystem(size: 12))
+                        .foregroundColor(.secondary)
+                }
+            }
+            .buttonStyle(.plain)
+            
+            if showXMTPConversations {
+                xmtpConversationsList
+            }
+        }
+        .padding(12)
+        .background(xmtpOrange.opacity(0.08))
+        .cornerRadius(8)
+    }
+    
+    @ViewBuilder
+    private var xmtpConversationsList: some View {
+        if !xmtpContainer.isInitialized {
+            Text("Connect wallet in settings to use XMTP")
+                .font(.bitchatSystem(size: 11, design: .monospaced))
+                .foregroundColor(.secondary)
+                .padding(.top, 4)
+        } else {
+            let contacts = xmtpContainer.clientService.savedContacts
+            let privateChats = viewModel.privateChats.filter { $0.key.isXMTPDM }
+            
+            if contacts.isEmpty && privateChats.isEmpty {
+                Text("No XMTP conversations yet.\nUse /dm-wallet <inbox-id> to start one.")
+                    .font(.bitchatSystem(size: 11, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .padding(.top, 4)
+            } else {
+                VStack(spacing: 0) {
+                    // Show saved contacts first
+                    ForEach(contacts) { contact in
+                        xmtpContactRow(contact)
+                    }
+                    
+                    // Show unsaved conversations
+                    let unsavedPeers = privateChats.keys.filter { peerID in
+                        !contacts.contains { $0.peerID == peerID }
+                    }
+                    ForEach(Array(unsavedPeers), id: \.self) { peerID in
+                        xmtpPeerRow(peerID)
+                    }
+                }
+            }
+        }
+    }
+    
+    private func xmtpContactRow(_ contact: XMTPContact) -> some View {
+        Button(action: {
+            viewModel.selectedPrivateChatPeer = contact.peerID
+        }) {
+            HStack {
+                Image(systemName: "star.fill")
+                    .font(.bitchatSystem(size: 10))
+                    .foregroundColor(xmtpOrange)
+                
+                Text(contact.displayName)
+                    .font(.bitchatSystem(size: 12, design: .monospaced))
+                    .foregroundColor(.primary)
+                
+                Spacer()
+                
+                // Unread indicator
+                if viewModel.unreadPrivateMessages.contains(contact.peerID) {
+                    Circle()
+                        .fill(xmtpOrange)
+                        .frame(width: 8, height: 8)
+                }
+            }
+            .padding(.vertical, 6)
+        }
+        .buttonStyle(.plain)
+    }
+    
+    private func xmtpPeerRow(_ peerID: PeerID) -> some View {
+        Button(action: {
+            viewModel.selectedPrivateChatPeer = peerID
+        }) {
+            HStack {
+                Image(systemName: "bubble.left")
+                    .font(.bitchatSystem(size: 10))
+                    .foregroundColor(.secondary)
+                
+                Text("XMTP:\(peerID.bare.prefix(8))…")
+                    .font(.bitchatSystem(size: 12, design: .monospaced))
+                    .foregroundColor(.primary)
+                
+                Spacer()
+                
+                // Unread indicator
+                if viewModel.unreadPrivateMessages.contains(peerID) {
+                    Circle()
+                        .fill(xmtpOrange)
+                        .frame(width: 8, height: 8)
+                }
+            }
+            .padding(.vertical, 6)
+        }
+        .buttonStyle(.plain)
     }
 }

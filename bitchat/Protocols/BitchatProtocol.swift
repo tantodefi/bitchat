@@ -81,6 +81,12 @@ enum MessageType: UInt8 {
     case fragment = 0x20        // Single fragment type for large messages
     case fileTransfer = 0x22    // Binary file/audio/image payloads
     
+    // Transaction relay (0x50-0x5F reserved)
+    case txRequest = 0x50       // Legacy: Transaction relay request (deprecated)
+    case txSigned = 0x51        // Pre-signed transaction for broadcast
+    case txConfirm = 0x52       // Transaction confirmation with hash
+    case txReject = 0x53        // Transaction rejected by relay peer
+    
     var description: String {
         switch self {
         case .announce: return "announce"
@@ -91,6 +97,10 @@ enum MessageType: UInt8 {
         case .noiseEncrypted: return "noiseEncrypted"
         case .fragment: return "fragment"
         case .fileTransfer: return "fileTransfer"
+        case .txRequest: return "txRequest"
+        case .txSigned: return "txSigned"
+        case .txConfirm: return "txConfirm"
+        case .txReject: return "txReject"
         }
     }
 }

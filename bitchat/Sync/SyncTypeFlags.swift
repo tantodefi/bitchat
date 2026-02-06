@@ -19,6 +19,10 @@ struct SyncTypeFlags: OptionSet {
         case .fragment: return 5
         case .requestSync: return 6
         case .fileTransfer: return 7
+        case .txRequest: return 8
+        case .txSigned: return 9
+        case .txConfirm: return 10
+        case .txReject: return 11
         }
     }
 
