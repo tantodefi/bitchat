@@ -48,6 +48,18 @@ final class XMTPClientService: ObservableObject {
     // Delegate for incoming messages
     weak var delegate: XMTPClientDelegate?
     
+    // MARK: - Inbox ID Mapping
+    
+    /// Store a full inbox ID mapping for later lookup
+    /// Call this when receiving messages from users to enable replying
+    func storeInboxIdMapping(fullInboxId: String) {
+        let truncated = String(fullInboxId.prefix(TransportConfig.nostrConvKeyPrefixLength))
+        if inboxIdMap[truncated] == nil {
+            inboxIdMap[truncated] = fullInboxId
+            SecureLogger.debug("📇 Stored inbox ID mapping: \(truncated) → \(fullInboxId.prefix(20))…", category: .network)
+        }
+    }
+    
     // MARK: - Initialization
     
     init(keychain: KeychainManagerProtocol, wallet: EmbeddedWallet, identityBridge: XMTPIdentityBridge) {
@@ -82,9 +94,10 @@ final class XMTPClientService: ObservableObject {
         let dbKey = try getOrCreateDbEncryptionKey()
         bootstrapProgress = 0.4
         
-        // Register codecs for attachments before creating client
+        // Register codecs for attachments and read receipts before creating client
         Client.register(codec: AttachmentCodec())
         Client.register(codec: RemoteAttachmentCodec())
+        Client.register(codec: ReadReceiptCodec())
         
         // Create XMTP client with encryption
         let xmtpClient = try await Client.create(
@@ -144,22 +157,100 @@ final class XMTPClientService: ObservableObject {
         return dm
     }
     
-    /// Create or join a group conversation
+    /// Find or create a group conversation for location channels.
+    ///
+    /// **XMTP MLS Group Limitations**:
+    /// - XMTP groups are invitation-based, not discovery-based
+    /// - The `groupId` parameter is used for local matching only (stored in group name)
+    /// - Groups cannot be "joined" by knowing their ID; members must be explicitly added
+    /// - For true public location channels, consider using Nostr ephemeral events instead
+    ///
+    /// This implementation searches for existing groups by matching the name pattern,
+    /// which allows reconnecting to previously created/joined groups.
+    ///
+    /// - Parameters:
+    ///   - groupId: A deterministic identifier derived from the geohash (for matching)
+    ///   - name: Human-readable group name
+    /// - Returns: An existing or newly created Group
     func findOrCreateGroup(groupId: String, name: String) async throws -> Group {
         guard let client = client else {
             throw XMTPClientError.notConnected
         }
         
-        // Try to find existing group first
+        // Try to find existing group by matching the group name
+        // The name includes the geohash, so it serves as our discovery mechanism
         let groups = try await client.conversations.listGroups()
         for group in groups {
-            if group.id == groupId {
+            // Match by name since XMTP group.id is an internal identifier
+            // Names are formatted as "📍 Location: <geohash_prefix>"
+            let groupName = try? group.name()
+            if groupName == name {
+                SecureLogger.debug("Found existing XMTP group for \(name)", category: .session)
                 return group
             }
         }
         
-        // Create new group (empty members, will be joined by others)
-        return try await client.conversations.newGroup(with: [], name: name)
+        // Create new group with allMembers permission so any member can add others
+        // This is crucial for open location-based groups
+        SecureLogger.info("Creating new XMTP location group: \(name)", category: .session)
+        return try await client.conversations.newGroup(
+            with: [],
+            permissions: .allMembers,  // Allow any member to add new members
+            name: name
+        )
+    }
+    
+    /// Find a group by its XMTP internal ID
+    /// Used when we know the exact group ID from a registry
+    func findGroupById(_ groupId: String) async throws -> Group? {
+        guard let client = client else {
+            throw XMTPClientError.notConnected
+        }
+        
+        let groups = try await client.conversations.listGroups()
+        return groups.first { group in
+            group.id == groupId
+        }
+    }
+    
+    /// Create a new open location group with allMembers permission
+    /// - Parameters:
+    ///   - name: Human-readable group name
+    ///   - geohash: The geohash this group is for (stored in description)
+    /// - Returns: The created Group and its ID
+    func createOpenLocationGroup(name: String, geohash: String) async throws -> Group {
+        guard let client = client else {
+            throw XMTPClientError.notConnected
+        }
+        
+        let description = "Open location channel for geohash: \(geohash)"
+        
+        // Create with allMembers permission - any member can add others
+        let group = try await client.conversations.newGroup(
+            with: [],
+            permissions: .allMembers,
+            name: name,
+            description: description
+        )
+        
+        SecureLogger.info("📍 Created open location group: \(name) (ID: \(group.id.prefix(16))…)", category: .session)
+        return group
+    }
+    
+    /// Add a member to a group by their inbox ID
+    /// Requires appropriate permissions (allMembers or admin)
+    func addMemberToGroup(_ group: Group, inboxId: String) async throws {
+        _ = try await group.addMembers(inboxIds: [inboxId])
+        let groupName = (try? group.name()) ?? "unnamed"
+        SecureLogger.debug("Added member \(inboxId.prefix(12))... to group \(groupName)", category: .session)
+    }
+    
+    /// List all groups the client is a member of
+    func listGroups() async throws -> [Group] {
+        guard let client = client else {
+            throw XMTPClientError.notConnected
+        }
+        return try await client.conversations.listGroups()
     }
     
     /// List all conversations
@@ -184,19 +275,19 @@ final class XMTPClientService: ObservableObject {
             dmCache[inboxId] = dm
         }
         
-        try await dm.send(content: content)
+        _ = try await dm.send(content: content)
         SecureLogger.debug("📤 Sent XMTP message to \(inboxId.prefix(8))…", category: .network)
     }
     
     /// Send a message to a DM conversation
     func sendMessage(_ content: String, to dm: Dm) async throws {
-        try await dm.send(content: content)
+        _ = try await dm.send(content: content)
         SecureLogger.debug("📤 Sent XMTP message", category: .network)
     }
     
     /// Send a message to a conversation
     func sendMessage(_ content: String, to conversation: Conversation) async throws {
-        try await conversation.send(content: content)
+        _ = try await conversation.send(content: content)
         SecureLogger.debug("📤 Sent XMTP message", category: .network)
     }
     
@@ -204,7 +295,7 @@ final class XMTPClientService: ObservableObject {
     func sendBitchatPacket(_ packet: Data, to dm: Dm) async throws {
         // Encode as base64 for text transport (custom codec will be added later)
         let encoded = "bitchat1:\(packet.base64EncodedString())"
-        try await dm.send(content: encoded)
+        _ = try await dm.send(content: encoded)
         SecureLogger.debug("📤 Sent BitChat packet via XMTP", category: .network)
     }
     
@@ -214,7 +305,7 @@ final class XMTPClientService: ObservableObject {
         let encoder = JSONEncoder()
         let data = try encoder.encode(request)
         let content = "txreq:\(data.base64EncodedString())"
-        try await dm.send(content: content)
+        _ = try await dm.send(content: content)
         SecureLogger.debug("📤 Sent transaction request via XMTP", category: .network)
     }
     
@@ -254,7 +345,7 @@ final class XMTPClientService: ObservableObject {
         remoteAttachment.filename = filename
         
         // Send via XMTP
-        try await dm.send(
+        _ = try await dm.send(
             content: remoteAttachment,
             options: .init(contentType: ContentTypeRemoteAttachment)
         )
@@ -285,6 +376,12 @@ final class XMTPClientService: ObservableObject {
     }
     
     private func handleIncomingMessage(_ message: DecodedMessage) async {
+        // Filter out our own messages to prevent storing our own inbox ID in the map
+        // This is critical - without it, replies would try to DM ourselves
+        if let myInboxId = self.inboxId, message.senderInboxId == myInboxId {
+            return
+        }
+        
         // Check if it's a BitChat packet
         if let textContent = try? message.content() as String? {
             if textContent.hasPrefix("bitchat1:") {
@@ -304,8 +401,11 @@ final class XMTPClientService: ObservableObject {
                 }
             }
             
+            // Check for location_msg JSON format and extract just the content
+            let displayContent = parseLocationMessageContent(textContent)
+            
             // Regular text message
-            delegate?.xmtpClient(self, didReceiveMessage: textContent, from: message.senderInboxId, messageId: message.id)
+            delegate?.xmtpClient(self, didReceiveMessage: displayContent, from: message.senderInboxId, messageId: message.id)
             return
         }
         
@@ -323,6 +423,18 @@ final class XMTPClientService: ObservableObject {
             // For now, just notify with a text message
             delegate?.xmtpClient(self, didReceiveMessage: "[attachment] \(attachment.filename)", from: message.senderInboxId, messageId: message.id)
         }
+    }
+    
+    /// Parse location message JSON format and extract just the content
+    /// Returns original text if not a location message format
+    private func parseLocationMessageContent(_ text: String) -> String {
+        guard let data = text.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              json["type"] as? String == "location_msg",
+              let content = json["content"] as? String else {
+            return text
+        }
+        return content
     }
     
     // MARK: - Sync
@@ -442,6 +554,41 @@ final class XMTPClientService: ObservableObject {
     func forceResetDatabase() {
         UserDefaults.standard.set(true, forKey: "xmtp-force-db-clear")
         SecureLogger.info("XMTP: Scheduled database reset for next connect", category: .network)
+    }
+    
+    // MARK: - Identity Lookup
+    
+    /// Look up an inbox ID from a wallet address or other identity
+    /// - Parameter identity: The public identity (wallet address) to look up
+    /// - Returns: The inbox ID if found, nil otherwise
+    func getInboxIdFromIdentity(identity: PublicIdentity) async throws -> String? {
+        guard let client = client else {
+            throw XMTPClientError.notConnected
+        }
+        return try await client.inboxIdFromIdentity(identity: identity)
+    }
+    
+    // MARK: - Read Receipts
+    
+    private static let readReceiptsKey = "enableReadReceipts"
+    
+    /// Enable or disable read receipts content type
+    /// When disabled, the client won't send read receipt messages to conversation partners
+    func setReadReceiptsEnabled(_ enabled: Bool) async {
+        // Store the preference - this affects whether we send read receipts
+        // The actual sending is controlled by the chat view when marking messages as read
+        UserDefaults.standard.set(enabled, forKey: Self.readReceiptsKey)
+        SecureLogger.info("XMTP: Read receipts \(enabled ? "enabled" : "disabled")", category: .network)
+    }
+    
+    /// Check if read receipts are enabled (defaults to true if not set)
+    /// This is nonisolated to allow checking from non-MainActor contexts (like XMTPTransport)
+    nonisolated var readReceiptsEnabled: Bool {
+        // If the key has never been set, default to true
+        if UserDefaults.standard.object(forKey: Self.readReceiptsKey) == nil {
+            return true
+        }
+        return UserDefaults.standard.bool(forKey: Self.readReceiptsKey)
     }
 }
 

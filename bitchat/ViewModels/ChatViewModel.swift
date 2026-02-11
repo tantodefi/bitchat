@@ -755,8 +755,87 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
             // Trim whitespace when loading
             nickname = savedNickname.trimmingCharacters(in: .whitespacesAndNewlines)
         } else {
+            // New user - generate anon username
             nickname = "anon\(Int.random(in: 1000...9999))"
             saveNickname()
+            
+            // Register ENS subdomain for new users
+            Task {
+                await registerENSSubdomainForNewUser()
+            }
+        }
+    }
+    
+    /// Register ENS subdomain for a new user
+    private func registerENSSubdomainForNewUser() async {
+        // Check if already registered
+        let ensKey = "ensSubdomain"
+        guard userDefaults.string(forKey: ensKey) == nil else { return }
+        
+        // Check if Namestone is configured
+        guard await NamestoneService.shared.isConfigured else {
+            SecureLogger.debug("Namestone not configured, skipping ENS registration", category: .network)
+            return
+        }
+        
+        // Wait for XMTP to be ready (max 30 seconds)
+        var attempts = 0
+        while !XMTPServiceContainer.isConfigured && attempts < 30 {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            attempts += 1
+        }
+        
+        guard XMTPServiceContainer.isConfigured else {
+            SecureLogger.debug("XMTP not ready, skipping ENS registration", category: .network)
+            return
+        }
+        
+        // Get wallet address from the container
+        let wallet = XMTPServiceContainer.shared.wallet
+        
+        do {
+            let address = try await wallet.getAddress()
+            let inboxId = XMTPServiceContainer.shared.clientService.inboxId
+            
+            // Try to register the ENS name
+            let success = try await NamestoneService.shared.setName(
+                name: nickname,
+                address: address,
+                xmtpInboxId: inboxId
+            )
+            
+            if success {
+                let fullName = "\(nickname).dstealth.eth"
+                await MainActor.run {
+                    userDefaults.set(fullName, forKey: ensKey)
+                }
+                SecureLogger.info("Registered ENS name: \(fullName)", category: .network)
+            }
+        } catch NamestoneError.nameAlreadyTaken {
+            // Name collision - try with a different suffix
+            let uniqueNickname = "\(nickname)-\(Int.random(in: 100...999))"
+            do {
+                let address = try await wallet.getAddress()
+                let inboxId = XMTPServiceContainer.shared.clientService.inboxId
+                
+                let success = try await NamestoneService.shared.setName(
+                    name: uniqueNickname,
+                    address: address,
+                    xmtpInboxId: inboxId
+                )
+                
+                if success {
+                    let fullName = "\(uniqueNickname).dstealth.eth"
+                    await MainActor.run {
+                        userDefaults.set(fullName, forKey: ensKey)
+                    }
+                    SecureLogger.info("Registered ENS name (with suffix): \(fullName)", category: .network)
+                }
+            } catch {
+                SecureLogger.error("Failed to register ENS with unique suffix: \(error)", category: .network)
+            }
+        } catch {
+            SecureLogger.error("Failed to register ENS: \(error)", category: .network)
         }
     }
     
@@ -3759,7 +3838,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         
         do {
             // Find or create DM with the inbox ID
-            let dm = try await XMTPServiceContainer.shared.clientService.findOrCreateDM(with: inboxId)
+            _ = try await XMTPServiceContainer.shared.clientService.findOrCreateDM(with: inboxId)
             
             // Create a virtual PeerID for this XMTP conversation
             let virtualPeerID = PeerID(xmtp: inboxId)

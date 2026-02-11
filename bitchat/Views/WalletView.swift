@@ -29,6 +29,26 @@ struct WalletView: View {
     @State private var copiedText: String = "Address copied!"
     @State private var showSendSheet: Bool = false
     @State private var showHistorySheet: Bool = false
+    @State private var showStealthSheet: Bool = false
+    @State private var showCrossChainSheet: Bool = false
+    
+    // Stealth address support
+    @StateObject private var stealthStore = StealthAddressStore()
+    private var stealthManager: StealthAddressManager {
+        StealthAddressManager(wallet: wallet)
+    }
+    
+    // Cross-chain support
+    private var eilManager: EILCrossChainManager {
+        EILCrossChainManager(wallet: wallet)
+    }
+    
+    // ENS name support
+    @AppStorage("ensSubdomain") private var ensSubdomain: String?
+    
+    // Beta warning - show once across both WalletView and WalletSettingsView
+    @AppStorage("wallet-beta-warning-accepted") private var betaWarningAccepted: Bool = false
+    @State private var showBetaWarning: Bool = false
     
     // Auto-refresh timer
     private let refreshInterval: TimeInterval = 15
@@ -39,6 +59,11 @@ struct WalletView: View {
                 // MARK: - QR Code
                 if !address.isEmpty {
                     qrCodeSection
+                }
+                
+                // MARK: - ENS Name
+                if !address.isEmpty {
+                    ensNameSection
                 }
                 
                 // MARK: - Address
@@ -68,6 +93,16 @@ struct WalletView: View {
                 if !address.isEmpty && !isLoading {
                     actionsSection
                 }
+                
+                // MARK: - Stealth Addresses
+                if !address.isEmpty && !isLoading {
+                    stealthSection
+                }
+                
+                // MARK: - Cross-Chain Swaps
+                if !address.isEmpty && !isLoading {
+                    crossChainSection
+                }
             }
             .padding()
         }
@@ -82,6 +117,19 @@ struct WalletView: View {
             // Auto-refresh balances periodically
             await autoRefreshBalances()
         }
+        .onAppear {
+            // Show beta warning once
+            if !betaWarningAccepted {
+                showBetaWarning = true
+            }
+        }
+        .alert("⚠️ Beta Wallet", isPresented: $showBetaWarning) {
+            Button("Accept") {
+                betaWarningAccepted = true
+            }
+        } message: {
+            Text("This wallet is still in beta and under active development.\n\nRecommended: Only use testnet funds for now.\n\nIf you use mainnet funds, make sure to export your private key from Wallet Settings.\n\nThe developer is not responsible for loss of funds. Please be safe.")
+        }
         .overlay(alignment: .bottom) {
             if showCopiedToast {
                 copiedToast
@@ -93,12 +141,36 @@ struct WalletView: View {
             SendTransactionView(
                 wallet: wallet,
                 balanceService: balanceService,
-                meshRelay: xmtpContainer.meshTransactionRelay
+                meshRelay: xmtpContainer.meshTransactionRelay,
+                onSuccess: {
+                    // Refresh balances after successful send
+                    Task {
+                        if let address = try? await wallet.getAddress() {
+                            await balanceService.fetchBalances(for: address)
+                        }
+                    }
+                }
             )
         }
         .sheet(isPresented: $showHistorySheet) {
             TransactionHistoryView(
                 meshRelay: xmtpContainer.meshTransactionRelay,
+                balanceService: balanceService
+            )
+        }
+        .sheet(isPresented: $showStealthSheet) {
+            NavigationStack {
+                StealthAddressListView(
+                    store: stealthStore,
+                    stealthManager: stealthManager,
+                    balanceService: balanceService
+                )
+            }
+        }
+        .sheet(isPresented: $showCrossChainSheet) {
+            CrossChainSwapView(
+                wallet: wallet,
+                eilManager: eilManager,
                 balanceService: balanceService
             )
         }
@@ -135,6 +207,78 @@ struct WalletView: View {
             Text("Scan to receive")
                 .font(.caption)
                 .foregroundColor(.secondary)
+        }
+    }
+    
+    private var ensNameSection: some View {
+        Group {
+            if let ensName = ensSubdomain {
+                VStack(spacing: 8) {
+                    HStack(spacing: 12) {
+                        // ENS name display
+                        HStack(spacing: 8) {
+                            Image(systemName: "globe")
+                                .font(.body)
+                                .foregroundColor(.accentColor)
+                            
+                            Text(ensName)
+                                .font(.system(.headline, design: .rounded))
+                                .foregroundColor(.primary)
+                        }
+                        
+                        Spacer()
+                        
+                        // Copy button
+                        Button {
+                            copyENSName(ensName)
+                        } label: {
+                            Image(systemName: "doc.on.doc")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Copy ENS name")
+                        
+                        // Edit button - navigate to ENS settings
+                        NavigationLink {
+                            ENSSettingsView(
+                                currentName: ensName,
+                                walletAddress: address,
+                                xmtpInboxId: xmtpContainer.clientService.inboxId,
+                                onNameChanged: { newName in
+                                    ensSubdomain = newName
+                                }
+                            )
+                        } label: {
+                            Image(systemName: "pencil.circle.fill")
+                                .font(.title3)
+                                .foregroundColor(.accentColor)
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Edit ENS name")
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
+                    .background(Color.accentColor.opacity(0.1))
+                    .cornerRadius(10)
+                }
+            }
+        }
+    }
+    
+    private func copyENSName(_ name: String) {
+        #if os(iOS)
+        UIPasteboard.general.string = name
+        #else
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(name, forType: .string)
+        #endif
+        
+        copiedText = "ENS name copied!"
+        showCopiedToast = true
+        
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            showCopiedToast = false
         }
     }
     
@@ -316,6 +460,113 @@ struct WalletView: View {
                 }
                 .buttonStyle(.plain)
             }
+        }
+    }
+    
+    private var stealthSection: some View {
+        VStack(spacing: 12) {
+            HStack {
+                Text("Private Receiving")
+                    .font(.headline)
+                
+                Spacer()
+                
+                if stealthStore.withBalanceCount > 0 {
+                    Text("\(stealthStore.withBalanceCount) with balance")
+                        .font(.caption)
+                        .foregroundColor(.green)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.green.opacity(0.15))
+                        .cornerRadius(8)
+                }
+            }
+            
+            Button {
+                showStealthSheet = true
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: "eye.slash.fill")
+                        .font(.title2)
+                        .foregroundColor(.accentColor)
+                    
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Stealth Addresses")
+                            .font(.subheadline)
+                            .fontWeight(.medium)
+                        
+                        Text("EIP-5564 privacy receiving")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    
+                    Spacer()
+                    
+                    HStack(spacing: 4) {
+                        if stealthStore.totalCount > 0 {
+                            Text("\(stealthStore.totalCount)")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        Image(systemName: "chevron.right")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .padding()
+                .background(Color(.systemGray).opacity(0.1))
+                .cornerRadius(12)
+            }
+            .buttonStyle(.plain)
+            
+            Text("Receive payments to unique addresses that only you can identify and spend from.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+    }
+    
+    private var crossChainSection: some View {
+        VStack(spacing: 12) {
+            HStack {
+                Text("Cross-Chain")
+                    .font(.headline)
+                
+                Spacer()
+            }
+            
+            Button {
+                showCrossChainSheet = true
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: "arrow.left.arrow.right.circle.fill")
+                        .font(.title2)
+                        .foregroundColor(.purple)
+                    
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Cross-Chain Swap")
+                            .font(.subheadline)
+                            .fontWeight(.medium)
+                        
+                        Text("EIP-7702 + EIL atomic swaps")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    
+                    Spacer()
+                    
+                    Image(systemName: "chevron.right")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                .padding()
+                .background(Color(.systemGray).opacity(0.1))
+                .cornerRadius(12)
+            }
+            .buttonStyle(.plain)
+            
+            Text("Swap assets between chains using EIL's trustless liquidity network.")
+                .font(.caption)
+                .foregroundColor(.secondary)
         }
     }
     

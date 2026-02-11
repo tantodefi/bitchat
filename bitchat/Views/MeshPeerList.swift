@@ -230,7 +230,7 @@ struct MeshPeerList: View {
             let privateChats = viewModel.privateChats.filter { $0.key.isXMTPDM }
             
             if contacts.isEmpty && privateChats.isEmpty {
-                Text("No XMTP conversations yet.\nUse /dm-wallet <inbox-id> to start one.")
+                Text("No XMTP conversations yet.\nUse /dm-wallet with inbox ID, wallet, or ENS.")
                     .font(.bitchatSystem(size: 11, design: .monospaced))
                     .foregroundColor(.secondary)
                     .padding(.top, 4)

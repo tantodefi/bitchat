@@ -25,6 +25,9 @@ final class MeshTransactionRelay: ObservableObject {
     /// Recently confirmed transactions
     @Published private(set) var confirmedTransactions: [ConfirmedTransaction] = []
     
+    /// Failed transactions with reasons (rejected by network, not network errors)
+    @Published private(set) var failedTransactions: [FailedTransaction] = []
+    
     /// Relay strategy setting
     @Published var allowMeshRelay: Bool {
         didSet {
@@ -35,6 +38,7 @@ final class MeshTransactionRelay: ObservableObject {
     private let keychain: KeychainManagerProtocol
     private weak var bleService: BLEService?
     private let storageKey = "mesh-tx-pending-relays"
+    private let failedStorageKey = "mesh-tx-failed-history"
     private var retryTask: Task<Void, Never>?
     private var retryScheduled = false
     
@@ -87,12 +91,24 @@ final class MeshTransactionRelay: ObservableObject {
         let blockNumber: UInt64?
     }
     
+    /// Failed transaction record with reason
+    struct FailedTransaction: Codable, Identifiable {
+        let id: String
+        let chainId: UInt64
+        let toAddress: String
+        let amount: UInt64?
+        let currency: String?
+        let failedAt: Date
+        let reason: String
+    }
+    
     // MARK: - Initialization
     
     init(keychain: KeychainManagerProtocol) {
         self.keychain = keychain
         self.allowMeshRelay = UserDefaults.standard.bool(forKey: "mesh-tx-relay-enabled")
         loadPendingRelays()
+        loadFailedTransactions()
         
         // Start retry loop for any queued transactions
         if !pendingRelays.isEmpty {
@@ -373,8 +389,8 @@ final class MeshTransactionRelay: ObservableObject {
             // Check if it's a real transaction error vs network error
             switch error {
             case .rpcError(let message):
-                // Real blockchain error - mark as failed (invalid nonce, insufficient funds, etc.)
-                updateRelayStatus(relay.id, status: .failed, relayedVia: nil)
+                // Real blockchain error - move to failed history (invalid nonce, insufficient funds, etc.)
+                moveToFailedHistory(relay, reason: message)
                 SecureLogger.error("❌ Transaction rejected by network: \(message)", category: .session)
             default:
                 // Network/connectivity error - keep queued for retry
@@ -508,7 +524,7 @@ final class MeshTransactionRelay: ObservableObject {
         for relay in queuedRelays {
             if now.timeIntervalSince(relay.createdAt) > maxRetryAge {
                 SecureLogger.warning("⏰ Transaction \(relay.id.prefix(8))… expired after 24h", category: .session)
-                updateRelayStatus(relay.id, status: .failed, relayedVia: nil)
+                moveToFailedHistory(relay, reason: "Expired after 24 hours without successful broadcast")
                 continue
             }
             
@@ -562,6 +578,49 @@ final class MeshTransactionRelay: ObservableObject {
         if let data = try? JSONEncoder().encode(pendingRelays) {
             UserDefaults.standard.set(data, forKey: storageKey)
         }
+    }
+    
+    private func loadFailedTransactions() {
+        guard let data = UserDefaults.standard.data(forKey: failedStorageKey),
+              let failed = try? JSONDecoder().decode([FailedTransaction].self, from: data) else {
+            return
+        }
+        failedTransactions = failed
+    }
+    
+    private func saveFailedTransactions() {
+        if let data = try? JSONEncoder().encode(failedTransactions) {
+            UserDefaults.standard.set(data, forKey: failedStorageKey)
+        }
+    }
+    
+    /// Move a relay to failed history with a reason
+    private func moveToFailedHistory(_ relay: PendingRelay, reason: String) {
+        // Create failed transaction record
+        let failed = FailedTransaction(
+            id: relay.id,
+            chainId: relay.payload.chainId,
+            toAddress: relay.payload.toAddress,
+            amount: relay.payload.amount,
+            currency: relay.payload.currency,
+            failedAt: Date(),
+            reason: reason
+        )
+        failedTransactions.append(failed)
+        saveFailedTransactions()
+        
+        // Remove from pending
+        pendingRelays.removeAll { $0.id == relay.id }
+        savePendingRelays()
+        
+        SecureLogger.info("📋 Moved tx \(relay.id.prefix(8))… to failed history: \(reason)", category: .session)
+    }
+    
+    /// Clear failed transaction history
+    func clearFailedHistory() {
+        failedTransactions.removeAll()
+        saveFailedTransactions()
+        SecureLogger.info("🧹 Cleared failed transaction history", category: .session)
     }
 }
 

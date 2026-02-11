@@ -36,6 +36,20 @@ final class NostrIdentityBridge {
         return nostrIdentity
     }
     
+    /// Get or create the app's main Nostr identity (non-optional, creates if needed)
+    func getOrCreateAppIdentity() throws -> NostrIdentity {
+        if let existing = try getCurrentNostrIdentity() {
+            return existing
+        }
+        
+        // If getCurrentNostrIdentity() returned nil but didn't throw,
+        // something unexpected happened. Generate a new one.
+        let identity = try NostrIdentity.generate()
+        let data = try JSONEncoder().encode(identity)
+        keychain.save(key: currentIdentityKey, data: data, service: keychainService, accessible: nil)
+        return identity
+    }
+    
     /// Associate a Nostr identity with a Noise public key (for favorites)
     func associateNostrIdentity(_ nostrPubkey: String, with noisePublicKey: Data) {
         let key = "nostr-noise-\(noisePublicKey.base64EncodedString())"

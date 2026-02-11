@@ -125,8 +125,15 @@ final class XMTPIdentityBridge {
         return seed
     }
     
-    /// Derive a deterministic XMTP group ID for a given geohash.
-    /// Uses HMAC-SHA256(deviceSeed, "xmtp-geo:" + geohash) to create a stable group identifier.
+    /// Derive a deterministic group identifier for a given geohash.
+    /// 
+    /// **IMPORTANT**: This uses the geohash directly as the basis for the identifier,
+    /// ensuring all users derive the same ID for the same geohash.
+    /// The previous per-device seed approach caused users to create separate groups.
+    ///
+    /// Note: XMTP MLS groups are invitation-based, not discovery-based.
+    /// This identifier is used for local caching/matching, but groups must be
+    /// discovered via explicit invitations or a coordination service.
     func deriveGroupId(forGeohash geohash: String) -> String {
         cacheLock.lock()
         if let cached = derivedGroupCache[geohash] {
@@ -135,13 +142,15 @@ final class XMTPIdentityBridge {
         }
         cacheLock.unlock()
         
-        let seed = getOrCreateDeviceSeed()
+        // Use a fixed, public seed so all users derive the same group identifier
+        // This enables group discovery coordination via a separate service
+        let publicSeed = "bitchat-geo-v1".data(using: .utf8)!
         let input = "xmtp-geo:\(geohash)"
         guard let inputData = input.data(using: .utf8) else {
             return "geo-\(geohash)"
         }
         
-        let code = HMAC<SHA256>.authenticationCode(for: inputData, using: SymmetricKey(data: seed))
+        let code = HMAC<SHA256>.authenticationCode(for: inputData, using: SymmetricKey(data: publicSeed))
         let groupId = Data(code).base64EncodedString()
             .replacingOccurrences(of: "+", with: "-")
             .replacingOccurrences(of: "/", with: "_")

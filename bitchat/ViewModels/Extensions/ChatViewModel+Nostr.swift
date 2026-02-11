@@ -425,12 +425,18 @@ extension ChatViewModel {
     func sendGeohash(context: GeoOutgoingContext) {
         let ch = context.channel
         let event = context.event
-        let identity = context.identity
+        _ = context.identity
         
         // Check if we should use XMTP for geo channels
-        if TransportPreferences.shared.geoTransport == .xmtp,
-           XMTPServiceContainer.isConfigured,
-           XMTPServiceContainer.shared.isInitialized {
+        let geoTransport = TransportPreferences.shared.geoTransport
+        let xmtpConfigured = XMTPServiceContainer.isConfigured
+        let xmtpInitialized = xmtpConfigured ? XMTPServiceContainer.shared.isInitialized : false
+        
+        SecureLogger.debug("📍 sendGeohash: geoTransport=\(geoTransport), xmtpConfigured=\(xmtpConfigured), xmtpInitialized=\(xmtpInitialized)", category: .session)
+        
+        if geoTransport == .xmtp,
+           xmtpConfigured,
+           xmtpInitialized {
             // Send via XMTP location channels
             Task { @MainActor in
                 do {
@@ -438,6 +444,7 @@ extension ChatViewModel {
                     
                     // Ensure we're in the channel
                     if locationChannels.activeChannels[ch.geohash]?.isJoined != true {
+                        SecureLogger.debug("📍 XMTP geo: joining channel \(ch.geohash)", category: .session)
                         try await locationChannels.joinChannel(geohash: ch.geohash)
                     }
                     
@@ -459,6 +466,7 @@ extension ChatViewModel {
             return
         }
         
+        SecureLogger.debug("📍 Using Nostr for geo channel (XMTP not available or not selected)", category: .session)
         // Default: send via Nostr
         sendGeohashViaNostr(context: context)
     }

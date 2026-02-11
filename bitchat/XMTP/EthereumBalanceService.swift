@@ -118,7 +118,7 @@ final class EthereumBalanceService: ObservableObject {
     @Published private(set) var balances: [Network: Balance] = [:]
     @Published private(set) var isLoading: Bool = false
     @Published private(set) var lastError: String?
-    @Published var useTestnet: Bool = false {
+    @Published var useTestnet: Bool = true {
         didSet {
             UserDefaults.standard.set(useTestnet, forKey: "wallet-use-testnet")
             // Clear balances when switching network mode
@@ -135,8 +135,12 @@ final class EthereumBalanceService: ObservableObject {
     // MARK: - Initialization
     
     init() {
-        // Load saved testnet preference
-        self.useTestnet = UserDefaults.standard.bool(forKey: "wallet-use-testnet")
+        // Load saved testnet preference (default to true for safety)
+        if UserDefaults.standard.object(forKey: "wallet-use-testnet") != nil {
+            self.useTestnet = UserDefaults.standard.bool(forKey: "wallet-use-testnet")
+        } else {
+            self.useTestnet = true
+        }
     }
     
     // MARK: - Public Methods

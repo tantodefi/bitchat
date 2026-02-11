@@ -95,18 +95,24 @@ struct MessagingSettingsView: View {
                 
                 if preferences.geoTransport == .xmtp {
                     Label {
-                        Text("Using XMTP groups for location channels")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("XMTP Groups (Beta)")
+                                .font(.caption)
+                                .fontWeight(.medium)
+                                .foregroundColor(.orange)
+                            Text("Uses Nostr to coordinate XMTP group membership. Persistent message history. May have delays when joining busy areas.")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
                     } icon: {
-                        Image(systemName: "info.circle")
-                            .foregroundColor(.blue)
+                        Image(systemName: "person.3.fill")
+                            .foregroundColor(.orange)
                     }
                 }
             } header: {
                 Text("Location Features")
             } footer: {
-                Text("Transport used for geo-location channels and presence broadcasting.")
+                Text("Transport used for geo-location channels and presence broadcasting. Nostr is recommended for public location channels.")
             }
             
             // MARK: - XMTP Configuration
@@ -114,19 +120,26 @@ struct MessagingSettingsView: View {
                 Section {
                     NavigationLink {
                         XMTPSettingsView(
-                            meshTransactionRelay: xmtpContainer.meshTransactionRelay,
-                            clientService: xmtpContainer.clientService,
-                            balanceService: xmtpContainer.balanceService,
-                            wallet: xmtpContainer.wallet
+                            clientService: xmtpContainer.clientService
                         )
                     } label: {
                         Label("XMTP Settings", systemImage: "gearshape")
                     }
                     
                     NavigationLink {
+                        WalletSettingsView(
+                            meshTransactionRelay: xmtpContainer.meshTransactionRelay,
+                            balanceService: xmtpContainer.balanceService,
+                            wallet: xmtpContainer.wallet
+                        )
+                    } label: {
+                        Label("Wallet Settings", systemImage: "wallet.pass")
+                    }
+                    
+                    NavigationLink {
                         WalletView(wallet: xmtpContainer.wallet)
                     } label: {
-                        Label("Wallet", systemImage: "creditcard.fill")
+                        Label("View Wallet", systemImage: "creditcard.fill")
                     }
                 } header: {
                     Text("XMTP Configuration")

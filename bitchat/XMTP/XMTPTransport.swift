@@ -182,6 +182,12 @@ final class XMTPTransport: Transport, @unchecked Sendable {
     }
     
     func sendReadReceipt(_ receipt: ReadReceipt, to peerID: PeerID) {
+        // Check if read receipts are enabled in settings
+        guard clientService.readReceiptsEnabled else {
+            SecureLogger.debug("XMTPTransport: read receipts disabled, skipping", category: .session)
+            return
+        }
+        
         queue.async(flags: .barrier) { [weak self] in
             self?.readQueue.append(QueuedRead(receipt: receipt, peerID: peerID))
             self?.processReadQueueIfNeeded()

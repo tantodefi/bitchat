@@ -385,10 +385,7 @@ struct AppInfoView: View {
         .sheet(isPresented: $showXMTPSettings) {
             NavigationStack {
                 XMTPSettingsView(
-                    meshTransactionRelay: xmtpContainer.meshTransactionRelay,
-                    clientService: xmtpContainer.clientService,
-                    balanceService: xmtpContainer.balanceService,
-                    wallet: xmtpContainer.wallet
+                    clientService: xmtpContainer.clientService
                 )
             }
         }

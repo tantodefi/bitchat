@@ -3,7 +3,22 @@
 // bitchat
 //
 // XMTP group-based location channels using geohash-derived group IDs.
-// Replaces Nostr ephemeral events with persistent XMTP groups.
+//
+// **Open Group Architecture (with GeohashGroupRegistry)**:
+// When the GeohashGroupRegistry is configured, this enables truly open location groups:
+// 1. Nostr is used as a decentralized database to store geohash→XMTP group mappings
+// 2. First user to enter a geohash creates the XMTP group with "allMembers" permissions
+// 3. The group ID is published to Nostr so other users can discover it
+// 4. Users joining later query Nostr for the group ID and publish join requests
+// 5. Existing members (any member, due to allMembers permission) add newcomers
+//
+// **Fallback Mode (without registry)**:
+// Without the registry, each user creates their own group and messages aren't shared.
+// This is still useful for testing or when Nostr is unavailable.
+//
+// For maximum compatibility, Nostr ephemeral events (kind 20000) remain the
+// recommended transport for public location channels. XMTP groups are better
+// suited when persistent message history is desired.
 //
 // This is free and unencumbered software released into the public domain.
 // For more information, see <https://unlicense.org>
@@ -15,6 +30,9 @@ import Foundation
 import XMTP
 
 /// Manages XMTP-based location channels (geographic chat rooms)
+///
+/// **Limitations**: Due to XMTP's MLS architecture, these are effectively private groups.
+/// For public location channels, prefer the Nostr transport option in settings.
 @MainActor
 final class XMTPLocationChannels: ObservableObject {
     // MARK: - Properties
@@ -22,12 +40,19 @@ final class XMTPLocationChannels: ObservableObject {
     private let identityBridge: XMTPIdentityBridge
     private let clientService: XMTPClientService
     
+    /// Optional registry for open group discovery
+    /// When set, enables cross-user group discovery via Nostr
+    private var registry: GeohashGroupRegistry?
+    
     // Active location channel subscriptions
     @Published private(set) var activeChannels: [String: LocationChannel] = [:] // geohash -> channel
     @Published private(set) var currentGeohash: String?
     
     // Message stream tasks
     private var streamTasks: [String: Task<Void, Never>] = [:]
+    
+    // Join request listener task
+    private var joinRequestTask: Task<Void, Never>?
     
     // Delegate for incoming messages
     weak var delegate: XMTPLocationChannelsDelegate?
@@ -66,9 +91,22 @@ final class XMTPLocationChannels: ObservableObject {
         }
     }
     
+    // MARK: - Registry Integration
+    
+    /// Set the geohash group registry for open group support
+    func setRegistry(_ registry: GeohashGroupRegistry) {
+        self.registry = registry
+    }
+    
     // MARK: - Channel Management
     
     /// Join a location channel for the given geohash
+    /// 
+    /// Flow with registry (open groups):
+    /// 1. Check if we're already a member of a group for this geohash
+    /// 2. Query registry for existing group
+    /// 3. If found, check if we're a member; if not, request to join
+    /// 4. If not found, create new group and register it
     func joinChannel(geohash: String) async throws {
         guard clientService.isConnected else {
             throw LocationChannelError.notConnected
@@ -80,17 +118,16 @@ final class XMTPLocationChannels: ObservableObject {
             return
         }
         
-        let groupId = identityBridge.deriveGroupId(forGeohash: geohash)
         let groupName = identityBridge.groupName(forGeohash: geohash)
         
-        SecureLogger.info("📍 Joining location channel: \(geohash) (group: \(groupId.prefix(16))…)", category: .session)
+        SecureLogger.info("📍 Joining location channel: \(geohash)", category: .session)
         
-        // Find or create the XMTP group
-        let group = try await clientService.findOrCreateGroup(groupId: groupId, name: groupName)
+        // Try to find or create the group using the registry-aware approach
+        let group = try await findOrJoinLocationGroup(geohash: geohash, groupName: groupName)
         
         let channel = LocationChannel(
             geohash: geohash,
-            groupId: groupId,
+            groupId: group.id,
             group: group,
             precision: geohash.count,
             lastActivity: Date(),
@@ -105,6 +142,64 @@ final class XMTPLocationChannels: ObservableObject {
         startMessageStream(for: geohash, group: group)
         
         SecureLogger.info("✅ Joined location channel: \(geohash) (\(channel.memberCount) members)", category: .session)
+    }
+    
+    /// Find or join a location group, using registry if available
+    private func findOrJoinLocationGroup(geohash: String, groupName: String) async throws -> Group {
+        // Step 1: Check if we're already a member of a group with this name
+        if let existingGroup = try await clientService.findGroupById(groupName) {
+            return existingGroup
+        }
+        
+        // Also check by name match
+        let groups = try await clientService.listGroups()
+        if let matchingGroup = groups.first(where: { (try? $0.name()) == groupName }) {
+            return matchingGroup
+        }
+        
+        // Step 2: If registry is available, use it for open group discovery
+        if let registry = registry {
+            // Query registry for existing group
+            if let mapping = await registry.lookupGroup(forGeohash: geohash) {
+                SecureLogger.debug("📍 Found registered group for \(geohash): \(mapping.xmtpGroupId.prefix(16))…", category: .session)
+                
+                // Check if we're already a member
+                if let group = try await clientService.findGroupById(mapping.xmtpGroupId) {
+                    return group
+                }
+                
+                // We're not a member yet - publish join request
+                // Other members listening will add us
+                if let myInboxId = clientService.inboxId {
+                    try await registry.requestJoin(geohash: geohash, myInboxId: myInboxId)
+                    
+                    // Wait briefly for someone to add us, then check again
+                    try await Task.sleep(nanoseconds: 2_000_000_000) // 2 seconds
+                    
+                    if let group = try await clientService.findGroupById(mapping.xmtpGroupId) {
+                        registry.completeJoin(geohash: geohash)
+                        return group
+                    }
+                }
+                
+                // Still not added - we may need to wait or create our own
+                SecureLogger.warning("📍 Join request sent but not yet added to group for \(geohash)", category: .session)
+            }
+        }
+        
+        // Step 3: No existing group found - create a new one
+        let group = try await clientService.createOpenLocationGroup(name: groupName, geohash: geohash)
+        
+        // Register the new group if registry is available
+        if let registry = registry, let myInboxId = clientService.inboxId {
+            try? await registry.registerGroup(
+                geohash: geohash,
+                xmtpGroupId: group.id,
+                creatorInboxId: myInboxId
+            )
+        }
+        
+        return group
     }
     
     /// Leave a location channel
@@ -131,6 +226,8 @@ final class XMTPLocationChannels: ObservableObject {
         for geohash in activeChannels.keys {
             leaveChannel(geohash: geohash)
         }
+        joinRequestTask?.cancel()
+        joinRequestTask = nil
     }
     
     /// Update location and switch channels if needed
@@ -146,8 +243,71 @@ final class XMTPLocationChannels: ObservableObject {
         }
     }
     
-    // MARK: - Messaging
+    // MARK: - Join Request Handling
     
+    /// Handle an incoming join request from another user
+    /// This is called when we receive a Nostr event requesting to join a geohash group
+    func handleJoinRequest(geohash: String, requesterInboxId: String) async {
+        // Check if we have a group for this geohash
+        guard let channel = activeChannels[geohash],
+              channel.isJoined,
+              let group = channel.group else {
+            SecureLogger.debug("📍 Ignoring join request for \(geohash) - not our group", category: .session)
+            return
+        }
+        
+        // Check if requester is already a member
+        do {
+            let members = try await group.members
+            let memberInboxIds = members.map { $0.inboxId }
+            
+            if memberInboxIds.contains(requesterInboxId) {
+                SecureLogger.debug("📍 Requester \(requesterInboxId.prefix(12))… already in group", category: .session)
+                return
+            }
+            
+            // Add the requester to the group
+            try await clientService.addMemberToGroup(group, inboxId: requesterInboxId)
+            SecureLogger.info("📍 Added \(requesterInboxId.prefix(12))… to location channel \(geohash)", category: .session)
+            
+        } catch {
+            SecureLogger.error("📍 Failed to add member to group: \(error.localizedDescription)", category: .session)
+        }
+    }
+    
+    // MARK: - Member Info
+    
+    /// Get the members of a location channel
+    /// Returns array of tuples with (inboxId, nickname if known)
+    func getMembers(for geohash: String) async -> [(inboxId: String, nickname: String?)] {
+        guard let channel = activeChannels[geohash],
+              channel.isJoined,
+              let group = channel.group else {
+            return []
+        }
+        
+        do {
+            let members = try await group.members
+            return members.map { member in
+                // Try to find a saved nickname for this member
+                let nickname = clientService.savedContacts.first { 
+                    $0.truncatedId == String(member.inboxId.prefix(16))
+                }?.displayName
+                return (inboxId: member.inboxId, nickname: nickname)
+            }
+        } catch {
+            SecureLogger.error("📍 Failed to get members: \(error.localizedDescription)", category: .session)
+            return []
+        }
+    }
+    
+    /// Get member count for a location channel
+    func getMemberCount(for geohash: String) -> Int {
+        return activeChannels[geohash]?.memberCount ?? 0
+    }
+    
+    // MARK: - Messaging
+
     /// Send a message to a location channel
     func sendMessage(_ content: String, to geohash: String) async throws {
         guard let channel = activeChannels[geohash], channel.isJoined,

@@ -7,6 +7,7 @@
 //
 
 import Foundation
+import XMTP
 
 /// Result of command processing
 enum CommandResult {
@@ -389,27 +390,99 @@ final class CommandProcessor {
     }
     
     private func handleDMWallet(_ args: String) -> CommandResult {
-        let inboxId = args.trimmingCharacters(in: .whitespaces)
+        let input = args.trimmingCharacters(in: .whitespaces)
         
-        guard !inboxId.isEmpty else {
-            return .error(message: "usage: /dm-wallet <inbox_id>\nGet inbox ID from recipient's /xmtp command")
-        }
-        
-        // Validate inbox ID format (64 char hex)
-        guard inboxId.count == 64, inboxId.allSatisfy({ $0.isHexDigit }) else {
-            return .error(message: "invalid inbox ID format. Must be 64 hex characters")
+        guard !input.isEmpty else {
+            return .error(message: """
+                usage: /dm-wallet <inbox_id, wallet, or ens_name>
+                
+                Examples:
+                  /dm-wallet alice.dstealth.eth
+                  /dm-wallet vitalik.eth
+                  /dm-wallet 0x1234...abcd (42 char wallet)
+                  /dm-wallet 64charhexinboxid
+                """)
         }
         
         guard XMTPServiceContainer.isConfigured, XMTPServiceContainer.shared.isInitialized else {
             return .error(message: "XMTP not connected. Check /xmtp status")
         }
         
-        // Start DM asynchronously
-        Task {
-            await contextProvider?.startXMTPChat(with: inboxId)
+        // Check if it's an ENS name
+        if input.contains(".eth") {
+            return resolveENSAndStartDM(ensName: input)
         }
         
-        return .success(message: "opening XMTP DM with \(inboxId.prefix(8))…")
+        // Check if it's a wallet address (0x...)
+        if input.hasPrefix("0x") && input.count == 42 {
+            return resolveWalletAndStartDM(walletAddress: input)
+        }
+        
+        // Validate inbox ID format (64 char hex)
+        guard input.count == 64, input.allSatisfy({ $0.isHexDigit }) else {
+            return .error(message: "invalid input. Provide ENS (*.eth), wallet (0x...), or 64-char hex inbox ID")
+        }
+        
+        // Start DM with inbox ID
+        Task {
+            await contextProvider?.startXMTPChat(with: input)
+        }
+        
+        return .success(message: "opening XMTP DM with \(input.prefix(8))…")
+    }
+    
+    private func resolveWalletAndStartDM(walletAddress: String) -> CommandResult {
+        Task {
+            do {
+                let identity = PublicIdentity(kind: .ethereum, identifier: walletAddress.lowercased())
+                if let inboxId = try await XMTPServiceContainer.shared.clientService.getInboxIdFromIdentity(identity: identity) {
+                    await contextProvider?.startXMTPChat(with: inboxId)
+                } else {
+                    await MainActor.run {
+                        contextProvider?.addPublicSystemMessage("⚠️ No XMTP identity found for wallet \(walletAddress.prefix(10))...")
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage("❌ Wallet lookup failed: \(error.localizedDescription)")
+                }
+            }
+        }
+        
+        return .success(message: "looking up \(walletAddress.prefix(10))…")
+    }
+    
+    private func resolveENSAndStartDM(ensName: String) -> CommandResult {
+        Task {
+            do {
+                let resolution = try await ENSResolver.shared.resolve(ensName)
+                
+                if let inboxId = resolution.xmtpInboxId, !inboxId.isEmpty {
+                    // Has XMTP inbox ID in ENS records - use that directly
+                    await contextProvider?.startXMTPChat(with: inboxId)
+                } else if !resolution.address.isEmpty {
+                    // Has address but no inbox ID in records - try XMTP SDK lookup
+                    let identity = PublicIdentity(kind: .ethereum, identifier: resolution.address.lowercased())
+                    if let inboxId = try await XMTPServiceContainer.shared.clientService.getInboxIdFromIdentity(identity: identity) {
+                        await contextProvider?.startXMTPChat(with: inboxId)
+                    } else {
+                        await MainActor.run {
+                            contextProvider?.addPublicSystemMessage("⚠️ \(ensName) resolves to \(resolution.address.prefix(10))... but no XMTP identity found")
+                        }
+                    }
+                } else {
+                    await MainActor.run {
+                        contextProvider?.addPublicSystemMessage("⚠️ \(ensName) has no address or XMTP inbox")
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage("❌ ENS resolution failed: \(error.localizedDescription)")
+                }
+            }
+        }
+        
+        return .success(message: "resolving \(ensName)…")
     }
     
     private func handleXMTPSync() -> CommandResult {

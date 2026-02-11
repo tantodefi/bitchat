@@ -492,6 +492,23 @@ struct NostrEvent: Codable {
         self.id = "" // Will be set during signing
     }
     
+    /// Initialize with a raw kind value (for custom/non-standard event kinds)
+    init(
+        pubkey: String,
+        createdAt: Date,
+        kind: UInt32,
+        tags: [[String]],
+        content: String
+    ) {
+        self.pubkey = pubkey
+        self.created_at = Int(createdAt.timeIntervalSince1970)
+        self.kind = Int(kind)
+        self.tags = tags
+        self.content = content
+        self.sig = nil
+        self.id = "" // Will be set during signing
+    }
+    
     init(from dict: [String: Any]) throws {
         guard let pubkey = dict["pubkey"] as? String,
               let createdAt = dict["created_at"] as? Int,

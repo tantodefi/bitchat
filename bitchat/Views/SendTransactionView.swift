@@ -10,12 +10,61 @@
 
 import SwiftUI
 
+/// Gas speed presets for transaction fee selection
+enum GasSpeed: String, CaseIterable, Identifiable {
+    case slow = "Slow"
+    case average = "Average"
+    case fast = "Fast"
+    case custom = "Custom"
+    
+    var id: String { rawValue }
+    
+    var icon: String {
+        switch self {
+        case .slow: return "tortoise"
+        case .average: return "hare"
+        case .fast: return "bolt"
+        case .custom: return "slider.horizontal.3"
+        }
+    }
+    
+    /// Priority fee (tip to validator) in gwei
+    var priorityFeeGwei: Double {
+        switch self {
+        case .slow: return 0.5
+        case .average: return 1.5
+        case .fast: return 3.0
+        case .custom: return 1.5 // Default for custom
+        }
+    }
+    
+    /// Max fee per gas in gwei
+    var maxFeeGwei: Double {
+        switch self {
+        case .slow: return 15
+        case .average: return 30
+        case .fast: return 60
+        case .custom: return 30 // Default for custom
+        }
+    }
+    
+    var description: String {
+        switch self {
+        case .slow: return "~5+ min"
+        case .average: return "~1-3 min"
+        case .fast: return "~15 sec"
+        case .custom: return "Manual"
+        }
+    }
+}
+
 struct SendTransactionView: View {
     @Environment(\.dismiss) private var dismiss
     
     let wallet: EmbeddedWallet
     let balanceService: EthereumBalanceService
     @ObservedObject var meshRelay: MeshTransactionRelay
+    var onSuccess: (() -> Void)? = nil
     
     @State private var recipientAddress = ""
     @State private var amount = ""
@@ -24,6 +73,12 @@ struct SendTransactionView: View {
     @State private var submittedTxId: String?
     @State private var showingConfirmation = false
     @State private var isOnline = true
+    
+    // Gas settings
+    @State private var selectedGasSpeed: GasSpeed = .average
+    @State private var customPriorityFee: String = "1.5"
+    @State private var customMaxFee: String = "30"
+    @State private var showGasDetails = false
     
     /// Get the current status of the submitted transaction
     private var txStatus: MeshTransactionRelay.RelayStatus? {
@@ -48,6 +103,54 @@ struct SendTransactionView: View {
     
     private var canSend: Bool {
         isValidAddress && amountInWei != nil && (amountInWei ?? 0) > 0 && submittedTxId == nil
+    }
+    
+    /// Get current network's balance
+    private var currentBalance: EthereumBalanceService.Balance? {
+        let network = balanceService.useTestnet ? EthereumBalanceService.Network.sepolia : EthereumBalanceService.Network.ethereum
+        return balanceService.balances[network]
+    }
+    
+    /// Formatted available balance
+    private var availableBalanceText: String {
+        guard let balance = currentBalance else { return "-- ETH" }
+        return balance.formattedETH + " ETH"
+    }
+    
+    /// Current priority fee in wei
+    private var priorityFeeWei: UInt64 {
+        if selectedGasSpeed == .custom {
+            let gwei = Double(customPriorityFee) ?? 1.5
+            return UInt64(gwei * 1_000_000_000)
+        }
+        return UInt64(selectedGasSpeed.priorityFeeGwei * 1_000_000_000)
+    }
+    
+    /// Current max fee in wei
+    private var maxFeeWei: UInt64 {
+        if selectedGasSpeed == .custom {
+            let gwei = Double(customMaxFee) ?? 30
+            return UInt64(gwei * 1_000_000_000)
+        }
+        return UInt64(selectedGasSpeed.maxFeeGwei * 1_000_000_000)
+    }
+    
+    /// Estimated transaction cost in ETH
+    private var estimatedCostEth: Double {
+        let gasLimit: UInt64 = 21000
+        let maxCostWei = gasLimit * maxFeeWei
+        return Double(maxCostWei) / 1e18
+    }
+    
+    /// Check if amount + gas exceeds balance
+    private var exceedsBalance: Bool {
+        guard let balance = currentBalance,
+              let sendWei = amountInWei else { return false }
+        let gasLimit: UInt64 = 21000
+        let maxCostWei = gasLimit * maxFeeWei
+        let totalWei = BigUInt(sendWei) + BigUInt(maxCostWei)
+        // Use >= with NOT: totalWei > balance.wei  ≡  !(balance.wei >= totalWei)
+        return !(balance.wei >= totalWei)
     }
     
     var body: some View {
@@ -78,10 +181,38 @@ struct SendTransactionView: View {
                             .foregroundColor(.secondary)
                     }
                     
-                    if let wei = amountInWei {
-                        Text("\(wei) wei")
+                    HStack {
+                        if let wei = amountInWei {
+                            Text("\(wei) wei")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        
+                        Spacer()
+                        
+                        // Available balance with Max button
+                        HStack(spacing: 4) {
+                            Text("Available:")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            Text(availableBalanceText)
+                                .font(.caption)
+                                .fontWeight(.medium)
+                                .foregroundColor(exceedsBalance ? .red : .primary)
+                            
+                            Button("Max") {
+                                setMaxAmount()
+                            }
                             .font(.caption)
-                            .foregroundColor(.secondary)
+                            .buttonStyle(.bordered)
+                            .controlSize(.mini)
+                        }
+                    }
+                    
+                    if exceedsBalance {
+                        Text("Amount + gas exceeds available balance")
+                            .font(.caption)
+                            .foregroundColor(.red)
                     }
                 } header: {
                     Text("Amount")
@@ -95,29 +226,88 @@ struct SendTransactionView: View {
                 }
                 
                 Section {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Text("Gas Limit")
-                            Spacer()
-                            Text("21,000")
-                                .foregroundColor(.secondary)
-                        }
-                        HStack {
-                            Text("Max Fee")
-                            Spacer()
-                            Text("~50 gwei")
-                                .foregroundColor(.secondary)
-                        }
-                        HStack {
-                            Text("Priority Fee")
-                            Spacer()
-                            Text("1.5 gwei")
-                                .foregroundColor(.secondary)
+                    // Gas speed picker
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Transaction Speed")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                        
+                        HStack(spacing: 8) {
+                            ForEach(GasSpeed.allCases) { speed in
+                                GasSpeedButton(
+                                    speed: speed,
+                                    isSelected: selectedGasSpeed == speed
+                                ) {
+                                    withAnimation(.easeInOut(duration: 0.2)) {
+                                        selectedGasSpeed = speed
+                                        if speed != .custom {
+                                            customPriorityFee = String(format: "%.1f", speed.priorityFeeGwei)
+                                            customMaxFee = String(format: "%.0f", speed.maxFeeGwei)
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
-                    .font(.caption)
+                    .padding(.vertical, 4)
+                    
+                    // Custom gas inputs (shown when custom is selected)
+                    if selectedGasSpeed == .custom {
+                        VStack(spacing: 12) {
+                            HStack {
+                                Text("Priority Fee")
+                                    .font(.subheadline)
+                                Spacer()
+                                HStack(spacing: 4) {
+                                    TextField("1.5", text: $customPriorityFee)
+                                        .keyboardType(.decimalPad)
+                                        .multilineTextAlignment(.trailing)
+                                        .frame(width: 60)
+                                        .textFieldStyle(.roundedBorder)
+                                    Text("gwei")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                            
+                            HStack {
+                                Text("Max Fee")
+                                    .font(.subheadline)
+                                Spacer()
+                                HStack(spacing: 4) {
+                                    TextField("30", text: $customMaxFee)
+                                        .keyboardType(.decimalPad)
+                                        .multilineTextAlignment(.trailing)
+                                        .frame(width: 60)
+                                        .textFieldStyle(.roundedBorder)
+                                    Text("gwei")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                        }
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                    }
+                    
+                    // Gas details disclosure
+                    DisclosureGroup("Details", isExpanded: $showGasDetails) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            gasDetailRow(label: "Gas Limit", value: "21,000")
+                            gasDetailRow(label: "Priority Fee", value: String(format: "%.2f gwei", selectedGasSpeed == .custom ? (Double(customPriorityFee) ?? 1.5) : selectedGasSpeed.priorityFeeGwei))
+                            gasDetailRow(label: "Max Fee", value: String(format: "%.0f gwei", selectedGasSpeed == .custom ? (Double(customMaxFee) ?? 30) : selectedGasSpeed.maxFeeGwei))
+                            Divider()
+                            gasDetailRow(label: "Max Cost", value: String(format: "%.6f ETH", estimatedCostEth), highlight: true)
+                        }
+                        .font(.caption)
+                        .padding(.top, 8)
+                    }
+                    .font(.subheadline)
                 } header: {
                     Text("Gas Settings (EIP-1559)")
+                } footer: {
+                    Text("Max cost is the worst-case fee. Actual cost is usually lower.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 }
                 
                 if let error = errorMessage {
@@ -140,6 +330,17 @@ struct SendTransactionView: View {
                                     Text("TX Hash: \(confirmed.txHash.prefix(20))...")
                                         .font(.caption)
                                         .foregroundColor(.secondary)
+                                    
+                                    Text("Closing in 2 seconds...")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                        .onAppear {
+                                            // Auto-dismiss after showing success
+                                            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                                                onSuccess?()
+                                                dismiss()
+                                            }
+                                        }
                                 }
                             } else if let status = txStatus {
                                 switch status {
@@ -249,6 +450,8 @@ struct SendTransactionView: View {
             let requestId = try await signer.signAndQueueTransfer(
                 to: recipientAddress,
                 amountWei: wei,
+                maxPriorityFeePerGas: priorityFeeWei,
+                maxFeePerGas: maxFeeWei,
                 replyToPeerId: myAddress, // Self for testing
                 description: "Send \(amount) ETH"
             )
@@ -260,6 +463,38 @@ struct SendTransactionView: View {
         }
         
         isLoading = false
+    }
+    
+    /// Set amount to max (balance minus estimated gas)
+    private func setMaxAmount() {
+        guard let balance = currentBalance else { return }
+        let gasLimit: UInt64 = 21000
+        let maxGasCostWei = BigUInt(gasLimit) * BigUInt(maxFeeWei)
+        
+        // Subtract gas from balance, ensure non-negative
+        // Check: balance.wei > maxGasCostWei  ≡  !(maxGasCostWei >= balance.wei)
+        guard !(maxGasCostWei >= balance.wei) else {
+            amount = "0"
+            return
+        }
+        
+        let maxSendWei = balance.wei - maxGasCostWei
+        let maxSendEth = maxSendWei.toDouble() / 1e18
+        
+        // Format with enough precision
+        amount = String(format: "%.6f", maxSendEth)
+    }
+    
+    /// Helper view for gas detail rows
+    private func gasDetailRow(label: String, value: String, highlight: Bool = false) -> some View {
+        HStack {
+            Text(label)
+                .foregroundColor(.secondary)
+            Spacer()
+            Text(value)
+                .foregroundColor(highlight ? .primary : .secondary)
+                .fontWeight(highlight ? .medium : .regular)
+        }
     }
     
     private func checkConnectivity() async {
@@ -299,4 +534,42 @@ struct SendTransactionView: View {
         balanceService: EthereumBalanceService(),
         meshRelay: MeshTransactionRelay(keychain: PreviewKeychainManager())
     )
+}
+
+// MARK: - Gas Speed Button
+
+struct GasSpeedButton: View {
+    let speed: GasSpeed
+    let isSelected: Bool
+    let action: () -> Void
+    
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 4) {
+                Image(systemName: speed.icon)
+                    .font(.system(size: 16))
+                Text(speed.rawValue)
+                    .font(.caption2)
+                    .fontWeight(.medium)
+                if speed != .custom {
+                    Text(speed.description)
+                        .font(.system(size: 9))
+                        .foregroundColor(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 8)
+            .padding(.horizontal, 4)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(isSelected ? Color.accentColor.opacity(0.15) : Color.clear)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(isSelected ? Color.accentColor : Color.gray.opacity(0.3), lineWidth: isSelected ? 2 : 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .foregroundColor(isSelected ? .accentColor : .primary)
+    }
 }

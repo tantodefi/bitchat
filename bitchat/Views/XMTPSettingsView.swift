@@ -12,13 +12,10 @@ import SwiftUI
 
 /// Settings view for XMTP and transaction relay configuration
 struct XMTPSettingsView: View {
-    @ObservedObject var meshTransactionRelay: MeshTransactionRelay
     @ObservedObject var clientService: XMTPClientService
-    @ObservedObject var balanceService: EthereumBalanceService
-    let wallet: EmbeddedWallet
     
-    @State private var showingWalletInfo = false
-    @State private var showingClearConfirmation = false
+    // Read receipts setting
+    @AppStorage("enableReadReceipts") private var enableReadReceipts = true
     
     var body: some View {
         List {
@@ -53,75 +50,30 @@ struct XMTPSettingsView: View {
                 Text("XMTP Connection")
             }
             
-            // MARK: - Transaction Relay Settings
+            // MARK: - Read Receipts
             Section {
-                Toggle(isOn: $meshTransactionRelay.allowMeshRelay) {
+                Toggle(isOn: $enableReadReceipts) {
                     Label {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("Mesh Relay")
-                            Text(meshTransactionRelay.allowMeshRelay ? "Transactions can relay through nearby peers" : "Transactions only broadcast when online")
+                            Text("Read Receipts")
+                            Text(enableReadReceipts ? "Others can see when you read messages" : "Read status hidden from others")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
                     } icon: {
-                        Image(systemName: "antenna.radiowaves.left.and.right")
+                        Image(systemName: enableReadReceipts ? "eye.fill" : "eye.slash.fill")
+                    }
+                }
+                .onChange(of: enableReadReceipts) { newValue in
+                    // Update the read receipts content type in the XMTP client
+                    Task {
+                        await clientService.setReadReceiptsEnabled(newValue)
                     }
                 }
             } header: {
-                Text("Transaction Relay")
+                Text("Message Settings")
             } footer: {
-                Text("When enabled, signed transactions can be relayed through nearby Bluetooth peers who have internet. Peers see transaction data but cannot modify it.")
-            }
-            
-            // MARK: - Pending Transactions
-            if !meshTransactionRelay.pendingRelays.isEmpty {
-                Section {
-                    ForEach(meshTransactionRelay.pendingRelays, id: \.id) { relay in
-                        MeshRelayRow(relay: relay)
-                    }
-                } header: {
-                    HStack {
-                        Text("Pending Transactions")
-                        Spacer()
-                        Text("\(meshTransactionRelay.pendingRelays.count)")
-                            .foregroundColor(.secondary)
-                    }
-                }
-            }
-            
-            // MARK: - Wallet Info
-            Section {
-                // Network mode toggle
-                Toggle(isOn: $balanceService.useTestnet) {
-                    Label {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Testnet Mode")
-                            Text(balanceService.useTestnet ? "Using Sepolia testnet" : "Using Ethereum & Base mainnet")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                    } icon: {
-                        Image(systemName: balanceService.useTestnet ? "testtube.2" : "network")
-                    }
-                }
-                .tint(.orange)
-                
-                NavigationLink {
-                    WalletView(wallet: wallet)
-                } label: {
-                    Label("View Wallet", systemImage: "creditcard.fill")
-                }
-                
-                Button(role: .destructive) {
-                    showingClearConfirmation = true
-                } label: {
-                    Label("Clear Pending Transactions", systemImage: "trash")
-                }
-                .disabled(meshTransactionRelay.pendingRelays.isEmpty)
-            } header: {
-                Text("Wallet")
-            } footer: {
-                Text("Testnet mode uses Sepolia for testing without real funds.")
+                Text("When enabled, conversation partners can see when you've read their messages.")
             }
             
             // MARK: - Privacy Info
@@ -140,17 +92,124 @@ struct XMTPSettingsView: View {
             }
         }
         .navigationTitle("XMTP Settings")
-        .confirmationDialog(
-            "Clear all pending transactions?",
-            isPresented: $showingClearConfirmation,
-            titleVisibility: .visible
-        ) {
-            Button("Clear All", role: .destructive) {
-                meshTransactionRelay.clearAll()
+    }
+}
+
+// MARK: - Private Key Export Sheet
+
+struct PrivateKeyExportSheet: View {
+    let privateKey: String
+    let onDismiss: () -> Void
+    
+    @State private var showKey = false
+    @State private var copied = false
+    
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 24) {
+                // Warning header
+                VStack(spacing: 12) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 48))
+                        .foregroundColor(.orange)
+                    
+                    Text("Keep This Secret!")
+                        .font(.title2)
+                        .fontWeight(.bold)
+                    
+                    Text("Anyone with this key can access all funds in your wallet. Never share it online or with anyone.")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .padding()
+                
+                // Key display
+                VStack(spacing: 12) {
+                    if showKey {
+                        Text(privateKey)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                            .padding()
+                            .background(Color(.systemGray).opacity(0.1))
+                            .cornerRadius(8)
+                    } else {
+                        Button {
+                            showKey = true
+                        } label: {
+                            HStack {
+                                Image(systemName: "eye.slash.fill")
+                                Text("Tap to reveal")
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding()
+                            .background(Color(.systemGray).opacity(0.1))
+                            .cornerRadius(8)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    
+                    if showKey {
+                        Button {
+                            #if os(iOS)
+                            UIPasteboard.general.string = privateKey
+                            #else
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(privateKey, forType: .string)
+                            #endif
+                            copied = true
+                            
+                            // Clear clipboard after 60 seconds for security
+                            Task {
+                                try? await Task.sleep(nanoseconds: 60_000_000_000)
+                                #if os(iOS)
+                                if UIPasteboard.general.string == privateKey {
+                                    UIPasteboard.general.string = ""
+                                }
+                                #endif
+                            }
+                        } label: {
+                            HStack {
+                                Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                                Text(copied ? "Copied! (clears in 60s)" : "Copy to Clipboard")
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding()
+                            .background(Color.accentColor)
+                            .foregroundColor(.white)
+                            .cornerRadius(8)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal)
+                
+                // Security tips
+                VStack(alignment: .leading, spacing: 8) {
+                    Label("Write it down on paper", systemImage: "pencil")
+                    Label("Store in a password manager", systemImage: "lock.fill")
+                    Label("Never screenshot or email", systemImage: "xmark.circle")
+                }
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .padding()
+                .background(Color.blue.opacity(0.1))
+                .cornerRadius(12)
+                .padding(.horizontal)
+                
+                Spacer()
             }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("This will remove all queued transactions. They will not be submitted to the network.")
+            .navigationTitle("Private Key")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") {
+                        onDismiss()
+                    }
+                }
+            }
         }
     }
 }

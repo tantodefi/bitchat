@@ -122,6 +122,157 @@ actor EmbeddedWallet {
     
     // MARK: - Transaction Signing
     
+    /// EIP-7702 Authorization for delegating code to a contract
+    struct EIP7702Authorization: Equatable {
+        let chainId: UInt64
+        let codeAddress: String  // Contract to delegate to
+        let nonce: UInt64
+    }
+    
+    /// Sign an EIP-7702 authorization tuple
+    /// The authorization allows this EOA to temporarily use code from another address
+    /// - Parameter authorization: The authorization parameters
+    /// - Returns: Signed authorization (chain_id, address, nonce, y_parity, r, s)
+    func signAuthorization(_ authorization: EIP7702Authorization) throws -> Data {
+        let privateKey = try getOrCreatePrivateKey()
+        
+        // Authorization signing hash: keccak256(MAGIC || rlp([chain_id, address, nonce]))
+        // MAGIC = 0x05 for EIP-7702
+        let codeAddressData = Data(hexString: authorization.codeAddress.hasPrefix("0x") 
+            ? String(authorization.codeAddress.dropFirst(2)) 
+            : authorization.codeAddress) ?? Data()
+        
+        let authPayload: [Any] = [
+            rlpEncode(authorization.chainId),
+            codeAddressData,
+            rlpEncode(authorization.nonce)
+        ]
+        
+        let encodedPayload = rlpEncodeList(authPayload)
+        
+        // Prepend MAGIC byte and hash
+        var toHash = Data([0x05])
+        toHash.append(encodedPayload)
+        let authHash = keccak256(toHash)
+        
+        // Sign the hash
+        let signature = try signTransactionHash(authHash, privateKey: privateKey)
+        
+        // Extract signature components
+        var r = Data(signature[0..<32])
+        var s = Data(signature[32..<64])
+        let yParity = signature[64] // 0 or 1
+        
+        // Strip leading zeros for canonical encoding
+        while r.first == 0 && r.count > 1 { r.removeFirst() }
+        while s.first == 0 && s.count > 1 { s.removeFirst() }
+        
+        // Return RLP([chain_id, address, nonce, y_parity, r, s])
+        let signedAuth: [Any] = [
+            rlpEncode(authorization.chainId),
+            codeAddressData,
+            rlpEncode(authorization.nonce),
+            rlpEncode(UInt64(yParity)),
+            r,
+            s
+        ]
+        
+        return rlpEncodeList(signedAuth)
+    }
+    
+    /// Sign an EIP-7702 "set code" transaction (type 0x04)
+    /// - Parameters:
+    ///   - chainId: Chain ID
+    ///   - nonce: Transaction nonce
+    ///   - maxPriorityFeePerGas: Max priority fee in wei
+    ///   - maxFeePerGas: Max fee per gas in wei
+    ///   - gasLimit: Gas limit
+    ///   - to: Destination address
+    ///   - value: Value in wei
+    ///   - data: Call data
+    ///   - authorizations: List of EIP-7702 authorizations
+    /// - Returns: RLP-encoded signed transaction ready for broadcast
+    func signEIP7702Transaction(
+        chainId: UInt64,
+        nonce: UInt64,
+        maxPriorityFeePerGas: UInt64,
+        maxFeePerGas: UInt64,
+        gasLimit: UInt64,
+        to: String,
+        value: UInt64,
+        data: Data = Data(),
+        authorizations: [EIP7702Authorization]
+    ) throws -> Data {
+        let privateKey = try getOrCreatePrivateKey()
+        
+        // Build authorization list
+        var authList: [Any] = []
+        for auth in authorizations {
+            let signedAuth = try signAuthorization(auth)
+            authList.append(signedAuth)
+        }
+        
+        let toAddress = Data(hexString: to.hasPrefix("0x") ? String(to.dropFirst(2)) : to) ?? Data()
+        
+        // Build unsigned EIP-7702 transaction (type 4)
+        // RLP([chain_id, nonce, max_priority_fee_per_gas, max_fee_per_gas, gas_limit, to, value, data, access_list, authorization_list])
+        let unsignedTx: [Any] = [
+            rlpEncode(chainId),
+            rlpEncode(nonce),
+            rlpEncode(maxPriorityFeePerGas),
+            rlpEncode(maxFeePerGas),
+            rlpEncode(gasLimit),
+            toAddress,
+            rlpEncode(value),
+            data,
+            [] as [Any], // Empty access list
+            authList
+        ]
+        
+        let encodedUnsigned = rlpEncodeList(unsignedTx)
+        
+        // Hash with EIP-7702 type prefix (0x04)
+        var toHash = Data([0x04])
+        toHash.append(encodedUnsigned)
+        let txHash = keccak256(toHash)
+        
+        // Sign the hash
+        let signature = try signTransactionHash(txHash, privateKey: privateKey)
+        
+        // Extract r, s, v
+        var r = Data(signature[0..<32])
+        var s = Data(signature[32..<64])
+        let v = signature[64]
+        
+        while r.first == 0 && r.count > 1 { r.removeFirst() }
+        while s.first == 0 && s.count > 1 { s.removeFirst() }
+        
+        // Build signed transaction
+        let signedTx: [Any] = [
+            rlpEncode(chainId),
+            rlpEncode(nonce),
+            rlpEncode(maxPriorityFeePerGas),
+            rlpEncode(maxFeePerGas),
+            rlpEncode(gasLimit),
+            toAddress,
+            rlpEncode(value),
+            data,
+            [] as [Any],
+            authList,
+            rlpEncode(UInt64(v)),
+            r,
+            s
+        ]
+        
+        let encodedSigned = rlpEncodeList(signedTx)
+        
+        // Prepend type byte for EIP-7702
+        var result = Data([0x04])
+        result.append(encodedSigned)
+        
+        return result
+    }
+
     /// Sign an EIP-1559 transaction and return the RLP-encoded signed transaction
     /// - Parameters:
     ///   - chainId: Chain ID (e.g., 1 for mainnet, 11155111 for Sepolia)

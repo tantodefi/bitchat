@@ -20,7 +20,7 @@ struct TransactionHistoryView: View {
     private var allTransactions: [TransactionItem] {
         var items: [TransactionItem] = []
         
-        // Add pending/failed transactions
+        // Add pending transactions (queued for mesh relay due to network issues)
         for relay in meshRelay.pendingRelays {
             items.append(TransactionItem(
                 id: relay.id,
@@ -47,6 +47,22 @@ struct TransactionHistoryView: View {
                 txHash: confirmed.txHash,
                 timestamp: confirmed.confirmedAt,
                 description: nil
+            ))
+        }
+        
+        // Add failed transactions (rejected by network)
+        for failed in meshRelay.failedTransactions {
+            items.append(TransactionItem(
+                id: failed.id,
+                status: .failed,
+                toAddress: failed.toAddress,
+                amount: failed.amount,
+                currency: failed.currency ?? "ETH",
+                chainId: failed.chainId,
+                txHash: nil,
+                timestamp: failed.failedAt,
+                description: nil,
+                failureReason: failed.reason
             ))
         }
         
@@ -130,6 +146,20 @@ struct TransactionItem: Identifiable {
     let txHash: String?
     let timestamp: Date
     let description: String?
+    let failureReason: String?
+    
+    init(id: String, status: TransactionStatus, toAddress: String, amount: UInt64?, currency: String, chainId: UInt64, txHash: String?, timestamp: Date, description: String?, failureReason: String? = nil) {
+        self.id = id
+        self.status = status
+        self.toAddress = toAddress
+        self.amount = amount
+        self.currency = currency
+        self.chainId = chainId
+        self.txHash = txHash
+        self.timestamp = timestamp
+        self.description = description
+        self.failureReason = failureReason
+    }
 }
 
 enum TransactionStatus: String {
@@ -221,6 +251,14 @@ struct TransactionRowView: View {
                     Text(formatTimestamp(transaction.timestamp))
                         .font(.caption)
                         .foregroundColor(.secondary)
+                }
+                
+                // Failure reason (if present)
+                if let reason = transaction.failureReason {
+                    Text(reason)
+                        .font(.caption2)
+                        .foregroundColor(.red.opacity(0.8))
+                        .lineLimit(2)
                 }
             }
             
@@ -360,6 +398,13 @@ struct TransactionDetailView: View {
                     Section("Description") {
                         Text(description)
                             .foregroundColor(.secondary)
+                    }
+                }
+                
+                if let reason = transaction.failureReason {
+                    Section("Failure Reason") {
+                        Text(reason)
+                            .foregroundColor(.red)
                     }
                 }
                 

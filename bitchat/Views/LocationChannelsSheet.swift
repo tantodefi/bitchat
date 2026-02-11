@@ -1,5 +1,6 @@
 import SwiftUI
 import CoreLocation
+import XMTP
 #if os(iOS)
 import UIKit
 #else
@@ -16,6 +17,8 @@ struct LocationChannelsSheet: View {
     @State private var customGeohash: String = ""
     @State private var customError: String? = nil
     @State private var showXMTPConversations: Bool = false
+    @State private var xmtpChatInput: String = ""
+    @State private var xmtpInputError: String? = nil
 
     private var backgroundColor: Color { colorScheme == .dark ? .black : .white }
 
@@ -551,10 +554,158 @@ extension LocationChannelsSheet {
             if showXMTPConversations {
                 xmtpConversationsList
             }
+            
+            // XMTP Chat Input
+            xmtpChatInputSection
         }
         .padding(12)
         .background(xmtpOrange.opacity(0.08))
         .cornerRadius(8)
+    }
+    
+    private var xmtpChatInputSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                TextField("inbox ID · wallet · ens", text: $xmtpChatInput)
+                    #if os(iOS)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled(true)
+                    .keyboardType(.asciiCapable)
+                    #endif
+                    .font(.bitchatSystem(size: 14, design: .monospaced))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .background(Color.white)
+                    .cornerRadius(6)
+                    .onChange(of: xmtpChatInput) { _ in
+                        xmtpInputError = nil
+                    }
+                
+                let trimmed = xmtpChatInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                let isValid = !trimmed.isEmpty && xmtpContainer.isInitialized
+                
+                Button(action: {
+                    startXMTPChat(with: trimmed)
+                }) {
+                    HStack(spacing: 6) {
+                        Text("chat")
+                            .font(.bitchatSystem(size: 14, design: .monospaced))
+                        Image(systemName: "face.smiling")
+                            .font(.bitchatSystem(size: 14))
+                    }
+                }
+                .buttonStyle(.plain)
+                .font(.bitchatSystem(size: 14, design: .monospaced))
+                .foregroundColor(.white)
+                .padding(.vertical, 8)
+                .padding(.horizontal, 12)
+                .background(xmtpOrange)
+                .cornerRadius(6)
+                .opacity(isValid ? 1.0 : 0.4)
+                .disabled(!isValid)
+            }
+            
+            if let err = xmtpInputError {
+                Text(err)
+                    .font(.bitchatSystem(size: 12, design: .monospaced))
+                    .foregroundColor(.red)
+            }
+        }
+    }
+    
+    private func startXMTPChat(with input: String) {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            xmtpInputError = "Enter an inbox ID, wallet address, or ENS name"
+            return
+        }
+        
+        guard xmtpContainer.isInitialized else {
+            xmtpInputError = "XMTP not connected"
+            return
+        }
+        
+        // Check if it's an ENS name
+        if trimmed.contains(".eth") {
+            // Resolve ENS and start chat
+            Task {
+                do {
+                    let resolution = try await ENSResolver.shared.resolve(trimmed)
+                    if let inboxId = resolution.xmtpInboxId, !inboxId.isEmpty {
+                        // Has XMTP inbox ID in ENS records - use directly
+                        await viewModel.startXMTPChat(with: inboxId)
+                        await MainActor.run {
+                            xmtpChatInput = ""
+                            isPresented = false
+                        }
+                    } else if !resolution.address.isEmpty {
+                        // Has address but no inbox ID in records - try XMTP SDK lookup
+                        let identity = PublicIdentity(kind: .ethereum, identifier: resolution.address.lowercased())
+                        if let inboxId = try await xmtpContainer.clientService.getInboxIdFromIdentity(identity: identity) {
+                            await viewModel.startXMTPChat(with: inboxId)
+                            await MainActor.run {
+                                xmtpChatInput = ""
+                                isPresented = false
+                            }
+                        } else {
+                            await MainActor.run {
+                                xmtpInputError = "\(trimmed) has no XMTP identity"
+                            }
+                        }
+                    } else {
+                        await MainActor.run {
+                            xmtpInputError = "\(trimmed) has no address or XMTP inbox"
+                        }
+                    }
+                } catch {
+                    await MainActor.run {
+                        xmtpInputError = "ENS resolution failed: \(error.localizedDescription)"
+                    }
+                }
+            }
+            return
+        }
+        
+        // Check if it's a 64-char hex inbox ID
+        if trimmed.count == 64 && trimmed.allSatisfy({ $0.isHexDigit }) {
+            Task {
+                await viewModel.startXMTPChat(with: trimmed)
+                await MainActor.run {
+                    xmtpChatInput = ""
+                    isPresented = false
+                }
+            }
+            return
+        }
+        
+        // Check if it's a wallet address (0x...)
+        if trimmed.hasPrefix("0x") && trimmed.count == 42 {
+            // Look up inbox ID from wallet address using XMTP SDK
+            Task {
+                do {
+                    let identity = PublicIdentity(kind: .ethereum, identifier: trimmed.lowercased())
+                    if let inboxId = try await xmtpContainer.clientService.getInboxIdFromIdentity(identity: identity) {
+                        await viewModel.startXMTPChat(with: inboxId)
+                        await MainActor.run {
+                            xmtpChatInput = ""
+                            isPresented = false
+                        }
+                    } else {
+                        await MainActor.run {
+                            xmtpInputError = "No XMTP identity found for this wallet"
+                        }
+                    }
+                } catch {
+                    await MainActor.run {
+                        xmtpInputError = "Wallet lookup failed: \(error.localizedDescription)"
+                    }
+                }
+            }
+            return
+        }
+        
+        // Invalid format
+        xmtpInputError = "Invalid format. Use inbox ID (64 hex), wallet (0x...), or ENS (.eth)"
     }
     
     @ViewBuilder
@@ -569,7 +720,7 @@ extension LocationChannelsSheet {
             let privateChats = viewModel.privateChats.filter { $0.key.isXMTPDM }
             
             if contacts.isEmpty && privateChats.isEmpty {
-                Text("No XMTP conversations yet.\nUse /dm-wallet <inbox-id> to start one.")
+                Text("No XMTP conversations yet.\nUse /dm-wallet with inbox ID, wallet, or ENS.")
                     .font(.bitchatSystem(size: 11, design: .monospaced))
                     .foregroundColor(.secondary)
                     .padding(.top, 4)

@@ -2,3 +2,6 @@
 
 // Optional include of local configs
 #include? "Local.xcconfig"
+
+// Optional include of secrets (API keys)
+#include? "Secrets.xcconfig"

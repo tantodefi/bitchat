@@ -16,13 +16,12 @@ extension ChatViewModel: XMTPClientDelegate {
     func xmtpClient(_ client: XMTPClientService, didReceiveMessage content: String, from senderInboxId: String, messageId: String) {
         let peerID = PeerID(xmtp: senderInboxId)
         
-        // Store the full inbox ID mapping so we can reply
-        let truncatedId = peerID.bare
-        if client.inboxIdMap[truncatedId] == nil {
-            // Update the map via a Task since inboxIdMap is internal(set)
-            Task {
-                try? await XMTPServiceContainer.shared.clientService.findOrCreateDM(with: senderInboxId)
-            }
+        // IMMEDIATELY store the full inbox ID mapping so we can reply/star
+        client.storeInboxIdMapping(fullInboxId: senderInboxId)
+        
+        // Also create/cache the DM conversation in background for faster replies
+        Task {
+            try? await XMTPServiceContainer.shared.clientService.findOrCreateDM(with: senderInboxId)
         }
         
         // Initialize private chat if needed
@@ -35,10 +34,20 @@ extension ChatViewModel: XMTPClientDelegate {
             return
         }
         
+        // Get display name from saved contacts if available
+        let truncatedId = peerID.bare
+        let senderDisplay: String = {
+            if let contact = client.savedContacts.first(where: { $0.truncatedId == truncatedId }) {
+                return contact.displayName
+            }
+            // Show short inbox ID
+            return String(senderInboxId.prefix(8))
+        }()
+        
         // Create the message (incoming messages don't need delivery status)
         let message = BitchatMessage(
             id: messageId,
-            sender: "XMTP:\(senderInboxId.prefix(8))…",
+            sender: senderDisplay,
             content: content,
             timestamp: Date(),
             isRelay: false,
@@ -63,8 +72,45 @@ extension ChatViewModel: XMTPClientDelegate {
     /// Called when a Bitchat packet is received via XMTP
     @MainActor
     func xmtpClient(_ client: XMTPClientService, didReceiveBitchatPacket packet: Data, from senderInboxId: String) {
-        // TODO: Handle Bitchat-specific packets (e.g., voice, media, encrypted payloads)
-        SecureLogger.debug("📦 XMTP Bitchat packet from \(senderInboxId.prefix(8))… (\(packet.count) bytes)", category: .network)
+        // Decode the BitChat packet
+        guard let payload = try? JSONSerialization.jsonObject(with: packet) as? [String: Any] else {
+            SecureLogger.debug("📦 XMTP Bitchat packet from \(senderInboxId.prefix(8))… (failed to decode)", category: .network)
+            return
+        }
+        
+        let type = payload["type"] as? String
+        
+        // Handle acknowledgment packets (delivered/read)
+        if type == "ack", let ackType = payload["ackType"] as? String, let messageID = payload["messageID"] as? String {
+            if ackType == "READ" {
+                // Update message delivery status to read
+                let readerNickname = (payload["senderNickname"] as? String) ?? String(senderInboxId.prefix(8))
+                updateMessageDeliveryStatus(messageID, status: .read(by: readerNickname, at: Date()))
+                SecureLogger.debug("📥 XMTP read receipt for \(messageID.prefix(8))… from \(senderInboxId.prefix(8))…", category: .network)
+            } else if ackType == "DELIVERED" {
+                // Update message delivery status to delivered
+                let deliveredTo = (payload["senderNickname"] as? String) ?? String(senderInboxId.prefix(8))
+                updateMessageDeliveryStatus(messageID, status: .delivered(to: deliveredTo, at: Date()))
+                SecureLogger.debug("📥 XMTP delivered ack for \(messageID.prefix(8))… from \(senderInboxId.prefix(8))…", category: .network)
+            }
+            return
+        }
+        
+        // Handle private message packets
+        if type == "pm", let content = payload["content"] as? String, let messageID = payload["messageID"] as? String {
+            // This is handled by the main message delegate, but log for debugging
+            SecureLogger.debug("📦 XMTP PM packet from \(senderInboxId.prefix(8))…: \(content.prefix(50))", category: .network)
+            return
+        }
+        
+        // Handle file/media packets
+        if type == "file" {
+            SecureLogger.debug("📦 XMTP file packet from \(senderInboxId.prefix(8))…", category: .network)
+            // TODO: Handle file packets
+            return
+        }
+        
+        SecureLogger.debug("📦 XMTP Bitchat packet from \(senderInboxId.prefix(8))… (unknown type: \(type ?? "nil"))", category: .network)
     }
     
     /// Called when a transaction request is received via XMTP
@@ -79,12 +125,12 @@ extension ChatViewModel: XMTPClientDelegate {
     func xmtpClient(_ client: XMTPClientService, didReceiveRemoteAttachment attachment: RemoteAttachment, from senderInboxId: String, messageId: String) {
         let peerID = PeerID(xmtp: senderInboxId)
         
-        // Store the full inbox ID mapping so we can reply
-        let truncatedId = peerID.bare
-        if client.inboxIdMap[truncatedId] == nil {
-            Task {
-                try? await XMTPServiceContainer.shared.clientService.findOrCreateDM(with: senderInboxId)
-            }
+        // IMMEDIATELY store the full inbox ID mapping so we can reply/star
+        client.storeInboxIdMapping(fullInboxId: senderInboxId)
+        
+        // Also create/cache the DM conversation in background for faster replies
+        Task {
+            try? await XMTPServiceContainer.shared.clientService.findOrCreateDM(with: senderInboxId)
         }
         
         // Initialize private chat if needed
@@ -370,13 +416,32 @@ extension ChatViewModel: XMTPLocationChannelsDelegate {
         }
         
         // Check for duplicates
-        if deduplicationService.hasSeenMessage(message.id) {
+        if deduplicationService.hasProcessedXMTPMessage(message.id) {
             return
         }
-        deduplicationService.recordNostrEvent(message.id)
+        deduplicationService.recordXMTPMessage(message.id)
         
-        // Create sender display name
-        let senderDisplay = message.senderNickname ?? "XMTP:\(message.senderInboxId.prefix(6))…"
+        // IMMEDIATELY store the full inbox ID mapping so we can DM/star this sender
+        // This must happen synchronously before any UI interaction
+        XMTPServiceContainer.shared.clientService.storeInboxIdMapping(fullInboxId: message.senderInboxId)
+        
+        // Also create/cache the DM conversation in background for faster replies
+        Task {
+            try? await XMTPServiceContainer.shared.clientService.findOrCreateDM(with: message.senderInboxId)
+        }
+        
+        // Create sender display name - use nickname if provided, otherwise shortened inbox ID
+        let truncatedId = String(message.senderInboxId.prefix(16))
+        let senderDisplay: String = {
+            if let nickname = message.senderNickname, !nickname.isEmpty {
+                return nickname
+            }
+            // Check if we have this contact saved with a nickname
+            if let contact = XMTPServiceContainer.shared.clientService.savedContacts.first(where: { $0.truncatedId == truncatedId }) {
+                return contact.displayName
+            }
+            return String(message.senderInboxId.prefix(8))
+        }()
         let senderPeerID = PeerID(xmtp: message.senderInboxId)
         
         // Create BitchatMessage

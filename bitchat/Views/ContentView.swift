@@ -66,6 +66,8 @@ struct ContentView: View {
     @State private var recordingTimer: Timer?
     @State private var showWalletView = false
     @State private var showSettings = false
+    @State private var showXMTPPeerInfo = false
+    @State private var showWalletQRScanner = false
     @State private var recordingStartDate: Date?
 #if os(iOS)
     @State private var showImagePicker = false
@@ -216,6 +218,13 @@ struct ContentView: View {
                     }
             }
         }
+        #if os(iOS)
+        .sheet(isPresented: $showWalletQRScanner) {
+            WalletQRScannerSheet(isPresented: $showWalletQRScanner)
+                .environmentObject(viewModel)
+                .presentationDetents([.medium, .large])
+        }
+        #endif
         .sheet(isPresented: Binding(
             get: { viewModel.showingFingerprintFor != nil },
             set: { _ in viewModel.showingFingerprintFor = nil }
@@ -685,6 +694,10 @@ struct ContentView: View {
                     }
 
                     sendOrMicButton
+                    
+                    #if os(iOS)
+                    walletQRScannerButton
+                    #endif
                 }
             }
         }
@@ -1009,11 +1022,19 @@ struct ContentView: View {
 
                     HStack(spacing: 8) {
                         privateHeaderInfo(context: headerContext, privatePeerID: privatePeerID)
-                        let isFavorite = viewModel.isFavorite(peerID: headerContext.headerPeerID)
+                        
+                        // Star/favorite button for saving contacts
+                        // Use privatePeerID directly for XMTP to ensure correct favorite lookup
+                        let favCheckPeerID = privatePeerID.isXMTPDM ? privatePeerID : headerContext.headerPeerID
+                        let isFavorite = viewModel.isFavorite(peerID: favCheckPeerID)
 
                         if !privatePeerID.isGeoDM {
                             Button(action: {
-                                viewModel.toggleFavorite(peerID: headerContext.headerPeerID)
+                                if privatePeerID.isXMTPDM {
+                                    viewModel.toggleFavorite(peerID: privatePeerID)
+                                } else {
+                                    viewModel.toggleFavorite(peerID: headerContext.headerPeerID)
+                                }
                             }) {
                                 Image(systemName: isFavorite ? "star.fill" : "star")
                                     .font(.bitchatSystem(size: 14))
@@ -1024,6 +1045,21 @@ struct ContentView: View {
                                 isFavorite
                                 ? String(localized: "content.accessibility.remove_favorite", comment: "Accessibility label to remove a favorite")
                                 : String(localized: "content.accessibility.add_favorite", comment: "Accessibility label to add a favorite")
+                            )
+                        }
+                        
+                        // People/info button for XMTP contacts
+                        if privatePeerID.isXMTPDM {
+                            Button(action: {
+                                showXMTPPeerInfo = true
+                            }) {
+                                Image(systemName: "person.circle")
+                                    .font(.bitchatSystem(size: 14))
+                                    .foregroundColor(textColor)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(
+                                String(localized: "content.accessibility.peer_info", comment: "Accessibility label for viewing peer info")
                             )
                         }
                     }
@@ -1072,11 +1108,23 @@ struct ContentView: View {
                     }
                 }
         )
+        .sheet(isPresented: $showXMTPPeerInfo) {
+            if let peerID = viewModel.selectedPrivateChatPeer, peerID.isXMTPDM {
+                XMTPPeerInfoSheet(peerID: peerID, isPresented: $showXMTPPeerInfo)
+                    .environmentObject(viewModel)
+                    .environmentObject(xmtpContainer)
+            }
+        }
     }
 
     private func privateHeaderInfo(context: PrivateHeaderContext, privatePeerID: PeerID) -> some View {
         Button(action: {
-            viewModel.showFingerprint(for: context.headerPeerID)
+            // For XMTP peers, show XMTP info sheet instead of Noise fingerprint view
+            if privatePeerID.isXMTPDM {
+                showXMTPPeerInfo = true
+            } else {
+                viewModel.showFingerprint(for: context.headerPeerID)
+            }
         }) {
             HStack(spacing: 6) {
                 if let connectionState = context.peer?.connectionState {
@@ -1125,7 +1173,14 @@ struct ContentView: View {
                     .font(.bitchatSystem(size: 16, weight: .medium, design: .monospaced))
                     .foregroundColor(textColor)
 
-                if !privatePeerID.isGeoDM {
+                // Show encryption status indicator
+                if privatePeerID.isXMTPDM {
+                    // XMTP uses MLS which is always end-to-end encrypted
+                    Image(systemName: "lock.fill")
+                        .font(.bitchatSystem(size: 14))
+                        .foregroundColor(.green)
+                        .accessibilityLabel(String(localized: "content.accessibility.xmtp_encrypted", comment: "Accessibility label for XMTP encrypted indicator"))
+                } else if !privatePeerID.isGeoDM {
                     let statusPeerID = viewModel.getShortIDForNoiseKey(privatePeerID)
                     let encryptionStatus = viewModel.getEncryptionStatus(for: statusPeerID)
                     if let icon = encryptionStatus.icon {
@@ -1167,6 +1222,15 @@ struct ContentView: View {
             if privatePeerID.isGeoDM, case .location(let ch) = locationManager.selectedChannel {
                 let disp = viewModel.geohashDisplayName(for: privatePeerID)
                 return "#\(ch.geohash)/@\(disp)"
+            }
+            // Check for XMTP contact with saved nickname
+            if privatePeerID.isXMTPDM {
+                let truncated = privatePeerID.bare
+                if let contact = xmtpContainer.clientService.savedContacts.first(where: { $0.truncatedId == truncated }) {
+                    return contact.displayName
+                }
+                // Show shortened inbox ID for unsaved XMTP contacts
+                return "XMTP:\(truncated.prefix(8))…"
             }
             if let name = peer?.displayName { return name }
             if let name = viewModel.meshService.peerNickname(peerID: headerPeerID) { return name }
@@ -1748,7 +1812,7 @@ private extension ContentView {
             return false
         }
     }
-
+    
     private var composerAccentColor: Color {
         viewModel.selectedPrivateChatPeer != nil ? Color.orange : textColor
     }
@@ -1782,6 +1846,19 @@ private extension ContentView {
         .accessibilityLabel("Choose photo")
         #endif
     }
+    
+    #if os(iOS)
+    var walletQRScannerButton: some View {
+        Button(action: { showWalletQRScanner = true }) {
+            Image(systemName: "qrcode.viewfinder")
+                .font(.bitchatSystem(size: 22))
+                .foregroundColor(Color.orange)
+                .frame(width: 36, height: 36)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Scan wallet QR code to start XMTP chat")
+    }
+    #endif
 
     @ViewBuilder
     var sendOrMicButton: some View {

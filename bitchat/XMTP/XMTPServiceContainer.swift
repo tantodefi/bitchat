@@ -29,6 +29,7 @@ final class XMTPServiceContainer: ObservableObject {
     let locationChannels: XMTPLocationChannels
     let balanceService: EthereumBalanceService
     let meshTransactionRelay: MeshTransactionRelay
+    let geohashGroupRegistry: GeohashGroupRegistry
     
     // MARK: - Private
     
@@ -93,6 +94,12 @@ final class XMTPServiceContainer: ObservableObject {
             clientService: clientService
         )
         
+        // Create geohash group registry for open location groups
+        self.geohashGroupRegistry = GeohashGroupRegistry(clientService: clientService)
+        
+        // Connect location channels to registry
+        self.locationChannels.setRegistry(geohashGroupRegistry)
+        
         // Create balance service
         self.balanceService = EthereumBalanceService()
         
@@ -114,9 +121,10 @@ final class XMTPServiceContainer: ObservableObject {
     func initialize() async {
         guard !isInitialized else { return }
         
-        // Check if XMTP is enabled
-        guard TransportPreferences.shared.isXMTPEnabled else {
-            SecureLogger.info("XMTP: Skipping initialization (disabled in preferences)", category: .session)
+        let prefs = TransportPreferences.shared
+        // Check if XMTP is enabled (either directly or via geo transport)
+        guard prefs.isXMTPEnabled || prefs.geoTransport == .xmtp else {
+            SecureLogger.info("XMTP: Skipping initialization (disabled in preferences and not used for geo)", category: .session)
             return
         }
         
@@ -174,12 +182,14 @@ final class XMTPServiceContainer: ObservableObject {
     private func handlePreferenceChange() {
         let prefs = TransportPreferences.shared
         
-        // Handle XMTP enable/disable
-        if prefs.isXMTPEnabled && !isInitialized {
+        // Handle XMTP enable/disable - also auto-enable if geo transport is XMTP
+        let shouldBeInitialized = prefs.isXMTPEnabled || prefs.geoTransport == .xmtp
+        
+        if shouldBeInitialized && !isInitialized {
             Task {
                 await initialize()
             }
-        } else if !prefs.isXMTPEnabled && isInitialized {
+        } else if !shouldBeInitialized && isInitialized {
             Task {
                 await shutdown()
             }
@@ -188,7 +198,7 @@ final class XMTPServiceContainer: ObservableObject {
         // Handle geo transport switching
         if prefs.geoTransport == .xmtp && isInitialized {
             startLocationChannels()
-        } else {
+        } else if prefs.geoTransport != .xmtp {
             locationChannels.leaveAllChannels()
         }
     }

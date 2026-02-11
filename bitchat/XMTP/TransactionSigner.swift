@@ -30,6 +30,8 @@ final class TransactionSigner {
     ///   - to: Destination address (0x prefixed)
     ///   - amountWei: Amount in wei
     ///   - nonce: Transaction nonce (fetch from RPC if nil)
+    ///   - maxPriorityFeePerGas: Priority fee in wei (default: 1.5 gwei)
+    ///   - maxFeePerGas: Max fee per gas in wei (default: 30 gwei)
     ///   - replyToPeerId: PeerID to send confirmation back to
     ///   - description: Human-readable description
     /// - Returns: The request ID for tracking
@@ -37,6 +39,8 @@ final class TransactionSigner {
         to: String,
         amountWei: UInt64,
         nonce: UInt64? = nil,
+        maxPriorityFeePerGas: UInt64? = nil,
+        maxFeePerGas: UInt64? = nil,
         replyToPeerId: String,
         description: String? = nil
     ) async throws -> String {
@@ -59,17 +63,17 @@ final class TransactionSigner {
         }
         SecureLogger.debug("📍 Using nonce: \(txNonce) for chain: \(chainId)", category: .session)
         
-        // Gas parameters (EIP-1559)
+        // Gas parameters (EIP-1559) - use provided values or defaults
         let gasLimit: UInt64 = 21000 // Standard ETH transfer
-        let maxPriorityFeePerGas: UInt64 = 1_500_000_000 // 1.5 gwei
-        let maxFeePerGas: UInt64 = 50_000_000_000 // 50 gwei
+        let priorityFee = maxPriorityFeePerGas ?? 1_500_000_000 // Default: 1.5 gwei
+        let maxFee = maxFeePerGas ?? 30_000_000_000 // Default: 30 gwei
         
         // Sign the transaction
         let signedTx = try await wallet.signTransaction(
             chainId: chainId,
             nonce: txNonce,
-            maxPriorityFeePerGas: maxPriorityFeePerGas,
-            maxFeePerGas: maxFeePerGas,
+            maxPriorityFeePerGas: priorityFee,
+            maxFeePerGas: maxFee,
             gasLimit: gasLimit,
             to: to,
             value: amountWei,
@@ -82,8 +86,8 @@ final class TransactionSigner {
             chainId: chainId,
             nonce: txNonce,
             gasLimit: gasLimit,
-            maxFeePerGas: maxFeePerGas,
-            maxPriorityFee: maxPriorityFeePerGas,
+            maxFeePerGas: maxFee,
+            maxPriorityFee: priorityFee,
             toAddress: to,
             replyToPeerId: replyToPeerId,
             description: description ?? "Transfer \(formatEth(amountWei)) to \(to.prefix(10))…",
@@ -108,6 +112,8 @@ final class TransactionSigner {
     ///   - value: Value to send (usually 0 for contract calls)
     ///   - gasLimit: Gas limit for the call
     ///   - nonce: Transaction nonce
+    ///   - maxPriorityFeePerGas: Priority fee in wei (default: 1.5 gwei)
+    ///   - maxFeePerGas: Max fee per gas in wei (default: 30 gwei)
     ///   - replyToPeerId: PeerID to send confirmation back to
     ///   - description: Human-readable description
     /// - Returns: The request ID for tracking
@@ -117,6 +123,8 @@ final class TransactionSigner {
         value: UInt64 = 0,
         gasLimit: UInt64 = 100000,
         nonce: UInt64? = nil,
+        maxPriorityFeePerGas: UInt64? = nil,
+        maxFeePerGas: UInt64? = nil,
         replyToPeerId: String,
         description: String? = nil,
         transactionType: String? = nil,
@@ -138,14 +146,15 @@ final class TransactionSigner {
             txNonce = try await fetchNonce(for: address, chainId: chainId)
         }
         
-        let maxPriorityFeePerGas: UInt64 = 1_500_000_000
-        let maxFeePerGas: UInt64 = 50_000_000_000
+        // Gas parameters - use provided values or defaults
+        let priorityFee = maxPriorityFeePerGas ?? 1_500_000_000 // Default: 1.5 gwei
+        let maxFee = maxFeePerGas ?? 30_000_000_000 // Default: 30 gwei
         
         let signedTx = try await wallet.signTransaction(
             chainId: chainId,
             nonce: txNonce,
-            maxPriorityFeePerGas: maxPriorityFeePerGas,
-            maxFeePerGas: maxFeePerGas,
+            maxPriorityFeePerGas: priorityFee,
+            maxFeePerGas: maxFee,
             gasLimit: gasLimit,
             to: to,
             value: value,
@@ -157,8 +166,8 @@ final class TransactionSigner {
             chainId: chainId,
             nonce: txNonce,
             gasLimit: gasLimit,
-            maxFeePerGas: maxFeePerGas,
-            maxPriorityFee: maxPriorityFeePerGas,
+            maxFeePerGas: maxFee,
+            maxPriorityFee: priorityFee,
             toAddress: to,
             replyToPeerId: replyToPeerId,
             description: description,

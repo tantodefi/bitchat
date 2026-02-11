@@ -415,6 +415,78 @@ final class NostrRelayManager: ObservableObject {
         }
     }
     
+    // MARK: - Query & Registry Methods
+    
+    /// Query events matching a filter and return collected results
+    /// - Parameters:
+    ///   - filter: The Nostr filter to query
+    ///   - timeout: Maximum time to wait for results (default 5 seconds)
+    /// - Returns: Array of matching events
+    func queryEvents(filter: NostrFilter, timeout: TimeInterval = 5.0) async throws -> [NostrEvent] {
+        return try await withCheckedThrowingContinuation { continuation in
+            var collectedEvents: [NostrEvent] = []
+            let subscriptionId = "query-\(UUID().uuidString.prefix(8))"
+            var hasResumed = false
+            
+            // Set up timeout
+            let timeoutTask = Task {
+                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                if !hasResumed {
+                    hasResumed = true
+                    self.unsubscribe(id: subscriptionId)
+                    continuation.resume(returning: collectedEvents)
+                }
+            }
+            
+            // Subscribe with EOSE callback
+            subscribe(
+                filter: filter,
+                id: subscriptionId,
+                handler: { event in
+                    collectedEvents.append(event)
+                },
+                onEOSE: {
+                    timeoutTask.cancel()
+                    if !hasResumed {
+                        hasResumed = true
+                        self.unsubscribe(id: subscriptionId)
+                        continuation.resume(returning: collectedEvents)
+                    }
+                }
+            )
+        }
+    }
+    
+    /// Publish a registry event (for geohash→XMTP group mappings)
+    /// Uses the app's main identity (not per-geohash identity)
+    /// - Parameters:
+    ///   - kind: Event kind (e.g., 30078 for app data)
+    ///   - content: Event content (JSON string)
+    ///   - tags: Event tags
+    func publishRegistryEvent(kind: UInt32, content: String, tags: [[String]]) async throws {
+        // Get or create the app's Nostr identity
+        let idBridge = NostrIdentityBridge()
+        let identity = try idBridge.getOrCreateAppIdentity()
+        
+        // Create the event with the raw kind value
+        var event = NostrEvent(
+            pubkey: identity.publicKeyHex,
+            createdAt: Date(),
+            kind: kind,
+            tags: tags,
+            content: content
+        )
+        
+        // Sign the event
+        let schnorrKey = try identity.schnorrSigningKey()
+        event = try event.sign(with: schnorrKey)
+        
+        // Send to all relays
+        sendEvent(event)
+        
+        SecureLogger.debug("📝 Published registry event kind \(kind)", category: .network)
+    }
+    
     // MARK: - Private Methods
     
     private func connectToRelay(_ urlString: String) {
@@ -905,6 +977,15 @@ struct NostrFilter: Encodable {
         filter.since = since?.timeIntervalSince1970.toInt()
         filter.tagFilters = ["g": [geohash]]
         filter.limit = limit
+        return filter
+    }
+    
+    // For geohash group registry lookups (kind 30078 parameterized replaceable events)
+    static func geohashRegistry(geohash: String, appTag: String, kind: Int) -> NostrFilter {
+        var filter = NostrFilter()
+        filter.kinds = [kind]
+        filter.tagFilters = ["d": [geohash], "t": [appTag]]
+        filter.limit = 1
         return filter
     }
 

@@ -79,3 +79,7 @@ build.log
 
 # Local configs
 Local.xcconfig
+
+# Secrets (API keys)
+Secrets.xcconfig
+Configs/Secrets.xcconfig
