@@ -43,8 +43,8 @@ struct WalletView: View {
         EILCrossChainManager(wallet: wallet)
     }
     
-    // ENS name support
-    @AppStorage("ensSubdomain") private var ensSubdomain: String?
+    // ENS name support - uses App Group for persistence across reinstalls
+    @AppStorage("ensSubdomain", store: UserDefaults(suiteName: BitchatApp.groupID)) private var ensSubdomain: String?
     
     // Beta warning - show once across both WalletView and WalletSettingsView
     @AppStorage("wallet-beta-warning-accepted") private var betaWarningAccepted: Bool = false

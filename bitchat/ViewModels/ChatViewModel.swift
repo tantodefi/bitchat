@@ -268,6 +268,10 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
     
     var nostrRelayManager: NostrRelayManager?
     private let userDefaults = UserDefaults.standard
+    // App Group UserDefaults for data that must persist across reinstalls (ENS, etc.)
+    private lazy var groupDefaults: UserDefaults = {
+        UserDefaults(suiteName: BitchatApp.groupID) ?? .standard
+    }()
     let keychain: KeychainManagerProtocol
     private let nicknameKey = "bitchat.nickname"
     // Location channel state (macOS supports manual geohash selection)
@@ -768,9 +772,9 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
     
     /// Register ENS subdomain for a new user
     private func registerENSSubdomainForNewUser() async {
-        // Check if already registered
+        // Check if already registered (using App Group for persistence)
         let ensKey = "ensSubdomain"
-        guard userDefaults.string(forKey: ensKey) == nil else { return }
+        guard groupDefaults.string(forKey: ensKey) == nil else { return }
         
         // Check if Namestone is configured
         guard await NamestoneService.shared.isConfigured else {
@@ -807,7 +811,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
             if success {
                 let fullName = "\(nickname).dstealth.eth"
                 await MainActor.run {
-                    userDefaults.set(fullName, forKey: ensKey)
+                    groupDefaults.set(fullName, forKey: ensKey)
                 }
                 SecureLogger.info("Registered ENS name: \(fullName)", category: .network)
             }
@@ -827,7 +831,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
                 if success {
                     let fullName = "\(uniqueNickname).dstealth.eth"
                     await MainActor.run {
-                        userDefaults.set(fullName, forKey: ensKey)
+                        groupDefaults.set(fullName, forKey: ensKey)
                     }
                     SecureLogger.info("Registered ENS name (with suffix): \(fullName)", category: .network)
                 }

@@ -27,8 +27,8 @@ struct WalletSettingsView: View {
     @AppStorage("enableEILSwaps") private var enableEILSwaps = true
     @AppStorage("stealthScanInterval") private var stealthScanInterval: Double = 60 // seconds
     
-    // ENS settings
-    @AppStorage("ensSubdomain") private var ensSubdomain: String?
+    // ENS settings - uses App Group for persistence across reinstalls
+    @AppStorage("ensSubdomain", store: UserDefaults(suiteName: BitchatApp.groupID)) private var ensSubdomain: String?
     @State private var walletAddress: String = ""
     @State private var xmtpInboxId: String?
     
