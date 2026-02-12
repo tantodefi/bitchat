@@ -14,6 +14,7 @@ import CryptoKit
 import CryptoSwift
 import Foundation
 @preconcurrency import P256K
+import XMTP
 
 /// Manager for EIP-5564 stealth addresses.
 /// Enables private receiving by generating one-time addresses that only the recipient can identify.
@@ -126,9 +127,9 @@ actor StealthAddressManager {
     /// - Returns: Self-stealth address result with all necessary data
     func generateSelfStealthAddress(derivationIndex: UInt32) async throws -> SelfStealthAddressResult {
         // Get our own stealth meta-address components
-        let spendPubKey = try await getSpendingPublicKey()
         let viewPubKey = try await getViewingPublicKey()
         let viewingPrivKey = try await getViewingPrivateKey()
+        let spendingPrivKey = try await wallet.getOrCreatePrivateKey()
         
         // Generate deterministic ephemeral key using HMAC
         // ephemeral_seed = HMAC-SHA256(viewing_priv, "self-stealth-ephemeral:" || index)
@@ -150,11 +151,12 @@ actor StealthAddressManager {
         // View tag is first byte
         let viewTag = hashedSecret[0]
         
-        // Compute stealth public key: P_stealth = P_spend + hash(S) * G
-        let stealthPubKey = try addPublicKeys(spendPubKey, scalarMultiplyG(hashedSecret))
+        // Compute stealth private key: stealth_priv = spending_priv + hash(S) mod n
+        let stealthPrivKey = try addPrivateKeys(spendingPrivKey, hashedSecret)
         
-        // Derive address
-        let stealthAddress = try deriveAddress(from: stealthPubKey)
+        // Derive address directly from stealth private key using XMTP FFI (efficient)
+        let stealthPubKey = try ethereumGeneratePublicKey(privateKey32: stealthPrivKey)
+        let stealthAddress = try ethereumAddressFromPubkey(pubkey: stealthPubKey).lowercased()
         
         SecureLogger.debug("🥷 Generated self-stealth address #\(derivationIndex) with view tag: \(viewTag)", category: .session)
         
@@ -252,10 +254,13 @@ actor StealthAddressManager {
         }
         
         // View tag matches, do full verification
-        // Compute expected stealth address: P_stealth = P_spend + hash(S) * G
-        let spendPubKey = try await getSpendingPublicKey()
-        let stealthPubKey = try addPublicKeys(spendPubKey, scalarMultiplyG(hashedSecret))
-        let expectedAddress = try deriveAddress(from: stealthPubKey)
+        // Use scalar addition: stealth_priv = spending_priv + hash(S), then derive address
+        let spendingPrivKey = try await wallet.getOrCreatePrivateKey()
+        let stealthPrivKey = try addPrivateKeys(spendingPrivKey, hashedSecret)
+        
+        // Derive address directly from stealth private key using XMTP FFI (efficient)
+        let stealthPubKey = try ethereumGeneratePublicKey(privateKey32: stealthPrivKey)
+        let expectedAddress = try ethereumAddressFromPubkey(pubkey: stealthPubKey).lowercased()
         
         let matches = expectedAddress.lowercased() == announcedAddress.lowercased()
         
@@ -337,13 +342,27 @@ actor StealthAddressManager {
     }
     
     /// Derive uncompressed public key (65 bytes with 0x04 prefix) from private key
+    /// Derive uncompressed public key (65 bytes with 0x04 prefix) from private key
     private func derivePublicKeyUncompressed(from privateKey: Data) throws -> Data {
         guard privateKey.count == 32 else {
             throw StealthError.invalidKey
         }
         
+        // P256K returns compressed format, so we derive compressed then decompress
         let privKey = try P256K.Signing.PrivateKey(dataRepresentation: privateKey, format: .uncompressed)
-        return privKey.publicKey.dataRepresentation
+        let compressedPubKey = privKey.publicKey.dataRepresentation
+        
+        // If P256K returns compressed (33 bytes), decompress it
+        if compressedPubKey.count == 33 {
+            return try decompressPublicKey(compressedPubKey)
+        }
+        
+        // If already uncompressed (65 bytes with 0x04 prefix), return as-is
+        if compressedPubKey.count == 65 && compressedPubKey[0] == 0x04 {
+            return compressedPubKey
+        }
+        
+        throw StealthError.invalidKey
     }
     
     /// Derive compressed public key (33 bytes) from private key
@@ -380,15 +399,47 @@ actor StealthAddressManager {
     }
     
     /// Decompress a 33-byte public key to 65-byte uncompressed form
+    /// Uses secp256k1 curve equation: y² = x³ + 7 (mod p)
     private func decompressPublicKey(_ compressed: Data) throws -> Data {
         guard compressed.count == 33 else {
             throw StealthError.invalidKey
         }
         
-        // Use P256K to decompress by creating a key and getting uncompressed representation
-        // This is a bit roundabout but ensures we use the library's curve math
-        let pubKey = try P256K.Signing.PublicKey(dataRepresentation: compressed, format: .compressed)
-        return pubKey.dataRepresentation
+        let prefix = compressed[0]
+        guard prefix == 0x02 || prefix == 0x03 else {
+            throw StealthError.invalidKey
+        }
+        
+        // secp256k1 prime
+        let p = BigUInt(hexString: "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F")!
+        
+        // Extract x coordinate
+        let x = BigUInt(data: Data(compressed[1...32]))
+        
+        // Calculate y² = x³ + 7 (mod p)
+        let x3 = x.modPow(BigUInt(3), modulus: p)
+        let y2 = (x3 + BigUInt(7)) % p
+        
+        // Calculate y = sqrt(y²) mod p using Tonelli-Shanks for p ≡ 3 (mod 4)
+        // For secp256k1, p ≡ 3 (mod 4), so y = y²^((p+1)/4) mod p
+        let exp = (p + BigUInt(1)) / BigUInt(4)
+        var y = y2.modPow(exp, modulus: p)
+        
+        // Choose the correct y based on prefix (02 = even y, 03 = odd y)
+        let yBytes = y.serialize()
+        let yIsOdd = !yBytes.isEmpty && !yBytes.last!.isMultiple(of: 2)
+        let prefixWantsOdd = prefix == 0x03
+        
+        if yIsOdd != prefixWantsOdd {
+            y = p - y
+        }
+        
+        // Construct uncompressed key: 04 || x (32 bytes) || y (32 bytes)
+        var result = Data([0x04])
+        result.append(Data(compressed[1...32])) // x coordinate
+        result.append(y.serialize().padLeft(to: 32)) // y coordinate
+        
+        return result
     }
     
     /// Perform ECDH to compute shared secret
@@ -596,6 +647,28 @@ private extension BigUInt {
         
         // Serialize directly to bytes
         return serializeToBytes()
+    }
+    
+    /// Modular exponentiation: self^exp mod m
+    /// Uses square-and-multiply algorithm for efficiency
+    func modPow(_ exp: BigUInt, modulus m: BigUInt) -> BigUInt {
+        guard !m.isZero else { return BigUInt(0) }
+        if exp.isZero { return BigUInt(1) }
+        
+        var result = BigUInt(1)
+        var base = self % m
+        var e = exp
+        let two = BigUInt(2)
+        
+        while !e.isZero {
+            if e % two == BigUInt(1) {
+                result = (result * base) % m
+            }
+            e = e / two
+            base = (base * base) % m
+        }
+        
+        return result
     }
     
     /// Internal method to serialize to bytes

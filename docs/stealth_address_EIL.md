@@ -29,8 +29,21 @@ Stealth addresses allow receivers to publish a single "meta-address" that sender
 
 3. **UI Components**
    - `StealthAddressListView.swift` - List of discovered addresses with self-generation UI
-   - `StealthAddressDetailView.swift` - Single address details, sweep functionality
+   - `StealthAddressDetailView.swift` - Single address details, sweep functionality, private key export
    - Integration in `WalletView.swift` - Quick access card
+
+### New Features (February 2026)
+
+#### Private Key Export ✅
+
+Users can export the private key for any stealth address to import into external wallets (MetaMask, etc.):
+
+- **Location**: StealthAddressDetailView → Advanced section → "Export Private Key"
+- **Derivation**: `stealth_priv = spending_key + keccak256(shared_secret) mod n`
+- **Output**: Hex-encoded 32-byte private key with `0x` prefix
+- **Security**: Warning displayed about key sensitivity; key cleared on sheet dismiss
+
+This is safe because all stealth private keys are deterministically derivable from the main spending key + ephemeral public key stored with each address. The main wallet remains protected.
 
 ### Technical Details
 
@@ -55,6 +68,31 @@ Recipient:
     P_stealth = P_spend + keccak256(S) * G
     stealth_key = spending_key + keccak256(S)
 ```
+
+### Implementation Notes (February 2026 Fixes)
+
+#### Performance Optimization
+
+The original implementation used pure Swift `BigUInt` for modular exponentiation during key derivation, which caused severe performance issues (multi-second hangs). This was fixed by leveraging XMTP's FFI bindings to libsecp256k1:
+
+```swift
+// Old (slow - BigUInt modPow):
+let stealthPrivKeyBigInt = (spendingKeyBigInt + hashedSecretBigInt) % curveOrder
+let stealthPubKey = secp256k1_ec_pubkey_create(stealthPrivKey)  // Slow!
+
+// New (fast - XMTP FFI):
+let stealthPrivKey = try addPrivateKeys(spendingPrivKey, hashedSecret)  // Scalar addition
+let stealthPubKey = try ethereumGeneratePublicKey(privateKey32: stealthPrivKey)  // Native libsecp256k1
+let stealthAddress = try ethereumAddressFromPubkey(pubkey: stealthPubKey)
+```
+
+Key functions from XMTP FFI:
+- `ethereumGeneratePublicKey(privateKey32:)` - Fast EC point multiplication
+- `ethereumAddressFromPubkey(pubkey:)` - Keccak256 address derivation
+
+#### Public Key Format Fix
+
+Fixed a crash in `decompressPublicKey()` where compressed keys (33 bytes) were being returned instead of uncompressed (65 bytes), causing array index out of bounds when accessing byte offsets for X/Y coordinates.
 
 ### Self-Generated Stealth Addresses ✅
 
@@ -203,10 +241,32 @@ Added to `XMTPSettingsView.swift`:
 ### Stealth Addresses
 - [x] Self-generated stealth addresses with deterministic derivation
 - [x] UI for generating and viewing self-generated addresses with balances
+- [x] Private key export for individual stealth addresses
+- [x] Performance optimization using XMTP FFI (libsecp256k1)
 - [ ] Implement background scanning service
 - [ ] Add announcement event indexer integration
 - [ ] Support token transfers (not just ETH)
 - [ ] ENS stealth meta-address resolution
+
+### Sweep Functionality (Partial)
+
+The sweep UI is complete but transaction signing/broadcast is stubbed. Current state:
+- ✅ Destination address input with validation
+- ✅ Private key derivation via `computeStealthKey()`
+- ❌ Transaction building and signing
+- ❌ Private broadcast (Flashbots Protect)
+
+**Implementation needed:**
+1. Get nonce for stealth address from RPC
+2. Estimate gas (~21,000 for ETH transfer)
+3. Build EIP-1559 transaction: `amount = balance - (gas_limit * max_fee)`
+4. Sign with derived stealth private key
+5. Broadcast via Flashbots Protect or private relay to preserve unlinkability
+
+**Privacy consideration:** Public mempool broadcast would link stealth address to destination, defeating the purpose. Options:
+- Flashbots Protect RPC (`https://rpc.flashbots.net`)
+- MEV Blocker (`https://rpc.mevblocker.io`)
+- Gas sponsorship relay (destination doesn't need prior funding)
 
 ### EIP-7702
 - [ ] Batch authorization signing
@@ -236,10 +296,20 @@ Added to `XMTPSettingsView.swift`:
 - [ ] EIP-7702 transaction encoding
 - [ ] Authorization signature verification
 - [ ] Quote calculation logic
+- [ ] Private key export derivation correctness
 
 ### Integration Tests Needed
 - [ ] Full stealth payment flow (generate → announce → scan → sweep)
 - [ ] Cross-chain swap end-to-end (when testnet contracts available)
+- [ ] Export key → import to MetaMask → sign transaction
+
+## Changelog
+
+### February 2026
+- **Fixed**: Stealth address generation crash (array bounds in `decompressPublicKey`)
+- **Fixed**: Performance hang during key derivation (replaced BigUInt with XMTP FFI)
+- **Added**: Private key export feature in StealthAddressDetailView
+- **Added**: XMTP import for efficient secp256k1 operations
 
 ## References
 

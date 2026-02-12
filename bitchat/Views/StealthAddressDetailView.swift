@@ -25,6 +25,9 @@ struct StealthAddressDetailView: View {
     @State private var showCopiedToast: Bool = false
     @State private var copiedText: String = ""
     @State private var balance: String?
+    @State private var showExportKeySheet: Bool = false
+    @State private var exportedPrivateKey: String?
+    @State private var isExportingKey: Bool = false
     
     var body: some View {
         ScrollView {
@@ -330,6 +333,37 @@ struct StealthAddressDetailView: View {
     
     private var dangerZone: some View {
         VStack(alignment: .leading, spacing: 12) {
+            Text("Advanced")
+                .font(.headline)
+            
+            // Export Private Key button
+            Button {
+                exportPrivateKey()
+            } label: {
+                HStack {
+                    if isExportingKey {
+                        ProgressView()
+                            .scaleEffect(0.8)
+                    } else {
+                        Image(systemName: "key.fill")
+                    }
+                    Text("Export Private Key")
+                }
+                .frame(maxWidth: .infinity)
+                .padding()
+                .background(Color.orange.opacity(0.1))
+                .cornerRadius(12)
+            }
+            .buttonStyle(.plain)
+            .disabled(isExportingKey)
+            
+            Text("Export this stealth address's private key to use in another wallet like MetaMask.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            
+            Divider()
+                .padding(.vertical, 8)
+            
             Text("Danger Zone")
                 .font(.headline)
                 .foregroundColor(.red)
@@ -352,6 +386,9 @@ struct StealthAddressDetailView: View {
             Text("This only removes the address from your list. If there are funds, they will remain on-chain.")
                 .font(.caption)
                 .foregroundColor(.secondary)
+        }
+        .sheet(isPresented: $showExportKeySheet) {
+            exportKeySheet
         }
     }
     
@@ -492,6 +529,114 @@ struct StealthAddressDetailView: View {
         case 42161: return "Arbitrum One"
         default: return "Chain \(chainId)"
         }
+    }
+    
+    // MARK: - Private Key Export
+    
+    private func exportPrivateKey() {
+        isExportingKey = true
+        
+        Task {
+            do {
+                let privateKey = try await stealthManager.computeStealthKey(ephemeralPubKey: address.ephemeralPubKey)
+                let hexKey = privateKey.map { String(format: "%02x", $0) }.joined()
+                
+                await MainActor.run {
+                    exportedPrivateKey = hexKey
+                    isExportingKey = false
+                    showExportKeySheet = true
+                }
+            } catch {
+                await MainActor.run {
+                    isExportingKey = false
+                    copiedText = "Failed to derive key"
+                    showCopiedToast = true
+                }
+            }
+        }
+    }
+    
+    private var exportKeySheet: some View {
+        NavigationStack {
+            VStack(spacing: 24) {
+                // Warning header
+                VStack(spacing: 12) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 48))
+                        .foregroundColor(.orange)
+                    
+                    Text("Private Key")
+                        .font(.title2)
+                        .fontWeight(.bold)
+                    
+                    Text("Anyone with this key can spend funds from this stealth address. Never share it publicly.")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .padding()
+                
+                // Private key display
+                if let key = exportedPrivateKey {
+                    VStack(spacing: 12) {
+                        Text("0x\(key)")
+                            .font(.system(.caption, design: .monospaced))
+                            .padding()
+                            .frame(maxWidth: .infinity)
+                            .background(Color(.systemGray6))
+                            .cornerRadius(8)
+                            .textSelection(.enabled)
+                        
+                        HStack(spacing: 16) {
+                            Button {
+                                copyToClipboard("0x\(key)", label: "Private key")
+                                showExportKeySheet = false
+                            } label: {
+                                HStack {
+                                    Image(systemName: "doc.on.doc")
+                                    Text("Copy")
+                                }
+                                .frame(maxWidth: .infinity)
+                                .padding()
+                                .background(Color.accentColor)
+                                .foregroundColor(.white)
+                                .cornerRadius(12)
+                            }
+                        }
+                    }
+                    .padding()
+                }
+                
+                // Info section
+                VStack(alignment: .leading, spacing: 8) {
+                    Label("Import into MetaMask or other wallets", systemImage: "wallet.pass")
+                    Label("Works on any EVM-compatible chain", systemImage: "link")
+                    Label("Your main wallet key remains safe", systemImage: "lock.shield")
+                }
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .padding()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(.systemGray6))
+                .cornerRadius(12)
+                .padding(.horizontal)
+                
+                Spacer()
+            }
+            .navigationTitle("Export Key")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") {
+                        exportedPrivateKey = nil
+                        showExportKeySheet = false
+                    }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
     }
 }
 

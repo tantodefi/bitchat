@@ -101,20 +101,69 @@ final class StealthAddressStore: ObservableObject {
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     
+    /// App Group container for persistence across reinstalls/rebuilds
+    private var containerURL: URL {
+        // Use App Group container if available, fall back to Documents
+        if let groupURL = fileManager.containerURL(forSecurityApplicationGroupIdentifier: BitchatApp.groupID) {
+            return groupURL
+        }
+        return fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
+    }
+    
     private var storeURL: URL {
-        let documents = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        return documents.appendingPathComponent("stealth_addresses.json")
+        containerURL.appendingPathComponent("stealth_addresses.json")
     }
     
     private var syncStateURL: URL {
-        let documents = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        return documents.appendingPathComponent("stealth_sync_state.json")
+        containerURL.appendingPathComponent("stealth_sync_state.json")
+    }
+    
+    /// Legacy Documents folder URL (for migration)
+    private var legacyStoreURL: URL {
+        fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("stealth_addresses.json")
+    }
+    
+    private var legacySyncStateURL: URL {
+        fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("stealth_sync_state.json")
     }
     
     // MARK: - Initialization
     
     init() {
+        migrateFromLegacyLocation()
         loadFromDisk()
+    }
+    
+    // MARK: - Migration
+    
+    /// Migrate data from legacy Documents folder to App Group container
+    private func migrateFromLegacyLocation() {
+        // Only migrate if App Group is available and legacy files exist
+        guard fileManager.containerURL(forSecurityApplicationGroupIdentifier: BitchatApp.groupID) != nil else {
+            return
+        }
+        
+        // Migrate stealth addresses
+        if fileManager.fileExists(atPath: legacyStoreURL.path) && !fileManager.fileExists(atPath: storeURL.path) {
+            do {
+                try fileManager.moveItem(at: legacyStoreURL, to: storeURL)
+                SecureLogger.info("🥷 Migrated stealth addresses to App Group container", category: .session)
+            } catch {
+                SecureLogger.error("🥷 Failed to migrate stealth addresses: \(error)", category: .session)
+            }
+        }
+        
+        // Migrate sync state
+        if fileManager.fileExists(atPath: legacySyncStateURL.path) && !fileManager.fileExists(atPath: syncStateURL.path) {
+            do {
+                try fileManager.moveItem(at: legacySyncStateURL, to: syncStateURL)
+                SecureLogger.info("🥷 Migrated stealth sync state to App Group container", category: .session)
+            } catch {
+                SecureLogger.error("🥷 Failed to migrate stealth sync state: \(error)", category: .session)
+            }
+        }
     }
     
     // MARK: - Address Management

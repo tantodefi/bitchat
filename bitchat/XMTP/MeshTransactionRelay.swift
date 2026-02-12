@@ -38,9 +38,15 @@ final class MeshTransactionRelay: ObservableObject {
     private let keychain: KeychainManagerProtocol
     private weak var bleService: BLEService?
     private let storageKey = "mesh-tx-pending-relays"
+    private let confirmedStorageKey = "mesh-tx-confirmed-history"
     private let failedStorageKey = "mesh-tx-failed-history"
     private var retryTask: Task<Void, Never>?
     private var retryScheduled = false
+    
+    /// App Group UserDefaults for persistence across reinstalls
+    private var appGroupDefaults: UserDefaults {
+        UserDefaults(suiteName: BitchatApp.groupID) ?? .standard
+    }
     
     // Retry configuration
     private let retryInterval: TimeInterval = 30 // Retry every 30 seconds
@@ -107,7 +113,9 @@ final class MeshTransactionRelay: ObservableObject {
     init(keychain: KeychainManagerProtocol) {
         self.keychain = keychain
         self.allowMeshRelay = UserDefaults.standard.bool(forKey: "mesh-tx-relay-enabled")
+        migrateFromLegacyStorage()
         loadPendingRelays()
+        loadConfirmedTransactions()
         loadFailedTransactions()
         
         // Start retry loop for any queued transactions
@@ -257,6 +265,7 @@ final class MeshTransactionRelay: ObservableObject {
                 blockNumber: confirm.blockNumber
             )
             confirmedTransactions.append(confirmed)
+            saveConfirmedTransactions()
             
             // Remove from pending
             pendingRelays.remove(at: idx)
@@ -379,6 +388,7 @@ final class MeshTransactionRelay: ObservableObject {
                 blockNumber: nil
             )
             confirmedTransactions.append(confirmed)
+            saveConfirmedTransactions()
             
             // Remove from pending
             pendingRelays.removeAll { $0.id == relay.id }
@@ -566,8 +576,35 @@ final class MeshTransactionRelay: ObservableObject {
     
     // MARK: - Persistence
     
+    /// Migrate data from standard UserDefaults to App Group
+    private func migrateFromLegacyStorage() {
+        let legacy = UserDefaults.standard
+        let appGroup = appGroupDefaults
+        
+        // Migrate pending relays
+        if let data = legacy.data(forKey: storageKey), appGroup.data(forKey: storageKey) == nil {
+            appGroup.set(data, forKey: storageKey)
+            legacy.removeObject(forKey: storageKey)
+            SecureLogger.info("📦 Migrated pending relays to App Group", category: .session)
+        }
+        
+        // Migrate confirmed transactions
+        if let data = legacy.data(forKey: confirmedStorageKey), appGroup.data(forKey: confirmedStorageKey) == nil {
+            appGroup.set(data, forKey: confirmedStorageKey)
+            legacy.removeObject(forKey: confirmedStorageKey)
+            SecureLogger.info("📦 Migrated confirmed transactions to App Group", category: .session)
+        }
+        
+        // Migrate failed transactions
+        if let data = legacy.data(forKey: failedStorageKey), appGroup.data(forKey: failedStorageKey) == nil {
+            appGroup.set(data, forKey: failedStorageKey)
+            legacy.removeObject(forKey: failedStorageKey)
+            SecureLogger.info("📦 Migrated failed transactions to App Group", category: .session)
+        }
+    }
+    
     private func loadPendingRelays() {
-        guard let data = UserDefaults.standard.data(forKey: storageKey),
+        guard let data = appGroupDefaults.data(forKey: storageKey),
               let relays = try? JSONDecoder().decode([PendingRelay].self, from: data) else {
             return
         }
@@ -576,12 +613,26 @@ final class MeshTransactionRelay: ObservableObject {
     
     private func savePendingRelays() {
         if let data = try? JSONEncoder().encode(pendingRelays) {
-            UserDefaults.standard.set(data, forKey: storageKey)
+            appGroupDefaults.set(data, forKey: storageKey)
+        }
+    }
+    
+    private func loadConfirmedTransactions() {
+        guard let data = appGroupDefaults.data(forKey: confirmedStorageKey),
+              let confirmed = try? JSONDecoder().decode([ConfirmedTransaction].self, from: data) else {
+            return
+        }
+        confirmedTransactions = confirmed
+    }
+    
+    private func saveConfirmedTransactions() {
+        if let data = try? JSONEncoder().encode(confirmedTransactions) {
+            appGroupDefaults.set(data, forKey: confirmedStorageKey)
         }
     }
     
     private func loadFailedTransactions() {
-        guard let data = UserDefaults.standard.data(forKey: failedStorageKey),
+        guard let data = appGroupDefaults.data(forKey: failedStorageKey),
               let failed = try? JSONDecoder().decode([FailedTransaction].self, from: data) else {
             return
         }
@@ -590,7 +641,7 @@ final class MeshTransactionRelay: ObservableObject {
     
     private func saveFailedTransactions() {
         if let data = try? JSONEncoder().encode(failedTransactions) {
-            UserDefaults.standard.set(data, forKey: failedStorageKey)
+            appGroupDefaults.set(data, forKey: failedStorageKey)
         }
     }
     
