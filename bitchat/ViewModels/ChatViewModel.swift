@@ -467,6 +467,9 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         self.commandProcessor.meshService = meshService
         
         loadNickname()
+        Task {
+            await recoverENSSubdomainIfNeeded()
+        }
         loadVerifiedFingerprints()
         meshService.delegate = self
         
@@ -767,6 +770,58 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
             Task {
                 await registerENSSubdomainForNewUser()
             }
+        }
+    }
+
+    /// Recover ENS subdomain if it exists in legacy storage or on Namestone.
+    /// This handles users who upgraded from pre-App Group ENS storage.
+    private func recoverENSSubdomainIfNeeded() async {
+        let ensKey = "ensSubdomain"
+
+        // Already present in App Group storage
+        if let existing = groupDefaults.string(forKey: ensKey), !existing.isEmpty {
+            return
+        }
+
+        // Migrate legacy value from standard defaults
+        if let legacyENS = userDefaults.string(forKey: ensKey), !legacyENS.isEmpty {
+            groupDefaults.set(legacyENS, forKey: ensKey)
+            SecureLogger.info("Migrated ENS subdomain from legacy storage: \(legacyENS)", category: .network)
+            return
+        }
+
+        // No local value - try recovering from Namestone for current wallet
+        guard await NamestoneService.shared.isConfigured else {
+            return
+        }
+
+        var attempts = 0
+        while !XMTPServiceContainer.isConfigured && attempts < 30 {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            attempts += 1
+        }
+
+        guard XMTPServiceContainer.isConfigured else {
+            return
+        }
+
+        do {
+            let wallet = XMTPServiceContainer.shared.wallet
+            let address = try await wallet.getAddress()
+            let records = try await NamestoneService.shared.getNames(address: address)
+
+            guard !records.isEmpty else { return }
+
+            let expectedFromNickname = "\(nickname).dstealth.eth"
+            let recoveredName = records.first(where: { $0.fullName.caseInsensitiveCompare(expectedFromNickname) == .orderedSame })?.fullName
+                ?? records.first?.fullName
+
+            if let recoveredName, !recoveredName.isEmpty {
+                groupDefaults.set(recoveredName, forKey: ensKey)
+                SecureLogger.info("Recovered ENS subdomain from Namestone: \(recoveredName)", category: .network)
+            }
+        } catch {
+            SecureLogger.debug("ENS recovery skipped: \(error)", category: .network)
         }
     }
     
