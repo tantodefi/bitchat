@@ -192,14 +192,9 @@ extension ChatViewModel: XMTPClientDelegate {
             let isImage = decodedAttachment.mimeType.hasPrefix("image/")
             let isVoice = decodedAttachment.mimeType.hasPrefix("audio/")
             
-            let subdir = isImage ? "images/incoming" : (isVoice ? "voice/incoming" : "files/incoming")
-            
-            guard let baseDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
-                SecureLogger.error("Failed to get documents directory", category: .session)
-                return
-            }
-            
-            let saveDir = baseDir.appendingPathComponent(subdir, isDirectory: true)
+            let subdir = isImage ? "images/incoming" : (isVoice ? "voicenotes/incoming" : "files/incoming")
+            let filesDir = try xmtpMediaFilesDirectory()
+            let saveDir = filesDir.appendingPathComponent(subdir, isDirectory: true)
             try FileManager.default.createDirectory(at: saveDir, withIntermediateDirectories: true)
             
             let fileURL = saveDir.appendingPathComponent(filename)
@@ -216,6 +211,18 @@ extension ChatViewModel: XMTPClientDelegate {
 // MARK: - XMTP Setup
 
 extension ChatViewModel {
+    
+    private func xmtpMediaFilesDirectory() throws -> URL {
+        let base = try FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        )
+        let filesDir = base.appendingPathComponent("files", isDirectory: true)
+        try FileManager.default.createDirectory(at: filesDir, withIntermediateDirectories: true)
+        return filesDir
+    }
     
     /// Set up XMTP delegate when the service becomes available
     /// Call this after XMTPServiceContainer is initialized
@@ -278,13 +285,12 @@ extension ChatViewModel {
                 let data = try Data(contentsOf: processedURL)
                 let filename = processedURL.lastPathComponent
                 
-                // Save to outgoing folder for local display
-                if let baseDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
-                    let saveDir = baseDir.appendingPathComponent("images/outgoing", isDirectory: true)
-                    try? FileManager.default.createDirectory(at: saveDir, withIntermediateDirectories: true)
-                    let saveURL = saveDir.appendingPathComponent(filename)
-                    try? data.write(to: saveURL)
-                }
+                // Save to canonical app files folder for local display
+                let filesDir = try self.xmtpMediaFilesDirectory()
+                let saveDir = filesDir.appendingPathComponent("images/outgoing", isDirectory: true)
+                try FileManager.default.createDirectory(at: saveDir, withIntermediateDirectories: true)
+                let saveURL = saveDir.appendingPathComponent(filename)
+                try data.write(to: saveURL)
                 
                 // Send via XMTP
                 try await XMTPServiceContainer.shared.clientService.sendRemoteAttachment(
@@ -297,6 +303,7 @@ extension ChatViewModel {
                 // Update message status
                 await MainActor.run {
                     if let idx = self.privateChats[peerID]?.firstIndex(where: { $0.id == messageID }) {
+                        self.privateChats[peerID]?[idx].content = "[image] \(filename)"
                         self.privateChats[peerID]?[idx].deliveryStatus = .sent
                     }
                     self.objectWillChange.send()
@@ -359,13 +366,12 @@ extension ChatViewModel {
             do {
                 let data = try Data(contentsOf: sourceURL)
                 
-                // Save to outgoing folder for local display
-                if let baseDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
-                    let saveDir = baseDir.appendingPathComponent("voice/outgoing", isDirectory: true)
-                    try? FileManager.default.createDirectory(at: saveDir, withIntermediateDirectories: true)
-                    let saveURL = saveDir.appendingPathComponent(filename)
-                    try? data.write(to: saveURL)
-                }
+                // Save to canonical app files folder for local display
+                let filesDir = try self.xmtpMediaFilesDirectory()
+                let saveDir = filesDir.appendingPathComponent("voicenotes/outgoing", isDirectory: true)
+                try FileManager.default.createDirectory(at: saveDir, withIntermediateDirectories: true)
+                let saveURL = saveDir.appendingPathComponent(filename)
+                try data.write(to: saveURL)
                 
                 // Send via XMTP
                 try await XMTPServiceContainer.shared.clientService.sendRemoteAttachment(
@@ -378,6 +384,7 @@ extension ChatViewModel {
                 // Update message status
                 await MainActor.run {
                     if let idx = self.privateChats[peerID]?.firstIndex(where: { $0.id == messageID }) {
+                        self.privateChats[peerID]?[idx].content = "[voice] \(filename)"
                         self.privateChats[peerID]?[idx].deliveryStatus = .sent
                     }
                     self.objectWillChange.send()

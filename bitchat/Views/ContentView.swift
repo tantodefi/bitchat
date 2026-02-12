@@ -2067,7 +2067,6 @@ struct ImagePreviewView: View {
 
     @Environment(\.dismiss) private var dismiss
     #if os(iOS)
-    @State private var showExporter = false
     @State private var platformImage: UIImage?
     #else
     @State private var platformImage: NSImage?
@@ -2114,16 +2113,12 @@ struct ImagePreviewView: View {
                             .padding(.vertical, 8)
                             .background(RoundedRectangle(cornerRadius: 12).fill(Color.blue.opacity(0.6)))
                     }
+                    .disabled(platformImage == nil)
                 }
                 .padding([.horizontal, .bottom], 24)
             }
         }
         .onAppear(perform: loadImage)
-        #if os(iOS)
-        .sheet(isPresented: $showExporter) {
-            FileExportWrapper(url: url)
-        }
-        #endif
     }
 
     private func loadImage() {
@@ -2141,7 +2136,11 @@ struct ImagePreviewView: View {
 
     private func saveCopy() {
         #if os(iOS)
-        showExporter = true
+        guard let image = platformImage else {
+            SecureLogger.error("Image preview save failed: image is not loaded", category: .session)
+            return
+        }
+        UIImageWriteToSavedPhotosAlbum(image, nil, nil, nil)
         #else
         Task { @MainActor in
             let panel = NSSavePanel()
@@ -2161,20 +2160,6 @@ struct ImagePreviewView: View {
         }
         #endif
     }
-
-    #if os(iOS)
-    private struct FileExportWrapper: UIViewControllerRepresentable {
-        let url: URL
-
-        func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
-            let controller = UIDocumentPickerViewController(forExporting: [url])
-            controller.shouldShowFileExtensions = true
-            return controller
-        }
-
-        func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
-    }
-#endif
 }
 
 #if os(iOS)
