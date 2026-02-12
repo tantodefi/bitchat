@@ -778,19 +778,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
     private func recoverENSSubdomainIfNeeded() async {
         let ensKey = "ensSubdomain"
 
-        // Already present in App Group storage
-        if let existing = groupDefaults.string(forKey: ensKey), !existing.isEmpty {
-            return
-        }
-
-        // Migrate legacy value from standard defaults
-        if let legacyENS = userDefaults.string(forKey: ensKey), !legacyENS.isEmpty {
-            groupDefaults.set(legacyENS, forKey: ensKey)
-            SecureLogger.info("Migrated ENS subdomain from legacy storage: \(legacyENS)", category: .network)
-            return
-        }
-
-        // No local value - try recovering from Namestone for current wallet
+        // Need Namestone to validate and recover names
         guard await NamestoneService.shared.isConfigured else {
             return
         }
@@ -805,23 +793,96 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
             return
         }
 
+        let wallet = XMTPServiceContainer.shared.wallet
+        let currentAddress: String
+
         do {
-            let wallet = XMTPServiceContainer.shared.wallet
-            let address = try await wallet.getAddress()
-            let records = try await NamestoneService.shared.getNames(address: address)
-
-            guard !records.isEmpty else { return }
-
-            let expectedFromNickname = "\(nickname).dstealth.eth"
-            let recoveredName = records.first(where: { $0.fullName.caseInsensitiveCompare(expectedFromNickname) == .orderedSame })?.fullName
-                ?? records.first?.fullName
-
-            if let recoveredName, !recoveredName.isEmpty {
-                groupDefaults.set(recoveredName, forKey: ensKey)
-                SecureLogger.info("Recovered ENS subdomain from Namestone: \(recoveredName)", category: .network)
-            }
+            currentAddress = try await wallet.getAddress()
         } catch {
-            SecureLogger.debug("ENS recovery skipped: \(error)", category: .network)
+            SecureLogger.debug("ENS recovery skipped (wallet unavailable): \(error)", category: .network)
+            return
+        }
+
+        // Validate existing App Group ENS for this wallet
+        if let existing = groupDefaults.string(forKey: ensKey), !existing.isEmpty {
+            if await ensName(existing, matchesWalletAddress: currentAddress) {
+                return
+            }
+
+            groupDefaults.removeObject(forKey: ensKey)
+            SecureLogger.warning("Removed stale ENS for different wallet: \(existing)", category: .network)
+        }
+
+        // Migrate legacy value if it matches current wallet
+        if let legacyENS = userDefaults.string(forKey: ensKey), !legacyENS.isEmpty {
+            if await ensName(legacyENS, matchesWalletAddress: currentAddress) {
+                groupDefaults.set(legacyENS, forKey: ensKey)
+                userDefaults.removeObject(forKey: ensKey)
+                SecureLogger.info("Migrated ENS subdomain from legacy storage: \(legacyENS)", category: .network)
+                return
+            }
+
+            // Legacy value exists but belongs to another wallet
+            userDefaults.removeObject(forKey: ensKey)
+        }
+
+        for attempt in 1...5 {
+            do {
+                let records = try await NamestoneService.shared.getNames(address: currentAddress)
+
+                // Primary recovery path: names already bound to this wallet address
+                if !records.isEmpty {
+                    let expectedFromNickname = "\(nickname).dstealth.eth"
+                    let recoveredName = records.first(where: { $0.fullName.caseInsensitiveCompare(expectedFromNickname) == .orderedSame })?.fullName
+                        ?? records.first?.fullName
+
+                    if let recoveredName, !recoveredName.isEmpty {
+                        groupDefaults.set(recoveredName, forKey: ensKey)
+                        SecureLogger.info("Recovered ENS subdomain from Namestone: \(recoveredName)", category: .network)
+                        return
+                    }
+                }
+
+                // Fallback: exact nickname search, then verify it resolves to this wallet
+                let nicknameResults = try await NamestoneService.shared.searchName(name: nickname, exactMatch: true)
+                if let match = nicknameResults.first(where: { $0.address.caseInsensitiveCompare(currentAddress) == .orderedSame }) {
+                    groupDefaults.set(match.fullName, forKey: ensKey)
+                    SecureLogger.info("Recovered ENS subdomain via nickname lookup: \(match.fullName)", category: .network)
+                    return
+                }
+
+                // No matching ENS yet, wait before retrying
+                if attempt < 5 {
+                    try? await Task.sleep(nanoseconds: UInt64(5 * attempt) * 1_000_000_000)
+                }
+            } catch {
+                if attempt == 5 {
+                    SecureLogger.debug("ENS recovery skipped after retries: \(error)", category: .network)
+                } else {
+                    try? await Task.sleep(nanoseconds: UInt64(5 * attempt) * 1_000_000_000)
+                }
+            }
+        }
+
+        // No ENS exists for this wallet
+        groupDefaults.removeObject(forKey: ensKey)
+    }
+
+    /// Check whether a full ENS name currently resolves to the given wallet address.
+    private func ensName(_ fullName: String, matchesWalletAddress walletAddress: String) async -> Bool {
+        let normalized = fullName.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalized.hasSuffix(".dstealth.eth") else { return false }
+
+        let subdomain = normalized.replacingOccurrences(of: ".dstealth.eth", with: "")
+
+        do {
+            let matches = try await NamestoneService.shared.searchName(name: subdomain, exactMatch: true)
+            guard let record = matches.first(where: { $0.fullName.caseInsensitiveCompare(normalized) == .orderedSame }) else {
+                return false
+            }
+            return record.address.caseInsensitiveCompare(walletAddress) == .orderedSame
+        } catch {
+            return false
         }
     }
     
