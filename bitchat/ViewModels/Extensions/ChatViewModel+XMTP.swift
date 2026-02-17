@@ -7,6 +7,18 @@ import Foundation
 import BitLogger
 import XMTP
 
+private func xmtpMediaFilesDirectoryURL() throws -> URL {
+    let base = try FileManager.default.url(
+        for: .applicationSupportDirectory,
+        in: .userDomainMask,
+        appropriateFor: nil,
+        create: true
+    )
+    let filesDir = base.appendingPathComponent("files", isDirectory: true)
+    try FileManager.default.createDirectory(at: filesDir, withIntermediateDirectories: true)
+    return filesDir
+}
+
 // MARK: - XMTP Delegate
 
 extension ChatViewModel: XMTPClientDelegate {
@@ -97,7 +109,7 @@ extension ChatViewModel: XMTPClientDelegate {
         }
         
         // Handle private message packets
-        if type == "pm", let content = payload["content"] as? String, let messageID = payload["messageID"] as? String {
+        if type == "pm", let content = payload["content"] as? String {
             // This is handled by the main message delegate, but log for debugging
             SecureLogger.debug("📦 XMTP PM packet from \(senderInboxId.prefix(8))…: \(content.prefix(50))", category: .network)
             return
@@ -193,7 +205,7 @@ extension ChatViewModel: XMTPClientDelegate {
             let isVoice = decodedAttachment.mimeType.hasPrefix("audio/")
             
             let subdir = isImage ? "images/incoming" : (isVoice ? "voicenotes/incoming" : "files/incoming")
-            let filesDir = try xmtpMediaFilesDirectory()
+            let filesDir = try xmtpMediaFilesDirectoryURL()
             let saveDir = filesDir.appendingPathComponent(subdir, isDirectory: true)
             try FileManager.default.createDirectory(at: saveDir, withIntermediateDirectories: true)
             
@@ -211,19 +223,7 @@ extension ChatViewModel: XMTPClientDelegate {
 // MARK: - XMTP Setup
 
 extension ChatViewModel {
-    
-    private func xmtpMediaFilesDirectory() throws -> URL {
-        let base = try FileManager.default.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        )
-        let filesDir = base.appendingPathComponent("files", isDirectory: true)
-        try FileManager.default.createDirectory(at: filesDir, withIntermediateDirectories: true)
-        return filesDir
-    }
-    
+
     /// Set up XMTP delegate when the service becomes available
     /// Call this after XMTPServiceContainer is initialized
     @MainActor
@@ -284,13 +284,8 @@ extension ChatViewModel {
                 let processedURL = try ImageUtils.processImage(at: sourceURL)
                 let data = try Data(contentsOf: processedURL)
                 let filename = processedURL.lastPathComponent
-                
-                // Save to canonical app files folder for local display
-                let filesDir = try self.xmtpMediaFilesDirectory()
-                let saveDir = filesDir.appendingPathComponent("images/outgoing", isDirectory: true)
-                try FileManager.default.createDirectory(at: saveDir, withIntermediateDirectories: true)
-                let saveURL = saveDir.appendingPathComponent(filename)
-                try data.write(to: saveURL)
+                // `ImageUtils.processImage` already writes into Application Support/files/images/outgoing.
+                // Keep this file for local chat rendering after upload.
                 
                 // Send via XMTP
                 try await XMTPServiceContainer.shared.clientService.sendRemoteAttachment(
@@ -303,14 +298,25 @@ extension ChatViewModel {
                 // Update message status
                 await MainActor.run {
                     if let idx = self.privateChats[peerID]?.firstIndex(where: { $0.id == messageID }) {
-                        self.privateChats[peerID]?[idx].content = "[image] \(filename)"
-                        self.privateChats[peerID]?[idx].deliveryStatus = .sent
+                        if let existing = self.privateChats[peerID]?[idx] {
+                            let updated = BitchatMessage(
+                                id: existing.id,
+                                sender: existing.sender,
+                                content: "[image] \(filename)",
+                                timestamp: existing.timestamp,
+                                isRelay: existing.isRelay,
+                                originalSender: existing.originalSender,
+                                isPrivate: existing.isPrivate,
+                                recipientNickname: existing.recipientNickname,
+                                senderPeerID: existing.senderPeerID,
+                                mentions: existing.mentions,
+                                deliveryStatus: .sent
+                            )
+                            self.privateChats[peerID]?[idx] = updated
+                        }
                     }
                     self.objectWillChange.send()
                 }
-                
-                // Cleanup processed file
-                try? FileManager.default.removeItem(at: processedURL)
                 
             } catch {
                 await MainActor.run {
@@ -327,6 +333,7 @@ extension ChatViewModel {
     /// Send a voice note via XMTP to the current XMTP conversation
     @MainActor
     func sendXMTPVoiceNote(from sourceURL: URL, to peerID: PeerID) {
+        let minimumVoiceBytes = 1024
         guard XMTPServiceContainer.isConfigured, XMTPServiceContainer.shared.isInitialized else {
             addSystemMessage("❌ XMTP not connected")
             return
@@ -365,9 +372,16 @@ extension ChatViewModel {
             
             do {
                 let data = try Data(contentsOf: sourceURL)
+                guard data.count >= minimumVoiceBytes else {
+                    throw NSError(
+                        domain: "chat.bitchat.xmtp",
+                        code: 1001,
+                        userInfo: [NSLocalizedDescriptionKey: "Voice note is empty or too short"]
+                    )
+                }
                 
                 // Save to canonical app files folder for local display
-                let filesDir = try self.xmtpMediaFilesDirectory()
+                let filesDir = try xmtpMediaFilesDirectoryURL()
                 let saveDir = filesDir.appendingPathComponent("voicenotes/outgoing", isDirectory: true)
                 try FileManager.default.createDirectory(at: saveDir, withIntermediateDirectories: true)
                 let saveURL = saveDir.appendingPathComponent(filename)
@@ -384,8 +398,22 @@ extension ChatViewModel {
                 // Update message status
                 await MainActor.run {
                     if let idx = self.privateChats[peerID]?.firstIndex(where: { $0.id == messageID }) {
-                        self.privateChats[peerID]?[idx].content = "[voice] \(filename)"
-                        self.privateChats[peerID]?[idx].deliveryStatus = .sent
+                        if let existing = self.privateChats[peerID]?[idx] {
+                            let updated = BitchatMessage(
+                                id: existing.id,
+                                sender: existing.sender,
+                                content: "[voice] \(filename)",
+                                timestamp: existing.timestamp,
+                                isRelay: existing.isRelay,
+                                originalSender: existing.originalSender,
+                                isPrivate: existing.isPrivate,
+                                recipientNickname: existing.recipientNickname,
+                                senderPeerID: existing.senderPeerID,
+                                mentions: existing.mentions,
+                                deliveryStatus: .sent
+                            )
+                            self.privateChats[peerID]?[idx] = updated
+                        }
                     }
                     self.objectWillChange.send()
                 }

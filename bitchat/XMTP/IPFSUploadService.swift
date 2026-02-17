@@ -51,6 +51,18 @@ actor IPFSUploadService {
         // Try multiple upload services in order of preference
         var lastError: Error = UploadError.allEndpointsFailed
         
+        // Try custom/private endpoint first (recommended for XMTP web compatibility)
+        if let endpoint = customUploadEndpoint() {
+            do {
+                let url = try await uploadToCustomEndpoint(endpoint, data: data, filename: filename)
+                SecureLogger.info("📤 Uploaded attachment via custom endpoint: \(filename) -> \(url.prefix(40))…", category: .network)
+                return url
+            } catch {
+                SecureLogger.warning("Custom upload endpoint failed: \(error.localizedDescription)", category: .network)
+                lastError = error
+            }
+        }
+        
         // Try 0x0.st first (simple, reliable, no auth needed)
         do {
             let url = try await uploadTo0x0(data, filename: filename)
@@ -72,6 +84,108 @@ actor IPFSUploadService {
         }
         
         throw lastError
+    }
+    
+    private func customUploadEndpoint() -> URL? {
+        func parseEndpoint(_ raw: String) -> URL? {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            
+            if let url = URL(string: trimmed), url.scheme == "https" {
+                return url
+            }
+            
+            // Allow shorthand values like "example.workers.dev/upload"
+            if !trimmed.contains("://"),
+               let url = URL(string: "https://\(trimmed)"),
+               url.scheme == "https" {
+                return url
+            }
+            
+            return nil
+        }
+
+        let env = ProcessInfo.processInfo.environment
+        if let endpoint = env["XMTP_UPLOAD_ENDPOINT"],
+           let url = parseEndpoint(endpoint) {
+            return url
+        }
+        
+        if let endpoint = Bundle.main.infoDictionary?["XMTP_UPLOAD_ENDPOINT"] as? String,
+           !endpoint.isEmpty,
+           endpoint != "$(XMTP_UPLOAD_ENDPOINT)",
+           let url = parseEndpoint(endpoint) {
+            return url
+        }
+        
+        return nil
+    }
+    
+    private func customUploadBearerToken() -> String? {
+        let env = ProcessInfo.processInfo.environment
+        if let token = env["XMTP_UPLOAD_BEARER_TOKEN"], !token.isEmpty {
+            return token
+        }
+        
+        if let token = Bundle.main.infoDictionary?["XMTP_UPLOAD_BEARER_TOKEN"] as? String,
+           !token.isEmpty,
+           token != "$(XMTP_UPLOAD_BEARER_TOKEN)" {
+            return token
+        }
+        
+        return nil
+    }
+    
+    private struct UploadResponse: Decodable {
+        let url: String
+    }
+    
+    private struct WrappedUploadResponse: Decodable {
+        let data: UploadResponse?
+    }
+    
+    /// Upload to a custom HTTPS endpoint that returns either:
+    /// - plain text URL
+    /// - JSON: {"url":"https://..."}
+    /// - JSON: {"data":{"url":"https://..."}}
+    private func uploadToCustomEndpoint(_ endpoint: URL, data: Data, filename: String) async throws -> String {
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 60
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        request.setValue(filename, forHTTPHeaderField: "X-Filename")
+        
+        if let bearer = customUploadBearerToken() {
+            request.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
+        }
+        
+        let (responseData, response) = try await URLSession.shared.upload(for: request, from: data)
+        guard let http = response as? HTTPURLResponse else {
+            throw UploadError.uploadFailed("No HTTP response from custom endpoint")
+        }
+        
+        guard (200...299).contains(http.statusCode) else {
+            let body = String(data: responseData, encoding: .utf8) ?? ""
+            throw UploadError.uploadFailed("Custom endpoint HTTP \(http.statusCode): \(body.prefix(120))")
+        }
+        
+        if let plain = String(data: responseData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           plain.hasPrefix("https://") {
+            return plain
+        }
+        
+        let decoder = JSONDecoder()
+        if let direct = try? decoder.decode(UploadResponse.self, from: responseData),
+           direct.url.hasPrefix("https://") {
+            return direct.url
+        }
+        if let wrapped = try? decoder.decode(WrappedUploadResponse.self, from: responseData),
+           let url = wrapped.data?.url,
+           url.hasPrefix("https://") {
+            return url
+        }
+        
+        throw UploadError.invalidResponse
     }
     
     /// Upload to 0x0.st - simple anonymous file hosting
