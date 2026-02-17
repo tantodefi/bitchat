@@ -8,10 +8,10 @@ SWIFT_VERSION = 5.0
 // Disable Swift symbol generation for String Catalogs (keys like "%@" and "—" are invalid Swift identifiers)
 SWIFT_EMIT_LOC_STRINGS = NO
 
-DEVELOPMENT_TEAM = L3N5LHJD5Y
+DEVELOPMENT_TEAM = 7SF8L3TAFC
 CODE_SIGN_STYLE = Automatic
 
-PRODUCT_BUNDLE_IDENTIFIER = chat.bitchat
+PRODUCT_BUNDLE_IDENTIFIER = chat.bitchat.dstealth
 
 // Optional include of secrets (API keys) for release builds
 #include? "Secrets.xcconfig"
