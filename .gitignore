@@ -87,3 +87,7 @@ Configs/Secrets.xcconfig
 
 # Private docs (contain API keys / certs)
 docs/uploading.md
+
+# Workers (contain secrets / node_modules)
+workers/
+docs/faucet.md

@@ -36,8 +36,15 @@ actor PQAccountDeployer {
         
         var rpcURL: String {
             switch self {
-            case .sepolia: return "https://rpc.sepolia.org"
+            case .sepolia: return "https://ethereum-sepolia-rpc.publicnode.com"
             case .arbitrumSepolia: return "https://sepolia-rollup.arbitrum.io/rpc"
+            }
+        }
+        
+        var fallbackRPCURLs: [String] {
+            switch self {
+            case .sepolia: return ["https://sepolia.drpc.org", "https://rpc2.sepolia.org"]
+            case .arbitrumSepolia: return ["https://arbitrum-sepolia-rpc.publicnode.com"]
             }
         }
         
@@ -235,34 +242,51 @@ actor PQAccountDeployer {
             throw DeployerError.invalidRequest("Cannot serialize to JSON")
         }
         
-        guard let rpcUrl = URL(string: chain.rpcURL) else {
-            throw DeployerError.invalidRequest("Invalid RPC URL")
+        let allRPCs = [chain.rpcURL] + chain.fallbackRPCURLs
+        var lastError: Error = DeployerError.networkError("No RPCs available")
+        
+        for rpcEndpoint in allRPCs {
+            guard let rpcUrl = URL(string: rpcEndpoint) else { continue }
+            
+            do {
+                var request = URLRequest(url: rpcUrl)
+                request.httpMethod = "POST"
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.httpBody = try JSONSerialization.data(withJSONObject: body)
+                request.timeoutInterval = 20
+                
+                let (data, response) = try await session.data(for: request)
+                
+                guard let httpResponse = response as? HTTPURLResponse,
+                      (200...299).contains(httpResponse.statusCode) else {
+                    lastError = DeployerError.networkError("HTTP error from \(rpcEndpoint)")
+                    continue
+                }
+                
+                guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    lastError = DeployerError.invalidResponse("Cannot parse JSON from \(rpcEndpoint)")
+                    continue
+                }
+                
+                if let error = json["error"] as? [String: Any] {
+                    let code = error["code"] as? Int ?? -1
+                    let message = error["message"] as? String ?? "Unknown"
+                    throw DeployerError.rpcError(code, message)
+                }
+                
+                return json["result"]
+            } catch let error as DeployerError {
+                // RPC-level errors (not network) should propagate immediately
+                if case .rpcError = error { throw error }
+                lastError = error
+                SecureLogger.warning("PQ deployer RPC failed for \(rpcEndpoint), trying fallback...", category: .network)
+            } catch {
+                lastError = DeployerError.networkError("\(rpcEndpoint): \(error.localizedDescription)")
+                SecureLogger.warning("PQ deployer RPC failed for \(rpcEndpoint), trying fallback...", category: .network)
+            }
         }
         
-        var request = URLRequest(url: rpcUrl)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        request.timeoutInterval = 15
-        
-        let (data, response) = try await session.data(for: request)
-        
-        guard let httpResponse = response as? HTTPURLResponse,
-              (200...299).contains(httpResponse.statusCode) else {
-            throw DeployerError.networkError("HTTP error from RPC")
-        }
-        
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw DeployerError.invalidResponse("Cannot parse JSON")
-        }
-        
-        if let error = json["error"] as? [String: Any] {
-            let code = error["code"] as? Int ?? -1
-            let message = error["message"] as? String ?? "Unknown"
-            throw DeployerError.rpcError(code, message)
-        }
-        
-        return json["result"]
+        throw lastError
     }
 }
 

@@ -22,6 +22,7 @@ struct XMTPPeerInfoSheet: View {
     @State private var copiedField: String?
     @State private var isEditingNickname = false
     @State private var editedNickname = ""
+    @State private var resolvedWalletAddress: String?
     
     // Conversation details
     @State private var conversationType: ConversationType = .unknown
@@ -87,8 +88,13 @@ struct XMTPPeerInfoSheet: View {
     }
     
     private var displayName: String {
-        if let contact = savedContact {
-            return contact.displayName
+        // Priority: nickname > ENS name > truncated ID
+        if let contact = savedContact,
+           let nick = contact.nickname, !nick.isEmpty {
+            return nick
+        }
+        if let ensName = resolvedDstealthName {
+            return ensName
         }
         return "XMTP:" + String(peerID.bare.prefix(8)) + "..."
     }
@@ -390,8 +396,19 @@ struct XMTPPeerInfoSheet: View {
                 title: "XMTP Inbox ID",
                 value: fullInboxId ?? peerID.bare,
                 icon: "envelope.fill",
-                copyable: true
+                copyable: true,
+                fullText: true
             )
+            
+            if conversationType == .dm, let walletAddress = resolvedWalletAddress {
+                infoCard(
+                    title: "Wallet Address",
+                    value: walletAddress,
+                    icon: "wallet.bifold.fill",
+                    copyable: true,
+                    fullText: true
+                )
+            }
             
             infoCard(title: "Peer ID", value: peerID.id, icon: "person.fill", copyable: true)
             
@@ -678,30 +695,46 @@ struct XMTPPeerInfoSheet: View {
     private func loadInboxId() {
         let truncated = peerID.bare
         
-        if xmtpContainer.clientService.inboxIdMap[truncated] != nil {
+        // Check if we already have the full inbox ID mapped
+        if let fullId = xmtpContainer.clientService.inboxIdMap[truncated] {
+            fullInboxIdLoaded = fullId
             isLoading = false
             resolveDstealthName()
             loadConversationDetails()
+            resolveWalletAddress()
             return
         }
         
-        let fullId = peerID.id.hasPrefix("xmtp_") ? String(peerID.id.dropFirst(5)) : peerID.id
+        // peerID.bare is truncated to 16 chars; try to use it as-is for findOrCreateDM
+        // (this may work if the server can resolve a partial inbox ID)
+        let candidateId = peerID.id.hasPrefix("xmtp_") ? String(peerID.id.dropFirst(5)) : peerID.id
         
         Task {
             do {
-                try await xmtpContainer.clientService.findOrCreateDM(with: fullId)
+                try await xmtpContainer.clientService.findOrCreateDM(with: candidateId)
                 await MainActor.run {
-                    self.fullInboxIdLoaded = fullId
+                    // Re-check inboxIdMap after findOrCreateDM which may have stored the mapping
+                    if let mapped = xmtpContainer.clientService.inboxIdMap[truncated] {
+                        self.fullInboxIdLoaded = mapped
+                    } else {
+                        self.fullInboxIdLoaded = candidateId
+                    }
                     self.isLoading = false
                 }
             } catch {
                 await MainActor.run {
-                    self.fullInboxIdLoaded = fullId
+                    // Fallback: re-check map, otherwise use candidate
+                    if let mapped = xmtpContainer.clientService.inboxIdMap[truncated] {
+                        self.fullInboxIdLoaded = mapped
+                    } else {
+                        self.fullInboxIdLoaded = candidateId
+                    }
                     self.isLoading = false
                 }
             }
             resolveDstealthName()
             loadConversationDetails()
+            resolveWalletAddress()
         }
     }
     
@@ -714,6 +747,23 @@ struct XMTPPeerInfoSheet: View {
             await MainActor.run {
                 self.resolvedDstealthName = name
                 self.isResolvingName = false
+            }
+        }
+    }
+    
+    private func resolveWalletAddress() {
+        guard let inboxId = fullInboxId else { return }
+        
+        Task {
+            do {
+                let addresses = try await xmtpContainer.clientService.getWalletAddresses(for: inboxId)
+                if let first = addresses.first {
+                    await MainActor.run {
+                        self.resolvedWalletAddress = first
+                    }
+                }
+            } catch {
+                // Wallet address resolution failed silently
             }
         }
     }
@@ -811,7 +861,7 @@ struct XMTPPeerInfoSheet: View {
     
     // MARK: - Info Card Helper
     
-    private func infoCard(title: String, value: String, icon: String, copyable: Bool) -> some View {
+    private func infoCard(title: String, value: String, icon: String, copyable: Bool, fullText: Bool = false) -> some View {
         HStack(spacing: 12) {
             Image(systemName: icon)
                 .font(.bitchatSystem(size: 16))
@@ -823,11 +873,18 @@ struct XMTPPeerInfoSheet: View {
                     .font(.bitchatSystem(size: 10, weight: .medium))
                     .foregroundColor(.secondary)
                 
-                Text(value)
-                    .font(.bitchatSystem(size: 12, design: .monospaced))
-                    .foregroundColor(textColor)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                if fullText {
+                    Text(value)
+                        .font(.bitchatSystem(size: 11, design: .monospaced))
+                        .foregroundColor(textColor)
+                        .textSelection(.enabled)
+                } else {
+                    Text(value)
+                        .font(.bitchatSystem(size: 12, design: .monospaced))
+                        .foregroundColor(textColor)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
             }
             
             Spacer()

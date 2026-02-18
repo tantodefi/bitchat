@@ -263,14 +263,14 @@ actor PQTransactionSigner {
         // Reuse the deployer's RPC by calling its ethCall indirectly.
         // We do a lightweight JSON-RPC call here, using the chain's RPC URL
         // from the deployer via a static lookup based on chainId.
-        let rpcURL: String
+        let chain: PQAccountDeployer.Chain
         switch chainId {
         case 11_155_111:
-            rpcURL = PQAccountDeployer.Chain.sepolia.rpcURL
+            chain = .sepolia
         case 421_614:
-            rpcURL = PQAccountDeployer.Chain.arbitrumSepolia.rpcURL
+            chain = .arbitrumSepolia
         default:
-            rpcURL = PQAccountDeployer.Chain.sepolia.rpcURL
+            chain = .sepolia
         }
         
         let body: [String: Any] = [
@@ -283,23 +283,33 @@ actor PQTransactionSigner {
             ]
         ]
         
-        guard let url = URL(string: rpcURL) else {
-            throw PQTransactionError.configurationError("Invalid RPC URL")
+        let allRPCs = [chain.rpcURL] + chain.fallbackRPCURLs
+        
+        for rpcEndpoint in allRPCs {
+            guard let url = URL(string: rpcEndpoint) else { continue }
+            
+            do {
+                var request = URLRequest(url: url)
+                request.httpMethod = "POST"
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.httpBody = try JSONSerialization.data(withJSONObject: body)
+                request.timeoutInterval = 20
+                
+                let (responseData, _) = try await URLSession.shared.data(for: request)
+                guard let json = try JSONSerialization.jsonObject(with: responseData) as? [String: Any],
+                      let hexResult = json["result"] as? String else {
+                    continue
+                }
+                
+                let hex = hexResult.hasPrefix("0x") ? String(hexResult.dropFirst(2)) : hexResult
+                return ABIEncoder.hexToData(hex)
+            } catch {
+                SecureLogger.warning("PQ EntryPoint call failed for \(rpcEndpoint), trying fallback...", category: .network)
+                continue
+            }
         }
         
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        
-        let (responseData, _) = try await URLSession.shared.data(for: request)
-        guard let json = try JSONSerialization.jsonObject(with: responseData) as? [String: Any],
-              let hexResult = json["result"] as? String else {
-            throw PQTransactionError.rpcError("Failed to get nonce from EntryPoint")
-        }
-        
-        let hex = hexResult.hasPrefix("0x") ? String(hexResult.dropFirst(2)) : hexResult
-        return ABIEncoder.hexToData(hex)
+        throw PQTransactionError.rpcError("Failed to get nonce from EntryPoint (all RPCs failed)")
     }
 }
 
