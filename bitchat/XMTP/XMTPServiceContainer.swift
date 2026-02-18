@@ -278,4 +278,27 @@ extension XMTPServiceContainer {
     var isPQEnabled: Bool {
         !pqChainServices.isEmpty
     }
+    
+    /// Create a PQAccountSigner for XMTP SCW identity.
+    ///
+    /// The PQ smart account can initialize its own XMTP client using
+    /// ERC-1271 on-chain signature verification. Requirements:
+    /// - PQ account must be deployed on the specified chain
+    /// - Chain must be in XMTP's supported SCW chain list
+    /// - The ZKNOX PQ contract must implement `isValidSignature`
+    ///
+    /// - Parameter chainId: The chain where the PQ account is deployed
+    /// - Returns: A `PQAccountSigner` if the PQ account is deployed, nil otherwise
+    func createPQAccountSigner(chainId: Int64 = 11_155_111) async -> PQAccountSigner? {
+        guard let accountAddress = await pqKeyManager.getAccountAddress() else {
+            return nil
+        }
+        
+        return PQAccountSigner(
+            wallet: wallet,
+            pqKeyManager: pqKeyManager,
+            accountAddress: accountAddress,
+            chainId: chainId
+        )
+    }
 }

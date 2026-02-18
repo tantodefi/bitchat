@@ -773,17 +773,129 @@ Confirmed: `0xe28F039653772C32b0eDB1db7c7A5FA250DDA0e5` on both Sepolia (1115511
 | WalletView EOA/PQ toggle (Phase 8) | Medium | Segmented picker for account mode |
 | Transaction history for UserOperations | Low | Query bundler for receipts |
 | PQ key export/import UX | Low | Seed backup flow |
+| BIP39 PQ key derivation (Stage 2) | Medium | Standardized PQ derivation path from seed phrase (per upcoming ZKNOX ERC) |
+| Falcon / XMSS support | Low | Additional PQ signature schemes beyond ML-DSA-44 |
+
+---
+
+## PQBeat Alignment Assessment
+
+### What is PQBeat?
+
+[PQBeat](https://github.com/ZKNoxHQ/PQbeat) is a Post-Quantum Readiness Tracker evaluating the PQ preparedness of L1/L2 chains, wallets, and protocols. It defines a staged progression system for each category.
+
+### Wallet Stages (from PQBeat)
+
+| Stage | Requirement | bitchat Status |
+|-------|-------------|----------------|
+| **Stage 0** | No PQ support | ✅ **Surpassed** |
+| **Stage 1** | PQ smart account supported on a Stage 1 chain | ✅ **Achieved** — ML-DSA-44 + ECDSA hybrid ERC-4337 account on Sepolia via ZKNOX mldsa_k1 factory |
+| **Stage 2** | PQ smart account on Stage 2 chain + BIP32/39 compliant PQ key derivation | ❌ **Not yet** — No BIP39 PQ derivation; chains not at Stage 2 |
+| **Stage 3+** | Inherits chain stage + ZK-recovery witness generation | ❌ **Not yet** — No ZK-recovery circuits exist yet |
+
+### Wallet Evaluation Criteria (from PQBeat)
+
+| Criterion | Required For | bitchat Status | Notes |
+|-----------|-------------|----------------|-------|
+| PQ Key Generation | Stage 1 | ✅ | ML-DSA-44 via SwiftDilithium 3.5.0 (FIPS 204) |
+| PQ Smart Account | Stage 1 | ✅ | ERC-4337 account via ZKNOX mldsa_k1 factory |
+| PQ Signing | Stage 1 | ✅ | Hybrid ECDSA (secp256k1) + ML-DSA-44 dual-signature scheme |
+| BIP32/39 PQ Derivation | Stage 2 | ❌ | SwiftDilithium has no seed-based init; keys are random (Option B). Blocked until ZKNOX ERC standardizes PQ derivation paths |
+| Recovery Witness | Stage 3+ | ❌ | ZK-recovery circuits not yet deployed on any chain |
+
+### Chain Dependencies (from PQBeat)
+
+A wallet's stage **cannot exceed** the stage of the chain it operates on.
+
+| Chain | PQBeat Stage | PQ Verifier | EIP-7701 | Precompiles | Notes |
+|-------|-------------|-------------|----------|-------------|-------|
+| Ethereum | 0 → 1 | ❌ Pending | ❌ | ❌ | ZKNOX contracts pending deployment |
+| Arbitrum | 0 → 1 | ❌ Pending | ❌ | N/A | Inherits L1 contracts |
+| Sepolia (testnet) | ~1 | ✅ mldsa_k1 factory deployed | N/A | N/A | bitchat targets this chain |
+| Arbitrum Sepolia | ~1 | ✅ mldsa_k1 factory deployed | N/A | N/A | Also supported by bitchat |
+
+**Key insight**: bitchat is **Stage 1 on testnets**. Mainnet readiness depends on ZKNOX deploying the PQ verifier contracts to Ethereum/Arbitrum mainnet.
+
+### Where bitchat Stands Today
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    PQBeat Wallet Stages                         │
+│                                                                 │
+│  Stage 0 ───── Stage 1 ──────── Stage 2 ────── Stage 3+        │
+│  No PQ         PQ Smart Acct    BIP39 PQ       ZK-Recovery     │
+│                on Stage 1 chain  Derivation     Witness         │
+│                                                                 │
+│          bitchat ▲                                              │
+│          (testnet)                                              │
+│                                                                 │
+│  ✅ Done        ✅ Done          ❌ Blocked     ❌ Blocked       │
+│  - ML-DSA-44    - ERC-4337       - No seed-     - No ZK         │
+│    keygen         hybrid acct      based init    circuits       │
+│  - Hybrid       - Pimlico        - No ZKNOX     deployed       │
+│    signing        bundler          ERC yet                      │
+│  - Key expand   - Multi-chain    - Chains not                   │
+│  - ABI encode   - Factory @       at Stage 2                   │
+│                   0xe28F...                                     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Gap Analysis: What's Needed for Stage 2+
+
+| Gap | Description | Dependency | Effort |
+|-----|-------------|------------|--------|
+| **BIP39 PQ derivation** | Derive ML-DSA-44 keys from BIP39 seed phrase via standardized path | ZKNOX ERC proposal (not yet published). SwiftDilithium lacks `SecretKey(seed:)` — would need upstream change or custom derivation using SHAKE-256 | Medium (once ERC is defined) |
+| **Mainnet deployment** | Deploy ZKNOX PQ verifier + factory to Ethereum / Arbitrum mainnet | ZKNOX team | External dependency |
+| **Additional PQ schemes** | Support Falcon (EIP-8052), XMSS, SPHINCS+ beyond ML-DSA-44 | No Swift libraries for Falcon/XMSS/SPHINCS+ available today | High |
+| **Precompile support** | EIP-8051 (ML-DSA precompile) reduces gas cost from ~5-15M to ~10K | Ethereum protocol upgrade (likely post-Pectra) | External dependency |
+| **EIP-7701 native AA** | Native account abstraction with PQ sigs (eliminates bundler dependency) | Ethereum protocol upgrade | External dependency |
+| **ZK-recovery** | Generate witness for seed-based account recovery post-freeze | ZK circuits not designed/deployed yet | External dependency |
+
+### Comparison with ZKNOX Kohaku Wallet
+
+| Feature | ZKNOX Kohaku (Stage 1) | bitchat (Stage 1) |
+|---------|----------------------|---------------------|
+| PQ Signature | ✅ Dilithium/Falcon | ✅ ML-DSA-44 (Dilithium) only |
+| Smart Account | ✅ ERC-4337 | ✅ ERC-4337 (same factory) |
+| Platform | Web/Desktop | iOS (native Swift) |
+| Signing Scheme | Hybrid ECDSA + PQ | Hybrid ECDSA + ML-DSA-44 |
+| BIP39 PQ Derivation | ✅ | ❌ |
+| Hardware wallet | ✅ (Kohaku HW) | ❌ |
+| Falcon support | ✅ | ❌ |
+
+### Recommendations for Roadmap
+
+1. **Short-term (Stage 1 hardening)**:
+   - Complete cross-validation with JS reference test vectors
+   - End-to-end testnet deployment from a real device
+   - WalletView EOA/PQ toggle (Phase 8)
+
+2. **Medium-term (Stage 2 prep)**:
+   - Monitor ZKNOX ERC for BIP39 PQ derivation standard
+   - Implement custom `SecretKey` derivation from SHAKE-256(seed) once spec is finalized
+   - Add Falcon support if a viable Swift library emerges
+
+3. **Long-term (Stage 3+)**:
+   - Track EIP-8051/8052 precompile progress for cheaper on-chain verification
+   - Implement ZK-recovery witness generation when circuits are available
+   - Support EIP-7701 native AA when adopted
 
 ---
 
 ## Open Questions
 
-1. **Factory address**: Need to pull the exact `mldsa_k1` factory address from `deployments.json` — the file wasn't accessible via GitHub raw URL. May need to clone the kohaku repo or check Etherscan directly.
+1. ~~**Factory address**: Need to pull the exact `mldsa_k1` factory address from `deployments.json`.~~ **Resolved**: `0xe28F039653772C32b0eDB1db7c7A5FA250DDA0e5` confirmed on Sepolia + Arbitrum Sepolia.
 
-2. **MLDSA vs MLDSAETH**: The kohaku contracts support both "MLDSA" (pure NIST FIPS 204) and "MLDSAETH" (an Ethereum-optimized variant). The example app uses `mldsa_k1` (NIST mode). Confirm which mode to target — NIST is simpler and matches SwiftDilithium's output directly.
+2. ~~**MLDSA vs MLDSAETH**: Which mode to target?~~ **Resolved**: Using `mldsa_k1` (NIST FIPS 204 mode).
 
-3. **Pimlico API key management**: Where to store it? Currently the plan uses `@AppStorage` which is not encrypted. Consider Keychain for the API key.
+3. ~~**Pimlico API key management**: Where to store?~~ **Resolved**: Stored in Keychain via `SecureConfig`.
 
-4. **Key derivation path**: Should the PQ seed be derived from the EOA key (Option A) or independent (Option B)? Option A is simpler for users but couples security domains.
+4. ~~**Key derivation path**: Option A vs Option B?~~ **Resolved**: Option B (independent random) since SwiftDilithium has no seed-based init.
 
-5. **Arbitrum Sepolia support**: Lower gas costs would make the experience much better. Adding a second testnet is a simple extension of the network enum.
+5. ~~**Arbitrum Sepolia support**~~ **Resolved**: Added to `PQAccountDeployer.Chain` enum.
+
+6. **BIP39 PQ derivation path**: When the ZKNOX ERC is published, implement standardized PQ key derivation from BIP39 seed. This is required for Stage 2 and enables cross-wallet interoperability.
+
+7. **Mainnet readiness**: When will ZKNOX deploy the PQ verifier + factory to Ethereum/Arbitrum mainnet? Bitchat should be ready to switch from testnet to mainnet with a config change.
+
+8. **Falcon support**: Should we add Falcon (EIP-8052) as an alternative PQ scheme? No viable pure-Swift Falcon library exists today.

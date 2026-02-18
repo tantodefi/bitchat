@@ -9,6 +9,12 @@
 /* Begin PBXBuildFile section */
 		11380E352F2D47F800932780 /* (null) in Frameworks */ = {isa = PBXBuildFile; };
 		115624A72F2E5119000C7E3D /* (null) in Frameworks */ = {isa = PBXBuildFile; };
+		11E7E5502F457C670003051C /* SwiftDilithium in Frameworks */ = {isa = PBXBuildFile; productRef = PQ0011008464F1EA38F4E286 /* SwiftDilithium */; };
+		11E7E5512F457C670003051C /* BigInt in Frameworks */ = {isa = PBXBuildFile; productRef = PQ0012008464F1EA38F4E286 /* BigInt */; };
+		11E7E5522F457C670003051C /* Digest in Frameworks */ = {isa = PBXBuildFile; productRef = PQ0013008464F1EA38F4E286 /* Digest */; };
+		11E7E5532F457C670003051C /* SwiftDilithium in Frameworks */ = {isa = PBXBuildFile; productRef = PQ0021008464F1EA38F4E286 /* SwiftDilithium */; };
+		11E7E5542F457C670003051C /* BigInt in Frameworks */ = {isa = PBXBuildFile; productRef = PQ0022008464F1EA38F4E286 /* BigInt */; };
+		11E7E5552F457C670003051C /* Digest in Frameworks */ = {isa = PBXBuildFile; productRef = PQ0023008464F1EA38F4E286 /* Digest */; };
 		17901751FD8010AFC8E750F2 /* bitchatShareExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 61F92EBA29C47C0FCC482F1F /* bitchatShareExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		3EE336D150427F736F32B56C /* P256K in Frameworks */ = {isa = PBXBuildFile; productRef = B1D9136AA0083366353BFA2F /* P256K */; };
 		885BBED78092484A5B069461 /* P256K in Frameworks */ = {isa = PBXBuildFile; productRef = 4EB6BA1B8464F1EA38F4E286 /* P256K */; };
@@ -163,6 +169,9 @@
 		31F6FDADA63050361C14F3A1 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			files = (
+				11E7E5552F457C670003051C /* Digest in Frameworks */,
+				11E7E5542F457C670003051C /* BigInt in Frameworks */,
+				11E7E5532F457C670003051C /* SwiftDilithium in Frameworks */,
 				A6E3E5722E7703760032EA8A /* BitLogger in Frameworks */,
 				3EE336D150427F736F32B56C /* P256K in Frameworks */,
 				A6E3EA812E7706A80032EA8A /* Tor in Frameworks */,
@@ -177,6 +186,9 @@
 		B5A5CC493FFB3D8966548140 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			files = (
+				11E7E5522F457C670003051C /* Digest in Frameworks */,
+				11E7E5512F457C670003051C /* BigInt in Frameworks */,
+				11E7E5502F457C670003051C /* SwiftDilithium in Frameworks */,
 				A6E3E5702E77036A0032EA8A /* BitLogger in Frameworks */,
 				885BBED78092484A5B069461 /* P256K in Frameworks */,
 				A6E3EA7F2E7706720032EA8A /* Tor in Frameworks */,
@@ -1107,6 +1119,27 @@
 			package = B8C407587481BBB190741C93 /* XCRemoteSwiftPackageReference "swift-secp256k1" */;
 			productName = P256K;
 		};
+		A6E3E56F2E77036A0032EA8A /* BitLogger */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = BitLogger;
+		};
+		A6E3E5712E7703760032EA8A /* BitLogger */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = BitLogger;
+		};
+		A6E3EA7E2E7706720032EA8A /* Tor */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = Tor;
+		};
+		A6E3EA802E7706A80032EA8A /* Tor */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = Tor;
+		};
+		B1D9136AA0083366353BFA2F /* P256K */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = B8C407587481BBB190741C93 /* XCRemoteSwiftPackageReference "swift-secp256k1" */;
+			productName = P256K;
+		};
 		PQ0011008464F1EA38F4E286 /* SwiftDilithium */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = PQ0001007481BBB190741C93 /* XCRemoteSwiftPackageReference "SwiftDilithium" */;
@@ -1136,27 +1169,6 @@
 			isa = XCSwiftPackageProductDependency;
 			package = PQ0003007481BBB190741C93 /* XCRemoteSwiftPackageReference "Digest" */;
 			productName = Digest;
-		};
-		A6E3E56F2E77036A0032EA8A /* BitLogger */ = {
-			isa = XCSwiftPackageProductDependency;
-			productName = BitLogger;
-		};
-		A6E3E5712E7703760032EA8A /* BitLogger */ = {
-			isa = XCSwiftPackageProductDependency;
-			productName = BitLogger;
-		};
-		A6E3EA7E2E7706720032EA8A /* Tor */ = {
-			isa = XCSwiftPackageProductDependency;
-			productName = Tor;
-		};
-		A6E3EA802E7706A80032EA8A /* Tor */ = {
-			isa = XCSwiftPackageProductDependency;
-			productName = Tor;
-		};
-		B1D9136AA0083366353BFA2F /* P256K */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = B8C407587481BBB190741C93 /* XCRemoteSwiftPackageReference "swift-secp256k1" */;
-			productName = P256K;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

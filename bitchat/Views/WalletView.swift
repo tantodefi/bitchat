@@ -12,6 +12,14 @@
 import CoreImage.CIFilterBuiltins
 import SwiftUI
 
+// MARK: - Account Mode
+
+/// Switches between EOA (externally owned account) and PQ smart contract wallet
+enum AccountMode: String, CaseIterable {
+    case eoa = "EOA"
+    case pqAccount = "PQ Account"
+}
+
 /// Main wallet view showing address QR code, copyable address, and balances
 struct WalletView: View {
     let wallet: EmbeddedWallet
@@ -31,6 +39,10 @@ struct WalletView: View {
     @State private var showHistorySheet: Bool = false
     @State private var showStealthSheet: Bool = false
     @State private var showCrossChainSheet: Bool = false
+    
+    // Account mode toggle
+    @AppStorage("active-account-mode") private var activeAccountMode: AccountMode = .eoa
+    @StateObject private var pqViewModel = PQAccountViewModel()
     
     // Stealth address support
     @StateObject private var stealthStore = StealthAddressStore()
@@ -56,18 +68,28 @@ struct WalletView: View {
     var body: some View {
         ScrollView {
             VStack(spacing: 24) {
+                // MARK: - Account Mode Picker
+                if pqViewModel.state.isDeployed {
+                    accountModePicker
+                }
+                
+                // MARK: - PQ Account Badge (when in PQ mode)
+                if activeAccountMode == .pqAccount && pqViewModel.state.isDeployed {
+                    pqBadgeSection
+                }
+                
                 // MARK: - QR Code
-                if !address.isEmpty {
+                if !displayAddress.isEmpty {
                     qrCodeSection
                 }
                 
-                // MARK: - ENS Name
-                if !address.isEmpty {
+                // MARK: - ENS Name (EOA only)
+                if activeAccountMode == .eoa && !address.isEmpty {
                     ensNameSection
                 }
                 
                 // MARK: - Address
-                if !address.isEmpty {
+                if !displayAddress.isEmpty {
                     addressSection
                 }
                 
@@ -85,33 +107,44 @@ struct WalletView: View {
                 }
                 
                 // MARK: - Balances
-                if !address.isEmpty {
+                if !displayAddress.isEmpty {
                     balancesSection
                 }
                 
                 // MARK: - Actions
-                if !address.isEmpty && !isLoading {
+                if !displayAddress.isEmpty && !isLoading {
                     actionsSection
                 }
                 
-                // MARK: - Stealth Addresses
-                if !address.isEmpty && !isLoading {
+                // MARK: - Stealth Addresses (EOA only)
+                if activeAccountMode == .eoa && !address.isEmpty && !isLoading {
                     stealthSection
                 }
                 
-                // MARK: - Cross-Chain Swaps
-                if !address.isEmpty && !isLoading {
+                // MARK: - Cross-Chain Swaps (EOA only)
+                if activeAccountMode == .eoa && !address.isEmpty && !isLoading {
                     crossChainSection
                 }
             }
             .padding()
         }
-        .navigationTitle("Wallet")
+        .navigationTitle(activeAccountMode == .pqAccount ? "PQ Wallet" : "Wallet")
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
         #endif
         .task {
             await loadWallet()
+        }
+        .task {
+            // Configure PQ VM
+            if XMTPServiceContainer.isConfigured {
+                let container = XMTPServiceContainer.shared
+                pqViewModel.configure(
+                    pqKeyManager: container.pqKeyManager,
+                    chainServiceSets: Array(container.pqChainServices.values)
+                )
+                await pqViewModel.initializeKeys(from: wallet)
+            }
         }
         .task {
             // Auto-refresh balances periodically
@@ -145,9 +178,7 @@ struct WalletView: View {
                 onSuccess: {
                     // Refresh balances after successful send
                     Task {
-                        if let address = try? await wallet.getAddress() {
-                            await balanceService.fetchBalances(for: address)
-                        }
+                        await balanceService.fetchBalances(for: displayAddress)
                     }
                 }
             )
@@ -176,11 +207,68 @@ struct WalletView: View {
         }
     }
     
+    // MARK: - Computed Properties
+    
+    /// The address to display based on active account mode
+    private var displayAddress: String {
+        if activeAccountMode == .pqAccount, let pqAddr = pqViewModel.accountAddress {
+            return pqAddr
+        }
+        return address
+    }
+    
     // MARK: - Sections
+    
+    private var accountModePicker: some View {
+        Picker("Account", selection: $activeAccountMode) {
+            Text("EOA").tag(AccountMode.eoa)
+            HStack {
+                Image(systemName: "shield.checkered")
+                Text("PQ Account")
+            }
+            .tag(AccountMode.pqAccount)
+        }
+        .pickerStyle(.segmented)
+    }
+    
+    private var pqBadgeSection: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "shield.checkered")
+                .font(.title3)
+                .foregroundColor(.green)
+            
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Quantum-Resistant Account")
+                    .font(.subheadline)
+                    .fontWeight(.semibold)
+                
+                Text("Hybrid ECDSA + ML-DSA-44 · ERC-4337")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+            
+            Spacer()
+            
+            // Show deployed chains
+            let deployedChains = pqViewModel.chainStatuses.filter(\.isDeployed)
+            if !deployedChains.isEmpty {
+                VStack(alignment: .trailing, spacing: 2) {
+                    ForEach(deployedChains) { chain in
+                        Text(chain.displayName)
+                            .font(.caption2)
+                            .foregroundColor(.green)
+                    }
+                }
+            }
+        }
+        .padding()
+        .background(Color.green.opacity(0.1))
+        .cornerRadius(12)
+    }
     
     private var qrCodeSection: some View {
         VStack(spacing: 16) {
-            if let qrImage = generateQRCode(from: address) {
+            if let qrImage = generateQRCode(from: displayAddress) {
                 #if os(iOS)
                 Image(uiImage: qrImage)
                     .interpolation(.none)
@@ -284,18 +372,26 @@ struct WalletView: View {
     
     private var addressSection: some View {
         VStack(spacing: 12) {
-            Text("Your Address")
-                .font(.headline)
+            HStack {
+                Text(activeAccountMode == .pqAccount ? "PQ Account Address" : "Your Address")
+                    .font(.headline)
+                
+                if activeAccountMode == .pqAccount {
+                    Image(systemName: "shield.checkered")
+                        .font(.caption)
+                        .foregroundColor(.green)
+                }
+            }
             
             HStack {
-                Text(truncatedAddress)
+                Text(truncatedDisplayAddress)
                     .font(.system(.body, design: .monospaced))
                     .foregroundColor(.primary)
                 
                 Spacer()
                 
                 Button {
-                    copyAddress()
+                    copyDisplayAddress()
                 } label: {
                     Image(systemName: "doc.on.doc")
                         .font(.body)
@@ -307,7 +403,7 @@ struct WalletView: View {
             .background(Color(.systemGray).opacity(0.15))
             .cornerRadius(8)
             
-            Text(address)
+            Text(displayAddress)
                 .font(.system(.caption2, design: .monospaced))
                 .foregroundColor(.secondary)
                 .textSelection(.enabled)
@@ -328,7 +424,7 @@ struct WalletView: View {
                 } else {
                     Button {
                         Task {
-                            await balanceService.fetchBalances(for: address)
+                            await balanceService.fetchBalances(for: displayAddress)
                         }
                     } label: {
                         Image(systemName: "arrow.clockwise")
@@ -386,7 +482,7 @@ struct WalletView: View {
                 .buttonStyle(.plain)
                 
                 Button {
-                    copyAddress()
+                    copyDisplayAddress()
                 } label: {
                     VStack(spacing: 8) {
                         Image(systemName: "arrow.down.circle.fill")
@@ -692,6 +788,12 @@ struct WalletView: View {
         return String(address.prefix(8)) + "…" + String(address.suffix(6))
     }
     
+    private var truncatedDisplayAddress: String {
+        let addr = displayAddress
+        guard addr.count > 16 else { return addr }
+        return String(addr.prefix(8)) + "…" + String(addr.suffix(6))
+    }
+    
     // MARK: - Actions
     
     private func loadWallet() async {
@@ -714,10 +816,10 @@ struct WalletView: View {
         while !Task.isCancelled {
             try? await Task.sleep(for: .seconds(refreshInterval))
             
-            guard !Task.isCancelled, !address.isEmpty else { break }
+            guard !Task.isCancelled, !displayAddress.isEmpty else { break }
             
             // Silently refresh balances in background
-            await balanceService.fetchBalances(for: address)
+            await balanceService.fetchBalances(for: displayAddress)
         }
     }
     
@@ -730,6 +832,23 @@ struct WalletView: View {
         #endif
         
         copiedText = "Address copied!"
+        showCopiedToast = true
+        
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            showCopiedToast = false
+        }
+    }
+    
+    private func copyDisplayAddress() {
+        let addr = displayAddress
+        #if os(iOS)
+        UIPasteboard.general.string = addr
+        #else
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(addr, forType: .string)
+        #endif
+        
+        copiedText = activeAccountMode == .pqAccount ? "PQ address copied!" : "Address copied!"
         showCopiedToast = true
         
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
