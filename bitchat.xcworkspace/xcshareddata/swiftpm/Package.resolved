@@ -1,6 +1,33 @@
 {
-  "originHash" : "bb4f328eb847aa20bb427949a0ee23c310061b3925e1f5368e7991676308a538",
+  "originHash" : "4ada2814858c0fbf1b1a6d6ccf5ac3a2f9cd79af5c4554a1702a7de37e00c54e",
   "pins" : [
+    {
+      "identity" : "asn1",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/leif-ibsen/ASN1",
+      "state" : {
+        "revision" : "e38d1b8b43d8b53ffadde9836f34289176bb7a0c",
+        "version" : "2.7.0"
+      }
+    },
+    {
+      "identity" : "bigint",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/leif-ibsen/BigInt",
+      "state" : {
+        "revision" : "8c6f93aa37504b7b1ba3954335b5548a19fbbd82",
+        "version" : "1.22.0"
+      }
+    },
+    {
+      "identity" : "digest",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/leif-ibsen/Digest",
+      "state" : {
+        "revision" : "95ba89b494aaff5f3cd2933c03b9a890323dbf2c",
+        "version" : "1.13.0"
+      }
+    },
     {
       "identity" : "swift-secp256k1",
       "kind" : "remoteSourceControl",
@@ -8,6 +35,15 @@
       "state" : {
         "revision" : "8c62aba8a3011c9bcea232e5ee007fb0b34a15e2",
         "version" : "0.21.1"
+      }
+    },
+    {
+      "identity" : "swiftdilithium",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/leif-ibsen/SwiftDilithium",
+      "state" : {
+        "revision" : "e5d4392af75f6c6094e5a15ec90f432eff9eb733",
+        "version" : "3.5.0"
       }
     }
   ],

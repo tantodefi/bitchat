@@ -26,6 +26,7 @@ final class XMTPClientService: ObservableObject {
     
     private var client: Client?
     private var streamTask: Task<Void, Never>?
+    private var conversationStreamTask: Task<Void, Never>?
     
     @Published private(set) var isConnected = false
     @Published private(set) var inboxId: String?
@@ -71,6 +72,7 @@ final class XMTPClientService: ObservableObject {
     
     deinit {
         streamTask?.cancel()
+        conversationStreamTask?.cancel()
     }
     
     // MARK: - Client Lifecycle
@@ -119,14 +121,17 @@ final class XMTPClientService: ObservableObject {
         
         SecureLogger.info("✅ XMTP client connected. Inbox: \(xmtpClient.inboxID.prefix(16))…", category: .network)
         
-        // Start message streaming
+        // Start message and conversation streaming
         startMessageStream()
+        startConversationStream()
     }
     
     /// Disconnect and cleanup
     func disconnect() {
         streamTask?.cancel()
         streamTask = nil
+        conversationStreamTask?.cancel()
+        conversationStreamTask = nil
         client = nil
         isConnected = false
         inboxId = nil
@@ -364,7 +369,8 @@ final class XMTPClientService: ObservableObject {
             guard let self = self else { return }
             
             do {
-                for try await message in await client.conversations.streamAllMessages(consentStates: [.allowed]) {
+                // Stream from both .allowed and .unknown so new inbound DMs are received
+                for try await message in await client.conversations.streamAllMessages(consentStates: [.allowed, .unknown]) {
                     await self.handleIncomingMessage(message)
                 }
             } catch {
@@ -375,11 +381,47 @@ final class XMTPClientService: ObservableObject {
         }
     }
     
+    /// Stream new conversations and auto-allow incoming DMs so they appear in the conversation list
+    private func startConversationStream() {
+        guard let client = client else { return }
+        
+        conversationStreamTask?.cancel()
+        
+        conversationStreamTask = Task { [weak self] in
+            guard let self = self else { return }
+            
+            do {
+                for try await conversation in try await client.conversations.stream() {
+                    // Auto-allow new incoming DMs so messages flow through the stream
+                    if case .dm(let dm) = conversation {
+                        let peerInboxId = try dm.peerInboxId
+                        try? await client.preferences.setConsentState(
+                            entries: [ConsentRecord(value: peerInboxId, entryType: .inbox_id, consentType: .allowed)]
+                        )
+                        SecureLogger.info("📬 New XMTP conversation auto-allowed: \(peerInboxId.prefix(8))…", category: .network)
+                    }
+                }
+            } catch {
+                if !Task.isCancelled {
+                    SecureLogger.error("XMTP conversation stream error: \(error.localizedDescription)", category: .network)
+                }
+            }
+        }
+    }
+    
     private func handleIncomingMessage(_ message: DecodedMessage) async {
         // Filter out our own messages to prevent storing our own inbox ID in the map
         // This is critical - without it, replies would try to DM ourselves
         if let myInboxId = self.inboxId, message.senderInboxId == myInboxId {
             return
+        }
+        
+        // Auto-allow the sender so future messages are streamed without issues
+        // This handles the case where a message arrives with .unknown consent state
+        if let client = self.client {
+            try? await client.preferences.setConsentState(
+                entries: [ConsentRecord(value: message.senderInboxId, entryType: .inbox_id, consentType: .allowed)]
+            )
         }
         
         // Check if it's a BitChat packet
@@ -445,7 +487,8 @@ final class XMTPClientService: ObservableObject {
             throw XMTPClientError.notConnected
         }
         
-        _ = try await client.conversations.syncAllConversations()
+        // Sync both allowed and unknown so new inbound conversations are discovered
+        _ = try await client.conversations.syncAllConversations(consentStates: [.allowed, .unknown])
         SecureLogger.debug("📥 Synced all XMTP conversations", category: .network)
     }
     

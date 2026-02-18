@@ -507,6 +507,8 @@ struct StealthAddressDetailView: View {
             baseURL = "https://basescan.org/address/"
         case 42161:
             baseURL = "https://arbiscan.io/address/"
+        case 421614:
+            baseURL = "https://sepolia.arbiscan.io/address/"
         default:
             baseURL = "https://etherscan.io/address/"
         }
@@ -527,6 +529,7 @@ struct StealthAddressDetailView: View {
         case 10: return "Optimism"
         case 8453: return "Base"
         case 42161: return "Arbitrum One"
+        case 421614: return "Arbitrum Sepolia"
         default: return "Chain \(chainId)"
         }
     }

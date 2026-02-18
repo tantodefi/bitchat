@@ -707,6 +707,75 @@ These are critical correctness gates — the Swift implementation must produce *
 
 ---
 
+## Implementation Status (Updated Feb 2026)
+
+### ✅ Completed
+
+| Phase | File | Status | Notes |
+|-------|------|--------|-------|
+| 1 | `Package.swift` + `project.pbxproj` | ✅ Done | SwiftDilithium 3.5.0, BigInt 1.21.0, Digest 1.13.0 added as SPM packages in both Package.swift AND Xcode project |
+| 2 | `PQKeyManager.swift` | ✅ Done | Actor with keychain storage, uses `keyBytes` for serialization |
+| 3 | `MLDSAKeyExpander.swift` | ✅ Done | SHAKE-128 rejection sampling via `Digest` package's `XOF` API |
+| 3 | `ABIEncoder.swift` | ✅ Done | Minimal ABI encoder with `.addressData(Data)` case, configurable hex prefix |
+| 4 | `UserOperationBuilder.swift` | ✅ Done | PackedUserOperation with UInt64 convenience init, gas packing helpers |
+| 4 | `PimlicoBundler.swift` | ✅ Done | JSON-RPC client with gas estimation, submission, receipt polling |
+| 5 | `PQAccountDeployer.swift` | ✅ Done | Factory at `0xe28F039653772C32b0eDB1db7c7A5FA250DDA0e5`, Sepolia + Arbitrum Sepolia |
+| 6 | `PQTransactionSigner.swift` | ✅ Done | End-to-end hybrid signing orchestrator |
+| 7 | `PQAccountViewModel.swift` | ✅ Done | @MainActor ObservableObject with deploy/execute/export |
+| 7 | `WalletSettingsView.swift` | ✅ Done | PQ section added to settings UI |
+| 9 | `XMTPServiceContainer.swift` | ✅ Done | PQ services wired into container (conditional on Pimlico key) |
+| 9 | `SecureConfig.swift` | ✅ Done | Pimlico API key getter/setter added |
+| 9 | `Secrets.xcconfig.example` | ✅ Done | `PIMLICO_API_KEY` entry added |
+| Tests | `PQAccountTests.swift` | ✅ Done | Swift Testing framework, key lifecycle, ABI encoding, deployer tests |
+
+### Implementation Findings & Corrections
+
+#### SwiftDilithium API (v3.5.0) — Actual vs Documented
+
+The plan's API surface section was based on README/docs. Actual API differs:
+
+| Plan Assumed | Actual API | Fix Applied |
+|-------------|-----------|-------------|
+| `Dilithium.GenerateKeyPair(kind: .d44)` | `Dilithium.GenerateKeyPair(kind: .ML_DSA_44)` | Kind enum uses `.ML_DSA_44` not `.d44` |
+| `SecretKey(kind:, seed:)` for deterministic keygen | **Does not exist** — no seed-based init | Use random keygen, store full `keyBytes` in keychain |
+| `secretKey.publicKey` property | **Does not exist** — no way to get public key from secret key | Generate keypair together, store both `sk.keyBytes` and `pk.keyBytes` |
+| `Data(secretKey)` / `Data(publicKey)` | Not directly castable | Use `Data(sk.keyBytes)` where `keyBytes` is `[UInt8]` |
+| Key reconstruction from bytes | `SecretKey(keyBytes: Bytes)` / `PublicKey(keyBytes: Bytes)` | Store and reconstruct via `keyBytes` arrays |
+
+**Key Takeaway**: PQ key derivation from EOA key (Plan Option A) is NOT possible with SwiftDilithium — there's no seed-based deterministic keygen. The implementation uses **random keygen** (Plan Option B) and stores the full secret key bytes in Keychain.
+
+#### SPM Package Integration
+
+The app builds via `.xcworkspace` (CocoaPods), not `Package.swift` alone. SPM packages must be added as `XCRemoteSwiftPackageReference` entries in `project.pbxproj` with `XCSwiftPackageProductDependency` for both iOS and macOS targets.
+
+#### Logging API
+
+The `BitLogger` module exposes `SecureLogger.info/error/warning("msg", category: .session)` — not `BitLogger.general.*` as one might assume.
+
+#### Factory Address
+
+Confirmed: `0xe28F039653772C32b0eDB1db7c7A5FA250DDA0e5` on both Sepolia (11155111) and Arbitrum Sepolia (421614).
+
+### Resolved Open Questions
+
+1. **Factory address**: Hardcoded as `0xe28F039653772C32b0eDB1db7c7A5FA250DDA0e5` (confirmed on Sepolia + Arbitrum Sepolia).
+2. **MLDSA vs MLDSAETH**: Using `mldsa_k1` (NIST FIPS 204 mode) — matches SwiftDilithium output directly.
+3. **Pimlico API key**: Stored in Keychain via `SecureConfig`, with Info.plist fallback from `Secrets.xcconfig`. NOT in `@AppStorage`.
+4. **Key derivation**: Using Option B (independent random) since SwiftDilithium has no seed-based init.
+5. **Arbitrum Sepolia**: Added to `EthereumBalanceService.Network` enum alongside Sepolia in testnet mode.
+
+### Remaining Work
+
+| Task | Priority | Notes |
+|------|----------|-------|
+| Cross-validate expanded key output with JS reference | High | Need test vectors from kohaku |
+| End-to-end testnet deployment test | High | Deploy actual account on Sepolia from device |
+| WalletView EOA/PQ toggle (Phase 8) | Medium | Segmented picker for account mode |
+| Transaction history for UserOperations | Low | Query bundler for receipts |
+| PQ key export/import UX | Low | Seed backup flow |
+
+---
+
 ## Open Questions
 
 1. **Factory address**: Need to pull the exact `mldsa_k1` factory address from `deployments.json` — the file wasn't accessible via GitHub raw URL. May need to clone the kohaku repo or check Etherscan directly.

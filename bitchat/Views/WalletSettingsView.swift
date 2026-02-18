@@ -19,8 +19,7 @@ struct WalletSettingsView: View {
     
     @State private var showingClearConfirmation = false
     @State private var showingExportConfirmation = false
-    @State private var exportedPrivateKey: String?
-    @State private var showingPrivateKey = false
+    @State private var exportedPrivateKey: IdentifiableString?
     
     // Stealth and EIL settings
     @AppStorage("enableStealthScanning") private var enableStealthScanning = true
@@ -35,6 +34,10 @@ struct WalletSettingsView: View {
     // Beta warning - show once across both WalletView and WalletSettingsView
     @AppStorage("wallet-beta-warning-accepted") private var betaWarningAccepted: Bool = false
     @State private var showBetaWarning: Bool = false
+    
+    // PQ Account
+    @StateObject private var pqViewModel = PQAccountViewModel()
+    @State private var exportedPQSeed: IdentifiableString?
     
     var body: some View {
         List {
@@ -81,7 +84,7 @@ struct WalletSettingsView: View {
                     Label {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Testnet Mode")
-                            Text(balanceService.useTestnet ? "Using Sepolia testnet" : "Using Ethereum & Base mainnet")
+                            Text(balanceService.useTestnet ? "Using Sepolia & Arbitrum Sepolia testnets" : "Using Ethereum, Base & Arbitrum mainnet")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
@@ -122,6 +125,228 @@ struct WalletSettingsView: View {
                 Text("Wallet")
             } footer: {
                 Text("Testnet mode uses Sepolia for testing without real funds.")
+            }
+            
+            // MARK: - Post-Quantum Account
+            Section {
+                // PQ Key Status
+                HStack {
+                    Label {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("ML-DSA-44 Keys")
+                            Text(pqViewModel.state.displayStatus)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    } icon: {
+                        Image(systemName: pqViewModel.state.isDeployed ? "checkmark.shield.fill" : "shield.lefthalf.filled")
+                            .foregroundColor(pqViewModel.state.isDeployed ? .green : .orange)
+                    }
+                    
+                    Spacer()
+                    
+                    if case .notInitialized = pqViewModel.state {
+                        Button("Initialize") {
+                            Task {
+                                await pqViewModel.initializeKeys(from: wallet)
+                            }
+                        }
+                        .font(.caption)
+                        .buttonStyle(.bordered)
+                    } else if case .initializing = pqViewModel.state {
+                        ProgressView()
+                            .scaleEffect(0.8)
+                    } else if case .error = pqViewModel.state {
+                        Button("Retry") {
+                            Task {
+                                await pqViewModel.initializeKeys(from: wallet)
+                            }
+                        }
+                        .font(.caption)
+                        .buttonStyle(.bordered)
+                        .tint(.red)
+                    }
+                }
+                
+                // PQ Account Address
+                if let address = pqViewModel.accountAddress {
+                    HStack {
+                        Text("Account")
+                        Spacer()
+                        Text(address.prefix(8) + "..." + address.suffix(4))
+                            .font(.caption.monospaced())
+                            .foregroundColor(.secondary)
+                    }
+                }
+                
+                // PQ Public Key (truncated)
+                if let pkHex = pqViewModel.pqPublicKeyHex {
+                    HStack {
+                        Text("Public Key")
+                        Spacer()
+                        Text(pkHex)
+                            .font(.caption.monospaced())
+                            .foregroundColor(.secondary)
+                    }
+                }
+                
+                // Chain selector + deploy (shown when keys are ready)
+                if case .keysReady = pqViewModel.state {
+                    // Chain target picker
+                    Picker("Deploy Target", selection: $pqViewModel.deployTarget) {
+                        ForEach(PQDeployTarget.allCases) { target in
+                            Text(target.rawValue).tag(target)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    
+                    if pqViewModel.canDeploy {
+                        // Per-chain status rows
+                        ForEach(pqViewModel.chainStatuses.filter { status in
+                            pqViewModel.deployTarget.chains.contains(where: { $0.chainId == status.chain.chainId })
+                        }) { status in
+                            HStack(spacing: 8) {
+                                Image(systemName: status.statusIcon)
+                                    .foregroundColor(pqChainStatusColor(status))
+                                    .font(.caption)
+                                Text(status.displayName)
+                                    .font(.caption)
+                                Spacer()
+                                if status.isDeployed {
+                                    Text("Deployed")
+                                        .font(.caption2)
+                                        .foregroundColor(.green)
+                                } else if status.isDeploying {
+                                    ProgressView()
+                                        .scaleEffect(0.6)
+                                } else {
+                                    let (sufficient, balance) = pqViewModel.checkDeploymentBalance(
+                                        chain: status.chain,
+                                        balanceService: balanceService
+                                    )
+                                    if sufficient {
+                                        Text(String(format: "%.4f ETH", balance))
+                                            .font(.caption2)
+                                            .foregroundColor(.secondary)
+                                    } else {
+                                        Text(String(format: "%.4f ETH ⚠️", balance))
+                                            .font(.caption2)
+                                            .foregroundColor(.orange)
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Insufficient gas warning
+                        let lowChains = pqViewModel.insufficientBalanceChains(balanceService: balanceService)
+                        if !lowChains.isEmpty {
+                            Label {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Insufficient gas for deployment")
+                                        .font(.caption)
+                                    Text("Need ≥ \(String(format: "%.3f", PQAccountViewModel.minimumDeploymentGasETH)) ETH on \(lowChains.map(\.chain.name).joined(separator: " & ")). Use a testnet faucet.")
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                }
+                            } icon: {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundColor(.orange)
+                            }
+                        }
+                        
+                        // Deploy button
+                        if !pqViewModel.allTargetChainsDeployed {
+                            Button {
+                                Task { await pqViewModel.deployToTarget() }
+                            } label: {
+                                HStack {
+                                    Image(systemName: "arrow.up.circle.fill")
+                                    Text("Deploy on \(pqViewModel.deployTarget.rawValue)")
+                                }
+                                .font(.caption)
+                            }
+                            .buttonStyle(.bordered)
+                            .tint(.orange)
+                            .disabled(pqViewModel.isAnyTargetDeploying || !lowChains.isEmpty)
+                        }
+                    } else {
+                        // No Pimlico API key — show guidance
+                        Label {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Bundler API key required")
+                                    .font(.caption)
+                                Text("Add PIMLICO_API_KEY to Secrets.xcconfig to enable on-chain deployment.")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                        } icon: {
+                            Image(systemName: "key.fill")
+                                .foregroundColor(.orange)
+                        }
+                    }
+                } else if case .deploying = pqViewModel.state {
+                    // Deploying — show per-chain progress
+                    ForEach(pqViewModel.chainStatuses.filter { $0.isDeploying || $0.isDeployed }) { status in
+                        HStack(spacing: 8) {
+                            if status.isDeploying {
+                                ProgressView().scaleEffect(0.6)
+                            } else {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundColor(.green)
+                                    .font(.caption)
+                            }
+                            Text(status.displayName)
+                                .font(.caption)
+                            Spacer()
+                            if status.isDeployed {
+                                Text("✓").foregroundColor(.green).font(.caption)
+                            } else if let err = status.error {
+                                Text(err).font(.caption2).foregroundColor(.red).lineLimit(1)
+                            }
+                        }
+                    }
+                } else if case .deployed = pqViewModel.state {
+                    // Show per-chain deployment status
+                    ForEach(pqViewModel.chainStatuses.filter { $0.isDeployed }) { status in
+                        HStack(spacing: 8) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundColor(.green)
+                                .font(.caption)
+                            Text(status.displayName)
+                                .font(.caption)
+                            Spacer()
+                            Text("Deployed")
+                                .font(.caption2)
+                                .foregroundColor(.green)
+                        }
+                    }
+                }
+                
+                // Error display
+                if let error = pqViewModel.lastError {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundColor(.red)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                
+                // Export PQ Seed
+                if pqViewModel.state != .notInitialized {
+                    Button {
+                        Task {
+                            if let seed = await pqViewModel.exportSeed() {
+                                exportedPQSeed = IdentifiableString(value: seed)
+                            }
+                        }
+                    } label: {
+                        Label("Export PQ Seed", systemImage: "square.and.arrow.up")
+                            .foregroundColor(.orange)
+                    }
+                }
+            } header: {
+                Label("Post-Quantum Security", systemImage: "shield.checkered")
+            } footer: {
+                Text("Hybrid ECDSA + ML-DSA-44 smart account (ERC-4337). Deploy on Sepolia, Arbitrum Sepolia, or both — same address via CREATE2.")
             }
             
             // MARK: - Stealth Addresses
@@ -258,10 +483,9 @@ struct WalletSettingsView: View {
         } message: {
             Text("Your private key controls all funds in your wallet. Never share it with anyone. Store it securely offline.")
         }
-        .sheet(isPresented: $showingPrivateKey) {
-            PrivateKeyExportSheet(privateKey: exportedPrivateKey ?? "", onDismiss: {
+        .sheet(item: $exportedPrivateKey) { item in
+            PrivateKeyExportSheet(privateKey: item.value, onDismiss: {
                 exportedPrivateKey = nil
-                showingPrivateKey = false
             })
         }
         .task {
@@ -275,7 +499,19 @@ struct WalletSettingsView: View {
             // Load XMTP inbox ID if available
             if XMTPServiceContainer.isConfigured {
                 xmtpInboxId = XMTPServiceContainer.shared.clientService.inboxId
+                
+                // Configure PQ VM with container services
+                let container = XMTPServiceContainer.shared
+                pqViewModel.configure(
+                    pqKeyManager: container.pqKeyManager,
+                    chainServiceSets: Array(container.pqChainServices.values)
+                )
             }
+        }
+        .sheet(item: $exportedPQSeed) { item in
+            PQSeedExportSheet(seed: item.value, onDismiss: {
+                exportedPQSeed = nil
+            })
         }
         .onAppear {
             // Show beta warning once
@@ -295,10 +531,147 @@ struct WalletSettingsView: View {
     private func exportPrivateKey() async {
         do {
             let privateKey = try await wallet.getOrCreatePrivateKey()
-            exportedPrivateKey = "0x" + privateKey.map { String(format: "%02x", $0) }.joined()
-            showingPrivateKey = true
+            let hex = "0x" + privateKey.map { String(format: "%02x", $0) }.joined()
+            exportedPrivateKey = IdentifiableString(value: hex)
         } catch {
             // Handle error silently - user can retry
+        }
+    }
+    
+    private func pqChainStatusColor(_ status: PQChainDeploymentStatus) -> Color {
+        if status.isDeploying { return .orange }
+        if status.isDeployed { return .green }
+        if status.error != nil { return .red }
+        return .secondary
+    }
+}
+
+// MARK: - Identifiable String Wrapper
+
+/// Simple wrapper to make a String usable with .sheet(item:)
+struct IdentifiableString: Identifiable {
+    let id = UUID()
+    let value: String
+}
+
+// MARK: - PQ Seed Export Sheet
+
+struct PQSeedExportSheet: View {
+    let seed: String
+    let onDismiss: () -> Void
+
+    @State private var showKey = false
+    @State private var copied = false
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 24) {
+                // Warning header
+                VStack(spacing: 12) {
+                    Image(systemName: "shield.lefthalf.filled")
+                        .font(.system(size: 48))
+                        .foregroundColor(.orange)
+
+                    Text("PQ Secret Key")
+                        .font(.title2)
+                        .fontWeight(.bold)
+
+                    Text("This is your ML-DSA-44 secret key. Anyone with this key can sign as your post-quantum identity. Never share it.")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .padding()
+
+                // Key display
+                VStack(spacing: 12) {
+                    if showKey {
+                        ScrollView {
+                            Text(seed)
+                                .font(.system(.caption, design: .monospaced))
+                                .textSelection(.enabled)
+                                .padding()
+                        }
+                        .frame(maxHeight: 200)
+                        .background(Color(.systemGray).opacity(0.1))
+                        .cornerRadius(8)
+                    } else {
+                        Button {
+                            showKey = true
+                        } label: {
+                            HStack {
+                                Image(systemName: "eye.slash.fill")
+                                Text("Tap to reveal")
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding()
+                            .background(Color(.systemGray).opacity(0.1))
+                            .cornerRadius(8)
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    if showKey {
+                        Button {
+                            #if os(iOS)
+                            UIPasteboard.general.string = seed
+                            #else
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(seed, forType: .string)
+                            #endif
+                            copied = true
+
+                            // Clear clipboard after 60 seconds for security
+                            Task {
+                                try? await Task.sleep(nanoseconds: 60_000_000_000)
+                                #if os(iOS)
+                                if UIPasteboard.general.string == seed {
+                                    UIPasteboard.general.string = ""
+                                }
+                                #endif
+                            }
+                        } label: {
+                            HStack {
+                                Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                                Text(copied ? "Copied! (clears in 60s)" : "Copy to Clipboard")
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding()
+                            .background(Color.accentColor)
+                            .foregroundColor(.white)
+                            .cornerRadius(8)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal)
+
+                // Security tips
+                VStack(alignment: .leading, spacing: 8) {
+                    Label("Write it down on paper", systemImage: "pencil")
+                    Label("Store in a password manager", systemImage: "lock.fill")
+                    Label("Never screenshot or email", systemImage: "xmark.circle")
+                }
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .padding()
+                .background(Color.blue.opacity(0.1))
+                .cornerRadius(12)
+                .padding(.horizontal)
+
+                Spacer()
+            }
+            .navigationTitle("PQ Seed Export")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") {
+                        onDismiss()
+                    }
+                }
+            }
         }
     }
 }

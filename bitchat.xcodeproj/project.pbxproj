@@ -256,6 +256,9 @@
 				B1D9136AA0083366353BFA2F /* P256K */,
 				A6E3E5712E7703760032EA8A /* BitLogger */,
 				A6E3EA802E7706A80032EA8A /* Tor */,
+				PQ0021008464F1EA38F4E286 /* SwiftDilithium */,
+				PQ0022008464F1EA38F4E286 /* BigInt */,
+				PQ0023008464F1EA38F4E286 /* Digest */,
 			);
 			productName = bitchat_macOS;
 			productReference = 8F3A7C058C2C8E1A06C8CF8B /* bitchat.app */;
@@ -341,6 +344,9 @@
 				4EB6BA1B8464F1EA38F4E286 /* P256K */,
 				A6E3E56F2E77036A0032EA8A /* BitLogger */,
 				A6E3EA7E2E7706720032EA8A /* Tor */,
+				PQ0011008464F1EA38F4E286 /* SwiftDilithium */,
+				PQ0012008464F1EA38F4E286 /* BigInt */,
+				PQ0013008464F1EA38F4E286 /* Digest */,
 			);
 			productName = bitchat_iOS;
 			productReference = 96D0D41CA19EE5A772AA8434 /* bitchat.app */;
@@ -382,6 +388,9 @@
 				B8C407587481BBB190741C93 /* XCRemoteSwiftPackageReference "swift-secp256k1" */,
 				A6E3E56E2E77036A0032EA8A /* XCLocalSwiftPackageReference "localPackages/BitLogger" */,
 				A6E3EA7D2E7706720032EA8A /* XCLocalSwiftPackageReference "localPackages/Arti" */,
+				PQ0001007481BBB190741C93 /* XCRemoteSwiftPackageReference "SwiftDilithium" */,
+				PQ0002007481BBB190741C93 /* XCRemoteSwiftPackageReference "BigInt" */,
+				PQ0003007481BBB190741C93 /* XCRemoteSwiftPackageReference "Digest" */,
 			);
 			preferredProjectObjectVersion = 90;
 			productRefGroup = 9F37F9F2C353B58AC809E93B /* Products */;
@@ -1066,6 +1075,30 @@
 				version = 0.21.1;
 			};
 		};
+		PQ0001007481BBB190741C93 /* XCRemoteSwiftPackageReference "SwiftDilithium" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/leif-ibsen/SwiftDilithium";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 3.5.0;
+			};
+		};
+		PQ0002007481BBB190741C93 /* XCRemoteSwiftPackageReference "BigInt" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/leif-ibsen/BigInt";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.21.0;
+			};
+		};
+		PQ0003007481BBB190741C93 /* XCRemoteSwiftPackageReference "Digest" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/leif-ibsen/Digest";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.13.0;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -1073,6 +1106,36 @@
 			isa = XCSwiftPackageProductDependency;
 			package = B8C407587481BBB190741C93 /* XCRemoteSwiftPackageReference "swift-secp256k1" */;
 			productName = P256K;
+		};
+		PQ0011008464F1EA38F4E286 /* SwiftDilithium */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = PQ0001007481BBB190741C93 /* XCRemoteSwiftPackageReference "SwiftDilithium" */;
+			productName = SwiftDilithium;
+		};
+		PQ0012008464F1EA38F4E286 /* BigInt */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = PQ0002007481BBB190741C93 /* XCRemoteSwiftPackageReference "BigInt" */;
+			productName = BigInt;
+		};
+		PQ0013008464F1EA38F4E286 /* Digest */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = PQ0003007481BBB190741C93 /* XCRemoteSwiftPackageReference "Digest" */;
+			productName = Digest;
+		};
+		PQ0021008464F1EA38F4E286 /* SwiftDilithium */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = PQ0001007481BBB190741C93 /* XCRemoteSwiftPackageReference "SwiftDilithium" */;
+			productName = SwiftDilithium;
+		};
+		PQ0022008464F1EA38F4E286 /* BigInt */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = PQ0002007481BBB190741C93 /* XCRemoteSwiftPackageReference "BigInt" */;
+			productName = BigInt;
+		};
+		PQ0023008464F1EA38F4E286 /* Digest */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = PQ0003007481BBB190741C93 /* XCRemoteSwiftPackageReference "Digest" */;
+			productName = Digest;
 		};
 		A6E3E56F2E77036A0032EA8A /* BitLogger */ = {
 			isa = XCSwiftPackageProductDependency;

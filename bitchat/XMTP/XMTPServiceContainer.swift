@@ -31,6 +31,12 @@ final class XMTPServiceContainer: ObservableObject {
     let meshTransactionRelay: MeshTransactionRelay
     let geohashGroupRegistry: GeohashGroupRegistry
     
+    // MARK: - PQ Services
+    
+    let pqKeyManager: PQKeyManager
+    /// Per-chain PQ service sets (keyed by chainId)
+    private(set) var pqChainServices: [UInt64: PQAccountViewModel.ChainServiceSet] = [:]
+    
     // MARK: - Private
     
     private let keychain: KeychainManagerProtocol
@@ -105,6 +111,35 @@ final class XMTPServiceContainer: ObservableObject {
         
         // Create mesh transaction relay
         self.meshTransactionRelay = MeshTransactionRelay(keychain: keychain)
+        
+        // Create PQ key manager (always available, keys derived from wallet)
+        self.pqKeyManager = PQKeyManager(keychain: keychain)
+        
+        // Create PQ account infrastructure for all testnet chains (requires Pimlico API key)
+        if SecureConfig.hasPimlicoAPIKey {
+            var services: [UInt64: PQAccountViewModel.ChainServiceSet] = [:]
+            for chain in PQAccountDeployer.Chain.allCases {
+                let deployer = PQAccountDeployer(chain: chain)
+                let bundler = PimlicoBundler(
+                    apiKey: SecureConfig.pimlicoAPIKey,
+                    chainId: chain.chainId
+                )
+                let signer = PQTransactionSigner(
+                    wallet: wallet,
+                    pqKeyManager: pqKeyManager,
+                    bundler: bundler,
+                    deployer: deployer,
+                    chainId: chain.chainId
+                )
+                services[chain.chainId] = PQAccountViewModel.ChainServiceSet(
+                    chain: chain,
+                    deployer: deployer,
+                    bundler: bundler,
+                    signer: signer
+                )
+            }
+            self.pqChainServices = services
+        }
     }
     
     // MARK: - BLE Service Configuration
@@ -237,5 +272,10 @@ extension XMTPServiceContainer {
         get async {
             try? await wallet.getAddress()
         }
+    }
+    
+    /// Whether PQ account services are available (Pimlico key configured)
+    var isPQEnabled: Bool {
+        !pqChainServices.isEmpty
     }
 }

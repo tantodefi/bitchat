@@ -12,6 +12,7 @@ struct MeshPeerList: View {
 
     @State private var orderedIDs: [String] = []
     @State private var showXMTPConversations: Bool = false
+    @State private var isSyncing: Bool = false
 
     private enum Strings {
         static let noneNearby: LocalizedStringKey = "geohash_people.none_nearby"
@@ -250,6 +251,31 @@ struct MeshPeerList: View {
                     }
                 }
             }
+            
+            // Sync All button
+            Button(action: {
+                isSyncing = true
+                Task {
+                    try? await xmtpContainer.clientService.syncAll()
+                    await MainActor.run { isSyncing = false }
+                }
+            }) {
+                HStack(spacing: 4) {
+                    if isSyncing {
+                        ProgressView()
+                            .scaleEffect(0.6)
+                    } else {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                            .font(.bitchatSystem(size: 10))
+                    }
+                    Text(isSyncing ? "syncing…" : "sync all")
+                        .font(.bitchatSystem(size: 11, design: .monospaced))
+                }
+                .foregroundColor(xmtpOrange)
+                .padding(.vertical, 6)
+            }
+            .buttonStyle(.plain)
+            .disabled(isSyncing)
         }
     }
     

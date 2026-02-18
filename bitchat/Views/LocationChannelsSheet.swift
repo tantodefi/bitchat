@@ -17,6 +17,7 @@ struct LocationChannelsSheet: View {
     @State private var customGeohash: String = ""
     @State private var customError: String? = nil
     @State private var showXMTPConversations: Bool = false
+    @State private var isSyncing: Bool = false
     @State private var xmtpChatInput: String = ""
     @State private var xmtpInputError: String? = nil
 
@@ -740,6 +741,31 @@ extension LocationChannelsSheet {
                     }
                 }
             }
+            
+            // Sync All button
+            Button(action: {
+                isSyncing = true
+                Task {
+                    try? await xmtpContainer.clientService.syncAll()
+                    await MainActor.run { isSyncing = false }
+                }
+            }) {
+                HStack(spacing: 4) {
+                    if isSyncing {
+                        ProgressView()
+                            .scaleEffect(0.6)
+                    } else {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                            .font(.bitchatSystem(size: 10))
+                    }
+                    Text(isSyncing ? "syncing…" : "sync all")
+                        .font(.bitchatSystem(size: 11, design: .monospaced))
+                }
+                .foregroundColor(xmtpOrange)
+                .padding(.vertical, 6)
+            }
+            .buttonStyle(.plain)
+            .disabled(isSyncing)
         }
     }
     

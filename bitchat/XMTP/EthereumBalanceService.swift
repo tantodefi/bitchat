@@ -22,13 +22,17 @@ final class EthereumBalanceService: ObservableObject {
     enum Network: String, CaseIterable {
         case ethereum = "Ethereum"
         case base = "Base"
+        case arbitrum = "Arbitrum"
         case sepolia = "Sepolia"
+        case arbitrumSepolia = "Arbitrum Sepolia"
         
         var chainId: Int {
             switch self {
             case .ethereum: return 1
             case .base: return 8453
+            case .arbitrum: return 42161
             case .sepolia: return 11155111
+            case .arbitrumSepolia: return 421614
             }
         }
         
@@ -41,9 +45,15 @@ final class EthereumBalanceService: ObservableObject {
             case .base:
                 // Base public RPC (consider privacy alternatives in production)
                 return URL(string: "https://mainnet.base.org")!
+            case .arbitrum:
+                // Arbitrum One public RPC
+                return URL(string: "https://arb1.arbitrum.io/rpc")!
             case .sepolia:
                 // Sepolia testnet - use dRPC (reliable public endpoint)
                 return URL(string: "https://sepolia.drpc.org")!
+            case .arbitrumSepolia:
+                // Arbitrum Sepolia testnet
+                return URL(string: "https://sepolia-rollup.arbitrum.io/rpc")!
             }
         }
         
@@ -60,18 +70,27 @@ final class EthereumBalanceService: ObservableObject {
                     URL(string: "https://base.llamarpc.com")!,
                     URL(string: "https://rpc.ankr.com/base")!
                 ]
+            case .arbitrum:
+                return [
+                    URL(string: "https://arbitrum.llamarpc.com")!,
+                    URL(string: "https://rpc.ankr.com/arbitrum")!
+                ]
             case .sepolia:
                 return [
                     URL(string: "https://rpc2.sepolia.org")!,
                     URL(string: "https://1rpc.io/sepolia")!
+                ]
+            case .arbitrumSepolia:
+                return [
+                    URL(string: "https://arbitrum-sepolia.blockpi.network/v1/rpc/public")!
                 ]
             }
         }
         
         var isTestnet: Bool {
             switch self {
-            case .ethereum, .base: return false
-            case .sepolia: return true
+            case .ethereum, .base, .arbitrum: return false
+            case .sepolia, .arbitrumSepolia: return true
             }
         }
         
@@ -79,17 +98,18 @@ final class EthereumBalanceService: ObservableObject {
             switch self {
             case .ethereum, .sepolia: return "ETH"
             case .base: return "ETH"
+            case .arbitrum, .arbitrumSepolia: return "ETH"
             }
         }
         
         /// Networks shown in mainnet mode
         static var mainnets: [Network] {
-            [.ethereum, .base]
+            [.ethereum, .base, .arbitrum]
         }
         
         /// Networks shown in testnet mode
         static var testnets: [Network] {
-            [.sepolia]
+            [.sepolia, .arbitrumSepolia]
         }
     }
     

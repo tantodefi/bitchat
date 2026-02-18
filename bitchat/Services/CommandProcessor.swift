@@ -589,7 +589,7 @@ final class CommandProcessor {
         }
         
         let balance = XMTPServiceContainer.shared.balanceService
-        let network = balance.useTestnet ? "Sepolia Testnet" : "Ethereum Mainnet"
+        let network = balance.useTestnet ? "Sepolia & Arbitrum Sepolia Testnets" : "Ethereum, Base & Arbitrum Mainnet"
         
         var status = "💰 Wallet Status\n"
         status += "  Network: \(network)\n"

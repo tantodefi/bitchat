@@ -18,6 +18,7 @@ enum SecureConfig {
     
     private static let keychainService = "com.bitchat.config"
     private static let namestoneKeyName = "namestone-api-key"
+    private static let pimlicoKeyName = "pimlico-api-key"
     
     // MARK: - Namestone API Key
     
@@ -56,6 +57,44 @@ enum SecureConfig {
     /// Clear the stored Namestone API key from keychain
     static func clearNamestoneAPIKey() -> Bool {
         KeychainHelper.delete(key: namestoneKeyName, service: keychainService)
+    }
+    
+    // MARK: - Pimlico API Key
+    
+    /// Get the Pimlico bundler API key from keychain or bundled config
+    static var pimlicoAPIKey: String {
+        // 1. Try keychain first (user-provided or remotely configured)
+        if let keyData = KeychainHelper.load(key: pimlicoKeyName, service: keychainService),
+           let key = String(data: keyData, encoding: .utf8), !key.isEmpty {
+            return key
+        }
+        
+        // 2. Fall back to bundled key from Info.plist (via xcconfig)
+        if let key = Bundle.main.infoDictionary?["PIMLICO_API_KEY"] as? String,
+           !key.isEmpty, key != "$(PIMLICO_API_KEY)" {
+            return key
+        }
+        
+        // 3. No key available
+        return ""
+    }
+    
+    /// Check if Pimlico API key is configured
+    static var hasPimlicoAPIKey: Bool {
+        !pimlicoAPIKey.isEmpty
+    }
+    
+    /// Store a Pimlico API key in keychain (for runtime configuration)
+    static func setPimlicoAPIKey(_ key: String) -> Bool {
+        guard !key.isEmpty else {
+            return KeychainHelper.delete(key: pimlicoKeyName, service: keychainService)
+        }
+        return KeychainHelper.save(key: pimlicoKeyName, data: Data(key.utf8), service: keychainService)
+    }
+    
+    /// Clear the stored Pimlico API key from keychain
+    static func clearPimlicoAPIKey() -> Bool {
+        KeychainHelper.delete(key: pimlicoKeyName, service: keychainService)
     }
 }
 

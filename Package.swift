@@ -18,7 +18,10 @@ let package = Package(
     dependencies:[
         .package(path: "localPackages/Arti"),
         .package(path: "localPackages/BitLogger"),
-        .package(url: "https://github.com/21-DOT-DEV/swift-secp256k1", exact: "0.21.1")
+        .package(url: "https://github.com/21-DOT-DEV/swift-secp256k1", exact: "0.21.1"),
+        .package(url: "https://github.com/leif-ibsen/SwiftDilithium", from: "3.5.0"),
+        .package(url: "https://github.com/leif-ibsen/BigInt", from: "1.21.0"),
+        .package(url: "https://github.com/leif-ibsen/Digest", from: "1.13.0")
         // XMTP is now provided via CocoaPods (includes SQLCipher)
     ],
     targets: [
@@ -27,7 +30,10 @@ let package = Package(
             dependencies: [
                 .product(name: "P256K", package: "swift-secp256k1"),
                 .product(name: "BitLogger", package: "BitLogger"),
-                .product(name: "Tor", package: "Arti")
+                .product(name: "Tor", package: "Arti"),
+                .product(name: "SwiftDilithium", package: "SwiftDilithium"),
+                .product(name: "BigInt", package: "BigInt"),
+                .product(name: "Digest", package: "Digest")
                 // XMTP is linked via CocoaPods, not SPM
             ],
             path: "bitchat",

@@ -32,6 +32,8 @@ struct TransactionTrayView: View {
         case 11155111: return "Sepolia (Testnet)"
         case 8453: return "Base"
         case 84532: return "Base Sepolia"
+        case 42161: return "Arbitrum"
+        case 421614: return "Arbitrum Sepolia (Testnet)"
         default: return "Chain \(chainId)"
         }
     }

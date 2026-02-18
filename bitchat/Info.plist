@@ -58,6 +58,8 @@
 	</array>
 	<key>NAMESTONE_API_KEY</key>
 	<string>$(NAMESTONE_API_KEY)</string>
+	<key>PIMLICO_API_KEY</key>
+	<string>$(PIMLICO_API_KEY)</string>
 	<key>XMTP_UPLOAD_ENDPOINT</key>
 	<string>$(XMTP_UPLOAD_ENDPOINT)</string>
 	<key>XMTP_UPLOAD_BEARER_TOKEN</key>

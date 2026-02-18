@@ -302,6 +302,8 @@ struct TransactionDetailView: View {
         case 1: return "Ethereum Mainnet"
         case 11155111: return "Sepolia Testnet"
         case 8453: return "Base"
+        case 42161: return "Arbitrum"
+        case 421614: return "Arbitrum Sepolia Testnet"
         default: return "Chain \(transaction.chainId)"
         }
     }
@@ -315,6 +317,10 @@ struct TransactionDetailView: View {
             return URL(string: "https://sepolia.etherscan.io/tx/\(hash)")
         case 8453:
             return URL(string: "https://basescan.org/tx/\(hash)")
+        case 42161:
+            return URL(string: "https://arbiscan.io/tx/\(hash)")
+        case 421614:
+            return URL(string: "https://sepolia.arbiscan.io/tx/\(hash)")
         default:
             return nil
         }
