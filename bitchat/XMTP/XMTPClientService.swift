@@ -73,6 +73,7 @@ final class XMTPClientService: ObservableObject {
     deinit {
         streamTask?.cancel()
         conversationStreamTask?.cancel()
+        periodicSyncTask?.cancel()
     }
     
     // MARK: - Client Lifecycle
@@ -124,6 +125,7 @@ final class XMTPClientService: ObservableObject {
         // Start message and conversation streaming
         startMessageStream()
         startConversationStream()
+        startPeriodicSync()
     }
     
     /// Disconnect and cleanup
@@ -132,6 +134,8 @@ final class XMTPClientService: ObservableObject {
         streamTask = nil
         conversationStreamTask?.cancel()
         conversationStreamTask = nil
+        periodicSyncTask?.cancel()
+        periodicSyncTask = nil
         client = nil
         isConnected = false
         inboxId = nil
@@ -360,6 +364,11 @@ final class XMTPClientService: ObservableObject {
     
     // MARK: - Message Streaming
     
+    /// Maximum backoff delay for stream reconnection (60 seconds)
+    private static let maxReconnectDelay: UInt64 = 60_000_000_000
+    /// Periodic sync interval (90 seconds) to catch any missed messages
+    private var periodicSyncTask: Task<Void, Never>?
+    
     private func startMessageStream() {
         guard let client = client else { return }
         
@@ -367,15 +376,25 @@ final class XMTPClientService: ObservableObject {
         
         streamTask = Task { [weak self] in
             guard let self = self else { return }
+            var backoff: UInt64 = 2_000_000_000 // Start at 2 seconds
             
-            do {
-                // Stream from both .allowed and .unknown so new inbound DMs are received
-                for try await message in await client.conversations.streamAllMessages(consentStates: [.allowed, .unknown]) {
-                    await self.handleIncomingMessage(message)
-                }
-            } catch {
-                if !Task.isCancelled {
-                    SecureLogger.error("XMTP stream error: \(error.localizedDescription)", category: .network)
+            while !Task.isCancelled {
+                do {
+                    backoff = 2_000_000_000 // Reset backoff on successful connection
+                    SecureLogger.debug("📡 XMTP message stream starting…", category: .network)
+                    // Stream from both .allowed and .unknown so new inbound DMs are received
+                    for try await message in await client.conversations.streamAllMessages(consentStates: [.allowed, .unknown]) {
+                        await self.handleIncomingMessage(message)
+                    }
+                    // Stream ended cleanly (server closed) — reconnect
+                    if !Task.isCancelled {
+                        SecureLogger.info("📡 XMTP message stream ended, reconnecting…", category: .network)
+                    }
+                } catch {
+                    if Task.isCancelled { return }
+                    SecureLogger.error("XMTP stream error: \(error.localizedDescription) — retrying in \(backoff / 1_000_000_000)s", category: .network)
+                    try? await Task.sleep(nanoseconds: backoff)
+                    backoff = min(backoff * 2, Self.maxReconnectDelay)
                 }
             }
         }
@@ -389,21 +408,47 @@ final class XMTPClientService: ObservableObject {
         
         conversationStreamTask = Task { [weak self] in
             guard let self = self else { return }
+            var backoff: UInt64 = 2_000_000_000
             
-            do {
-                for try await conversation in try await client.conversations.stream() {
-                    // Auto-allow new incoming DMs so messages flow through the stream
-                    if case .dm(let dm) = conversation {
-                        let peerInboxId = try dm.peerInboxId
-                        try? await client.preferences.setConsentState(
-                            entries: [ConsentRecord(value: peerInboxId, entryType: .inbox_id, consentType: .allowed)]
-                        )
-                        SecureLogger.info("📬 New XMTP conversation auto-allowed: \(peerInboxId.prefix(8))…", category: .network)
+            while !Task.isCancelled {
+                do {
+                    backoff = 2_000_000_000
+                    SecureLogger.debug("📡 XMTP conversation stream starting…", category: .network)
+                    for try await conversation in try await client.conversations.stream() {
+                        // Auto-allow new incoming DMs so messages flow through the stream
+                        if case .dm(let dm) = conversation {
+                            let peerInboxId = try dm.peerInboxId
+                            try? await client.preferences.setConsentState(
+                                entries: [ConsentRecord(value: peerInboxId, entryType: .inbox_id, consentType: .allowed)]
+                            )
+                            SecureLogger.info("📬 New XMTP conversation auto-allowed: \(peerInboxId.prefix(8))…", category: .network)
+                        }
                     }
+                    if !Task.isCancelled {
+                        SecureLogger.info("📡 XMTP conversation stream ended, reconnecting…", category: .network)
+                    }
+                } catch {
+                    if Task.isCancelled { return }
+                    SecureLogger.error("XMTP conversation stream error: \(error.localizedDescription) — retrying in \(backoff / 1_000_000_000)s", category: .network)
+                    try? await Task.sleep(nanoseconds: backoff)
+                    backoff = min(backoff * 2, Self.maxReconnectDelay)
                 }
-            } catch {
-                if !Task.isCancelled {
-                    SecureLogger.error("XMTP conversation stream error: \(error.localizedDescription)", category: .network)
+            }
+        }
+    }
+    
+    /// Start periodic sync to catch messages missed during stream drops
+    private func startPeriodicSync() {
+        periodicSyncTask?.cancel()
+        
+        periodicSyncTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 90_000_000_000) // 90 seconds
+                guard !Task.isCancelled, let self = self else { return }
+                do {
+                    try await self.syncAll()
+                } catch {
+                    SecureLogger.debug("Periodic XMTP sync failed: \(error.localizedDescription)", category: .network)
                 }
             }
         }
@@ -493,6 +538,34 @@ final class XMTPClientService: ObservableObject {
     }
     
     // MARK: - User Consent
+    
+    /// Get wallet addresses associated with an inbox ID via XMTP identity lookup
+    func getWalletAddresses(for inboxId: String) async throws -> [String] {
+        guard let client = client else {
+            throw XMTPClientError.notConnected
+        }
+        
+        let states = try await client.inboxStatesForInboxIds(refreshFromNetwork: true, inboxIds: [inboxId])
+        guard let state = states.first else { return [] }
+        
+        return state.identities.map { $0.identifier }
+    }
+    
+    /// Resolve the .dstealth.eth name for an inbox ID (if registered)
+    func resolveDstealthName(for inboxId: String) async -> String? {
+        do {
+            let addresses = try await getWalletAddresses(for: inboxId)
+            for address in addresses {
+                let records = try await NamestoneService.shared.getNames(address: address)
+                if let record = records.first {
+                    return record.fullName
+                }
+            }
+        } catch {
+            SecureLogger.debug("Failed to resolve .dstealth.eth for \(inboxId.prefix(8))…: \(error.localizedDescription)", category: .network)
+        }
+        return nil
+    }
     
     /// Allow a contact
     func allowContact(_ inboxId: String) async throws {
@@ -778,11 +851,26 @@ extension XMTPClientService {
         guard peerID.isXMTPDM else { return }
         let truncated = peerID.bare
         
-        // Look up full inbox ID
+        // If already saved, we can remove by matching truncated ID directly
+        // This avoids the inboxIdMap lookup issue on app restart
+        if let existing = savedContacts.first(where: { $0.truncatedId == truncated }) {
+            removeContact(existing.id)
+            return
+        }
+        
+        // For adding: try inboxIdMap first, then extract from peerID.id
         if let fullId = inboxIdMap[truncated] {
-            toggleContact(fullId)
+            saveContact(fullId)
         } else {
-            SecureLogger.warning("Cannot toggle XMTP contact - inbox ID not in map: \(truncated)", category: .network)
+            // PeerID.id is formatted as "xmtp_<fullInboxId>"
+            let fullId = peerID.id.hasPrefix("xmtp_") ? String(peerID.id.dropFirst(5)) : peerID.id
+            if !fullId.isEmpty {
+                // Populate the map for future lookups
+                storeInboxIdMapping(fullInboxId: fullId)
+                saveContact(fullId)
+            } else {
+                SecureLogger.warning("Cannot toggle XMTP contact - inbox ID not resolvable: \(truncated)", category: .network)
+            }
         }
     }
     

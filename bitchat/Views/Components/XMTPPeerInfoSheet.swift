@@ -15,6 +15,9 @@ struct XMTPPeerInfoSheet: View {
     @Environment(\.colorScheme) private var colorScheme
     @State private var isLoading = true
     @State private var fullInboxIdLoaded: String?
+    @State private var resolvedDstealthName: String?
+    @State private var isResolvingName = false
+    @State private var copiedField: String?
     
     private var backgroundColor: Color {
         colorScheme == .dark ? Color.black : Color.white
@@ -72,6 +75,41 @@ struct XMTPPeerInfoSheet: View {
                         .font(.bitchatSystem(size: 20, weight: .semibold, design: .monospaced))
                         .foregroundColor(textColor)
                     
+                    if let dstealthName = resolvedDstealthName {
+                        HStack(spacing: 6) {
+                            Text(dstealthName)
+                                .font(.bitchatSystem(size: 14, design: .monospaced))
+                                .foregroundColor(xmtpOrange)
+                            
+                            Button(action: {
+                                #if os(iOS)
+                                UIPasteboard.general.string = dstealthName
+                                #else
+                                let pb = NSPasteboard.general
+                                pb.clearContents()
+                                pb.setString(dstealthName, forType: .string)
+                                #endif
+                                withAnimation { copiedField = "dstealth" }
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                                    withAnimation { copiedField = nil }
+                                }
+                            }) {
+                                Image(systemName: copiedField == "dstealth" ? "checkmark" : "doc.on.doc")
+                                    .font(.bitchatSystem(size: 12))
+                                    .foregroundColor(copiedField == "dstealth" ? .green : .secondary)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    } else if isResolvingName {
+                        HStack(spacing: 6) {
+                            ProgressView()
+                                .scaleEffect(0.6)
+                            Text("Resolving name…")
+                                .font(.bitchatSystem(size: 11))
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    
                     if savedContact != nil {
                         Label("Saved Contact", systemImage: "star.fill")
                             .font(.bitchatSystem(size: 12))
@@ -81,6 +119,16 @@ struct XMTPPeerInfoSheet: View {
                 
                 // Info Cards
                 VStack(spacing: 12) {
+                    // .dstealth.eth name
+                    if let dstealthName = resolvedDstealthName {
+                        infoCard(
+                            title: "ENS Name",
+                            value: dstealthName,
+                            icon: "at",
+                            copyable: true
+                        )
+                    }
+                    
                     // Inbox ID
                     infoCard(
                         title: "XMTP Inbox ID",
@@ -154,6 +202,7 @@ struct XMTPPeerInfoSheet: View {
         // Check if already loaded
         if xmtpContainer.clientService.inboxIdMap[truncated] != nil {
             isLoading = false
+            resolveDstealthName()
             return
         }
         
@@ -175,6 +224,20 @@ struct XMTPPeerInfoSheet: View {
                     self.fullInboxIdLoaded = fullId
                     self.isLoading = false
                 }
+            }
+            resolveDstealthName()
+        }
+    }
+    
+    private func resolveDstealthName() {
+        guard let inboxId = fullInboxId else { return }
+        isResolvingName = true
+        
+        Task {
+            let name = await xmtpContainer.clientService.resolveDstealthName(for: inboxId)
+            await MainActor.run {
+                self.resolvedDstealthName = name
+                self.isResolvingName = false
             }
         }
     }

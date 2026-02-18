@@ -74,6 +74,13 @@ struct SendTransactionView: View {
     @State private var showingConfirmation = false
     @State private var isOnline = true
     
+    // ENS resolution
+    @State private var resolvedAddress: String?
+    @State private var resolvedENSName: String?
+    @State private var isResolvingENS = false
+    @State private var ensError: String?
+    @State private var ensResolveTask: Task<Void, Never>?
+    
     // Gas settings
     @State private var selectedGasSpeed: GasSpeed = .average
     @State private var customPriorityFee: String = "1.5"
@@ -98,11 +105,22 @@ struct SendTransactionView: View {
     }
     
     private var isValidAddress: Bool {
-        recipientAddress.hasPrefix("0x") && recipientAddress.count == 42
+        let addr = effectiveRecipientAddress
+        return addr.hasPrefix("0x") && addr.count == 42
+    }
+    
+    /// Whether the input looks like an ENS name
+    private var isENSInput: Bool {
+        ENSResolver.looksLikeENSName(recipientAddress)
+    }
+    
+    /// The actual address to use for the transaction (resolved or raw)
+    private var effectiveRecipientAddress: String {
+        resolvedAddress ?? recipientAddress
     }
     
     private var canSend: Bool {
-        isValidAddress && amountInWei != nil && (amountInWei ?? 0) > 0 && submittedTxId == nil
+        isValidAddress && amountInWei != nil && (amountInWei ?? 0) > 0 && submittedTxId == nil && !isResolvingENS
     }
     
     /// Get current network's balance
@@ -157,12 +175,36 @@ struct SendTransactionView: View {
         NavigationStack {
             Form {
                 Section {
-                    TextField("Recipient Address (0x...)", text: $recipientAddress)
+                    TextField("Address (0x...) or name.dstealth.eth", text: $recipientAddress)
                         .font(.system(.body, design: .monospaced))
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
+                        .onChange(of: recipientAddress) { newValue in
+                            resolveENSIfNeeded(newValue)
+                        }
                     
-                    if !recipientAddress.isEmpty && !isValidAddress {
+                    if isResolvingENS {
+                        HStack(spacing: 6) {
+                            ProgressView()
+                                .scaleEffect(0.7)
+                            Text("Resolving \(recipientAddress)…")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    } else if let resolved = resolvedAddress, let ensName = resolvedENSName {
+                        HStack(spacing: 4) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundColor(.green)
+                                .font(.caption)
+                            Text("\(ensName) → \(resolved.prefix(6))…\(resolved.suffix(4))")
+                                .font(.caption)
+                                .foregroundColor(.green)
+                        }
+                    } else if let ensErr = ensError {
+                        Text(ensErr)
+                            .font(.caption)
+                            .foregroundColor(.red)
+                    } else if !recipientAddress.isEmpty && !isValidAddress && !isENSInput {
                         Text("Invalid address format")
                             .font(.caption)
                             .foregroundColor(.red)
@@ -421,10 +463,11 @@ struct SendTransactionView: View {
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
+                let displayRecipient = resolvedENSName ?? String(effectiveRecipientAddress.prefix(10)) + "..."
                 if isOnline {
-                    Text("Send \(amount) ETH to \(recipientAddress.prefix(10))...?\n\nThis will sign and broadcast the transaction immediately.")
+                    Text("Send \(amount) ETH to \(displayRecipient)?\n\nThis will sign and broadcast the transaction immediately.")
                 } else {
-                    Text("Send \(amount) ETH to \(recipientAddress.prefix(10))...?\n\nThis will sign the transaction locally and queue it for mesh relay when connectivity is available.")
+                    Text("Send \(amount) ETH to \(displayRecipient)?\n\nThis will sign the transaction locally and queue it for mesh relay when connectivity is available.")
                 }
             }
         }
@@ -448,7 +491,7 @@ struct SendTransactionView: View {
             let myAddress = try await wallet.getAddress()
             
             let requestId = try await signer.signAndQueueTransfer(
-                to: recipientAddress,
+                to: effectiveRecipientAddress,
                 amountWei: wei,
                 maxPriorityFeePerGas: priorityFeeWei,
                 maxFeePerGas: maxFeeWei,
@@ -524,6 +567,51 @@ struct SendTransactionView: View {
             }
         } catch {
             isOnline = false
+        }
+    }
+    
+    // MARK: - ENS Resolution
+    
+    /// Resolve an ENS name to an address with debounce
+    private func resolveENSIfNeeded(_ input: String) {
+        // Cancel any in-flight resolution
+        ensResolveTask?.cancel()
+        resolvedAddress = nil
+        resolvedENSName = nil
+        ensError = nil
+        
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        // Only resolve if it looks like an ENS name
+        guard ENSResolver.looksLikeENSName(trimmed) else {
+            isResolvingENS = false
+            return
+        }
+        
+        // Debounce: wait 500ms after the user stops typing
+        isResolvingENS = true
+        ensResolveTask = Task {
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            guard !Task.isCancelled else { return }
+            
+            do {
+                let resolution = try await ENSResolver.shared.resolve(trimmed)
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    resolvedAddress = resolution.address
+                    resolvedENSName = trimmed
+                    isResolvingENS = false
+                    ensError = nil
+                }
+            } catch {
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    resolvedAddress = nil
+                    resolvedENSName = nil
+                    isResolvingENS = false
+                    ensError = "Could not resolve \(trimmed)"
+                }
+            }
         }
     }
 }
