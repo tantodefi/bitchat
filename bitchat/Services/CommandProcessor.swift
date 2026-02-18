@@ -409,7 +409,7 @@ final class CommandProcessor {
         }
         
         // Check if it's an ENS name
-        if input.contains(".eth") {
+        if ENSResolver.looksLikeENSName(input) {
             return resolveENSAndStartDM(ensName: input)
         }
         

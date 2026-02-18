@@ -45,13 +45,13 @@ actor ENSResolver {
         
         // Route based on domain
         let resolution: ENSResolution
-        
+
         if name.hasSuffix(".dstealth.eth") {
             resolution = try await resolveViaNamestone(name)
         } else if name.hasSuffix(".base.eth") {
-            resolution = try await resolveViaBasename(name)
+            resolution = try await resolveViaAnyETH(name, includeBasenameProvider: true)
         } else if name.hasSuffix(".eth") {
-            resolution = try await resolveViaENS(name)
+            resolution = try await resolveViaAnyETH(name, includeBasenameProvider: false)
         } else {
             throw ENSError.unsupportedDomain
         }
@@ -73,6 +73,78 @@ actor ENSResolver {
         return name.hasSuffix(".dstealth.eth") ||
                name.hasSuffix(".base.eth") ||
                name.hasSuffix(".eth")
+    }
+
+    /// Nonisolated helper for quick ENS input validation from UI/commands
+    nonisolated static func looksLikeENSName(_ input: String) -> Bool {
+        input.lowercased().trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix(".eth")
+    }
+
+    // MARK: - Generic ETH Name Resolution
+
+    /// Resolve any *.eth name and merge Namestone XMTP records with address providers.
+    private func resolveViaAnyETH(_ name: String, includeBasenameProvider: Bool) async throws -> ENSResolution {
+        var namestoneRecord: NamestoneRecord?
+        do {
+            namestoneRecord = try await NamestoneService.shared.resolveName(fullName: name)
+        } catch {
+            // Optional provider; ignore and continue with onchain/public resolution.
+        }
+
+        let providerResolution = try await resolveAddressProviders(
+            name,
+            includeBasenameProvider: includeBasenameProvider
+        )
+
+        let resolvedAddress = providerResolution?.address ?? namestoneRecord?.address
+        guard let address = resolvedAddress, !address.isEmpty else {
+            throw ENSError.notFound
+        }
+
+        let resolvedInbox = namestoneRecord?.xmtpInboxId ?? providerResolution?.xmtpInboxId
+
+        return ENSResolution(
+            address: address,
+            xmtpInboxId: resolvedInbox,
+            fullName: name
+        )
+    }
+
+    /// Attempt address resolution from multiple providers.
+    private func resolveAddressProviders(
+        _ name: String,
+        includeBasenameProvider: Bool
+    ) async throws -> ENSResolution? {
+        var firstError: Error?
+
+        if includeBasenameProvider {
+            do {
+                return try await resolveViaBasename(name)
+            } catch {
+                firstError = firstError ?? error
+            }
+        }
+
+        do {
+            return try await resolveViaENSIdeas(name)
+        } catch {
+            firstError = firstError ?? error
+        }
+
+        do {
+            return try await resolveViaWeb3Bio(name)
+        } catch {
+            firstError = firstError ?? error
+        }
+
+        if let firstError {
+            if let ensError = firstError as? ENSError {
+                throw ensError
+            }
+            throw ENSError.networkError
+        }
+
+        return nil
     }
     
     // MARK: - Namestone Resolution (.dstealth.eth)
@@ -113,61 +185,38 @@ actor ENSResolver {
         request.httpMethod = "GET"
         request.addValue("application/json", forHTTPHeaderField: "Accept")
         
-        do {
-            let (data, response) = try await URLSession.shared.data(for: request)
-            
-            guard let httpResponse = response as? HTTPURLResponse else {
-                throw ENSError.networkError
-            }
-            
-            if httpResponse.statusCode == 404 {
-                throw ENSError.notFound
-            }
-            
-            guard httpResponse.statusCode == 200 else {
-                throw ENSError.networkError
-            }
-            
-            let result = try JSONDecoder().decode(BasenameResponse.self, from: data)
-            
-            guard let address = result.address, !address.isEmpty else {
-                throw ENSError.notFound
-            }
-            
-            return ENSResolution(
-                address: address,
-                xmtpInboxId: result.textRecords?["com.xmtp.inbox"],
-                fullName: name
-            )
-        } catch let error as ENSError {
-            throw error
-        } catch {
-            // Fallback: Try ENS Ideas API which supports Base names
-            return try await resolveViaENSIdeas(name)
+        let (data, response) = try await URLSession.shared.data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw ENSError.networkError
         }
+
+        if httpResponse.statusCode == 404 {
+            throw ENSError.notFound
+        }
+
+        guard httpResponse.statusCode == 200 else {
+            throw ENSError.networkError
+        }
+
+        let result = try JSONDecoder().decode(BasenameResponse.self, from: data)
+
+        guard let address = result.address, !address.isEmpty else {
+            throw ENSError.notFound
+        }
+
+        return ENSResolution(
+            address: address,
+            xmtpInboxId: result.textRecords?["com.xmtp.inbox"],
+            fullName: name
+        )
     }
     
     // MARK: - Standard ENS Resolution (.eth)
     
     private func resolveViaENS(_ name: String) async throws -> ENSResolution {
-        // Try multiple resolution methods in order of preference
-        
-        // 1. Try ENS Ideas API (fast, reliable)
-        do {
-            return try await resolveViaENSIdeas(name)
-        } catch {
-            // Fall through to next method
-        }
-        
-        // 2. Try Cloudflare ENS gateway
-        do {
-            return try await resolveViaCloudflare(name)
-        } catch {
-            // Fall through
-        }
-        
-        // 3. Final fallback: 1RPC ENS endpoint
-        return try await resolveVia1RPC(name)
+        // Maintained for compatibility with older call sites.
+        return try await resolveViaAnyETH(name, includeBasenameProvider: false)
     }
     
     // MARK: - Resolution Providers
@@ -202,6 +251,49 @@ actor ENSResolver {
             xmtpInboxId: nil, // ENS Ideas doesn't return text records
             fullName: name
         )
+    }
+
+    /// Resolve via web3.bio profile API (supports ENS + Basenames)
+    private func resolveViaWeb3Bio(_ name: String) async throws -> ENSResolution {
+        let encodedName = name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? name
+
+        guard let url = URL(string: "https://api.web3.bio/profile/\(encodedName)") else {
+            throw ENSError.invalidRequest
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 10
+        request.addValue("application/json", forHTTPHeaderField: "Accept")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 200 else {
+            throw ENSError.networkError
+        }
+
+        let profiles = try JSONDecoder().decode([Web3BioProfile].self, from: data)
+
+        if let exact = profiles.first(where: { profile in
+            profile.identity.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == name
+        }), !exact.address.isEmpty {
+            return ENSResolution(
+                address: exact.address,
+                xmtpInboxId: nil,
+                fullName: name
+            )
+        }
+
+        if let first = profiles.first(where: { !$0.address.isEmpty }) {
+            return ENSResolution(
+                address: first.address,
+                xmtpInboxId: nil,
+                fullName: name
+            )
+        }
+
+        throw ENSError.notFound
     }
     
     /// Resolve via Cloudflare ENS gateway (using eth.limo)
@@ -395,6 +487,11 @@ private struct RPCResponse: Codable {
 private struct RPCError: Codable {
     let code: Int?
     let message: String?
+}
+
+private struct Web3BioProfile: Codable {
+    let address: String
+    let identity: String
 }
 
 // MARK: - Errors

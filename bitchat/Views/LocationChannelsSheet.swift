@@ -626,7 +626,7 @@ extension LocationChannelsSheet {
         }
         
         // Check if it's an ENS name
-        if trimmed.contains(".eth") {
+        if ENSResolver.looksLikeENSName(trimmed) {
             // Resolve ENS and start chat
             Task {
                 do {

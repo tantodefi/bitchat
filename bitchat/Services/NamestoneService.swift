@@ -124,12 +124,17 @@ actor NamestoneService {
     /// Search for a name to check availability
     /// - Parameters:
     ///   - name: Name to search for
+    ///   - domain: ENS domain to search within
     ///   - exactMatch: If true, only return exact matches
     /// - Returns: Array of matching names (empty if available)
-    func searchName(name: String, exactMatch: Bool = false) async throws -> [NamestoneRecord] {
+    func searchName(
+        name: String,
+        domain: String,
+        exactMatch: Bool = false
+    ) async throws -> [NamestoneRecord] {
         // Search endpoint doesn't require auth for public names
         var params = [
-            "domain": domain,
+            "domain": domain.lowercased(),
             "name": name.lowercased()
         ]
         
@@ -138,6 +143,37 @@ actor NamestoneService {
         }
         
         return try await get(endpoint: "search-names", params: params)
+    }
+
+    /// Search for a name in the default dstealth.eth domain
+    /// - Parameters:
+    ///   - name: Name to search for
+    ///   - exactMatch: If true, only return exact matches
+    /// - Returns: Array of matching names (empty if available)
+    func searchName(name: String, exactMatch: Bool = false) async throws -> [NamestoneRecord] {
+        try await searchName(name: name, domain: domain, exactMatch: exactMatch)
+    }
+
+    /// Resolve a full ENS name via Namestone exact search
+    /// - Parameter fullName: Full ENS name like "alice.base.eth"
+    /// - Returns: Matching record if found
+    func resolveName(fullName: String) async throws -> NamestoneRecord? {
+        let normalized = fullName.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        let labels = normalized.split(separator: ".").map(String.init)
+
+        guard labels.count >= 3 else {
+            return nil
+        }
+
+        let name = labels.first ?? ""
+        let domain = labels.dropFirst().joined(separator: ".")
+
+        guard !name.isEmpty, !domain.isEmpty else {
+            return nil
+        }
+
+        let records = try await searchName(name: name, domain: domain, exactMatch: true)
+        return records.first(where: { $0.fullName.caseInsensitiveCompare(normalized) == .orderedSame })
     }
     
     /// Check if a name is available for registration
