@@ -27,6 +27,7 @@ actor PQTransactionSigner {
     private let chainId: UInt64
     
     private var _accountAddress: String?
+    private var _cachedExpandedPQKey: Data?
     
     init(
         wallet: EmbeddedWallet,
@@ -42,6 +43,29 @@ actor PQTransactionSigner {
         self.chainId = chainId
     }
     
+    // MARK: - Key Helpers
+    
+    /// Get the EOA address as raw 20-byte Data for the factory's `preQuantumPubKey` parameter.
+    /// The ZKNOX mldsa_k1 factory expects the Ethereum address (20 bytes), NOT the public key.
+    private func getPreQuantumKeyForFactory() async throws -> Data {
+        let address = try await wallet.getAddress()
+        let hex = address.hasPrefix("0x") ? String(address.dropFirst(2)) : address
+        return ABIEncoder.hexToData(hex)
+    }
+    
+    /// Get the expanded ML-DSA-44 public key (~22KB) for the factory's `postQuantumPubKey` parameter.
+    /// The factory expects the fully expanded key (Â-hat matrix + tr + t1), NOT the raw 1312-byte key.
+    private func getPostQuantumKeyForFactory() async throws -> Data {
+        if let cached = _cachedExpandedPQKey {
+            return cached
+        }
+        let pk = try await pqKeyManager.getPublicKey()
+        let expanded = try MLDSAKeyExpander.toExpandedEncodedBytes(publicKey: pk.keyBytes)
+        _cachedExpandedPQKey = expanded
+        SecureLogger.info("PQ key expanded: \(pk.keyBytes.count) → \(expanded.count) bytes", category: .session)
+        return expanded
+    }
+    
     // MARK: - Account Address
     
     /// Get or compute the PQ account address (counterfactual if not deployed).
@@ -50,16 +74,14 @@ actor PQTransactionSigner {
             return cached
         }
         
-        // Get ECDSA public key from wallet
-        let ecdsaPubKey = try await wallet.getPublicKey()
-        
-        // Get ML-DSA-44 public key
-        let pqPubKey = try await pqKeyManager.getPublicKey()
+        // Get factory-compatible key formats
+        let preQKey = try await getPreQuantumKeyForFactory()
+        let postQKey = try await getPostQuantumKeyForFactory()
         
         // Compute counterfactual address
         let address = try await deployer.getAddress(
-            preQuantumPubKey: ecdsaPubKey,
-            postQuantumPubKey: Data(pqPubKey.keyBytes)
+            preQuantumPubKey: preQKey,
+            postQuantumPubKey: postQKey
         )
         
         _accountAddress = address
@@ -95,11 +117,11 @@ actor PQTransactionSigner {
         // Build initCode if not deployed
         var initCode = Data()
         if !deployed {
-            let ecdsaPubKey = try await wallet.getPublicKey()
-            let pqPubKey = try await pqKeyManager.getPublicKey()
+            let preQKey = try await getPreQuantumKeyForFactory()
+            let postQKey = try await getPostQuantumKeyForFactory()
             initCode = await deployer.buildInitCode(
-                preQuantumPubKey: ecdsaPubKey,
-                postQuantumPubKey: Data(pqPubKey.keyBytes)
+                preQuantumPubKey: preQKey,
+                postQuantumPubKey: postQKey
             )
         }
         
@@ -201,15 +223,15 @@ actor PQTransactionSigner {
             throw DeployerError.accountAlreadyDeployed(sender)
         }
         
-        let ecdsaPubKey = try await wallet.getPublicKey()
-        let pqPubKey = try await pqKeyManager.getPublicKey()
+        let preQKey = try await getPreQuantumKeyForFactory()
+        let postQKey = try await getPostQuantumKeyForFactory()
         let eoaAddress = try await wallet.getAddress()
         let nonce = try await deployer.getNonce(address: eoaAddress)
         
         let signedTx = try await deployer.buildDeployTransaction(
             wallet: wallet,
-            preQuantumPubKey: ecdsaPubKey,
-            postQuantumPubKey: Data(pqPubKey.keyBytes),
+            preQuantumPubKey: preQKey,
+            postQuantumPubKey: postQKey,
             nonce: nonce
         )
         

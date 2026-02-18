@@ -68,6 +68,7 @@ struct ContentView: View {
     @State private var showSettings = false
     @State private var showXMTPPeerInfo = false
     @State private var showWalletQRScanner = false
+    @State private var resolvedXMTPHeaderNames: [String: String] = [:]  // truncatedId -> ENS name
     @State private var recordingStartDate: Date?
 #if os(iOS)
     @State private var showImagePicker = false
@@ -1226,9 +1227,16 @@ struct ContentView: View {
             // Check for XMTP contact with saved nickname
             if privatePeerID.isXMTPDM {
                 let truncated = privatePeerID.bare
-                if let contact = xmtpContainer.clientService.savedContacts.first(where: { $0.truncatedId == truncated }) {
-                    return contact.displayName
+                if let contact = xmtpContainer.clientService.savedContacts.first(where: { $0.truncatedId == truncated }),
+                   let nick = contact.nickname, !nick.isEmpty {
+                    return nick
                 }
+                // Show resolved ENS name if available
+                if let ensName = resolvedXMTPHeaderNames[truncated] {
+                    return ensName
+                }
+                // Trigger async resolution if needed
+                resolveXMTPHeaderName(truncated: truncated)
                 // Show shortened inbox ID for unsaved XMTP contacts
                 return "XMTP:\(truncated.prefix(8))…"
             }
@@ -1271,6 +1279,19 @@ struct ContentView: View {
             displayName: displayName,
             isNostrAvailable: isNostrAvailable
         )
+    }
+    
+    /// Resolve ENS name for an XMTP peer's truncated inbox ID (used in chat header)
+    private func resolveXMTPHeaderName(truncated: String) {
+        guard resolvedXMTPHeaderNames[truncated] == nil else { return }
+        guard let fullId = xmtpContainer.clientService.inboxIdMap[truncated] else { return }
+        Task {
+            if let name = await xmtpContainer.clientService.resolveDstealthName(for: fullId) {
+                await MainActor.run {
+                    resolvedXMTPHeaderNames[truncated] = name
+                }
+            }
+        }
     }
 
     // Compute channel-aware people count and color for toolbar (cross-platform)

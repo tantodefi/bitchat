@@ -176,15 +176,19 @@ struct XMTPPeerInfoSheet: View {
                         .font(.bitchatSystem(size: 20, weight: .semibold, design: .monospaced))
                         .foregroundColor(textColor)
                     
-                    Button(action: {
-                        editedNickname = savedContact?.nickname ?? ""
-                        isEditingNickname = true
-                    }) {
-                        Image(systemName: "pencil")
-                            .font(.bitchatSystem(size: 14))
-                            .foregroundColor(.secondary)
+                    // Only show pencil edit icon when displayName is not a resolved ENS name
+                    // (i.e. it's either a nickname or the XMTP:... fallback)
+                    if resolvedDstealthName == nil || (savedContact?.nickname != nil && !savedContact!.nickname!.isEmpty) {
+                        Button(action: {
+                            editedNickname = savedContact?.nickname ?? ""
+                            isEditingNickname = true
+                        }) {
+                            Image(systemName: "pencil")
+                                .font(.bitchatSystem(size: 14))
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
                 }
             }
             
@@ -400,14 +404,42 @@ struct XMTPPeerInfoSheet: View {
                 fullText: true
             )
             
-            if conversationType == .dm, let walletAddress = resolvedWalletAddress {
-                infoCard(
-                    title: "Wallet Address",
-                    value: walletAddress,
-                    icon: "wallet.bifold.fill",
-                    copyable: true,
-                    fullText: true
-                )
+            if conversationType == .dm {
+                if let walletAddress = resolvedWalletAddress {
+                    infoCard(
+                        title: "Wallet Address",
+                        value: walletAddress,
+                        icon: "wallet.bifold.fill",
+                        copyable: true,
+                        fullText: true
+                    )
+                } else {
+                    HStack(spacing: 12) {
+                        Image(systemName: "wallet.bifold.fill")
+                            .font(.bitchatSystem(size: 16))
+                            .foregroundColor(xmtpOrange)
+                            .frame(width: 24)
+                        
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Wallet Address")
+                                .font(.bitchatSystem(size: 10, weight: .medium))
+                                .foregroundColor(.secondary)
+                            
+                            HStack(spacing: 6) {
+                                ProgressView()
+                                    .scaleEffect(0.5)
+                                Text("Resolving...")
+                                    .font(.bitchatSystem(size: 11, design: .monospaced))
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        
+                        Spacer()
+                    }
+                    .padding(12)
+                    .background(colorScheme == .dark ? Color.white.opacity(0.05) : Color.black.opacity(0.05))
+                    .cornerRadius(8)
+                }
             }
             
             infoCard(title: "Peer ID", value: peerID.id, icon: "person.fill", copyable: true)
@@ -878,6 +910,7 @@ struct XMTPPeerInfoSheet: View {
                         .font(.bitchatSystem(size: 11, design: .monospaced))
                         .foregroundColor(textColor)
                         .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
                 } else {
                     Text(value)
                         .font(.bitchatSystem(size: 12, design: .monospaced))

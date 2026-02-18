@@ -227,14 +227,20 @@ final class PQAccountViewModel: ObservableObject {
             
             // Compute counterfactual address (same on all chains due to CREATE2)
             if let firstService = chainServices.values.first {
-                let ecdsaPubKey = try await wallet.getPublicKey()
+                // Factory expects ETH address (20 bytes) as preQuantumPubKey
+                let eoaAddress = try await wallet.getAddress()
+                let eoaHex = eoaAddress.hasPrefix("0x") ? String(eoaAddress.dropFirst(2)) : eoaAddress
+                let preQKey = ABIEncoder.hexToData(eoaHex)
+                
+                // Factory expects expanded ML-DSA key (~22KB) as postQuantumPubKey
+                let expandedPQKey = try MLDSAKeyExpander.toExpandedEncodedBytes(publicKey: pubKey.keyBytes)
                 
                 // Timeout the address computation (15s max)
                 let address: String? = try? await withThrowingTaskGroup(of: String.self) { group in
                     group.addTask {
                         try await firstService.deployer.getAddress(
-                            preQuantumPubKey: ecdsaPubKey,
-                            postQuantumPubKey: Data(pubKey.keyBytes)
+                            preQuantumPubKey: preQKey,
+                            postQuantumPubKey: expandedPQKey
                         )
                     }
                     group.addTask {

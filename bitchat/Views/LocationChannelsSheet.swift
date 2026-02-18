@@ -20,6 +20,7 @@ struct LocationChannelsSheet: View {
     @State private var isSyncing: Bool = false
     @State private var xmtpChatInput: String = ""
     @State private var xmtpInputError: String? = nil
+    @State private var resolvedENSNames: [String: String] = [:]  // inboxId/truncatedId -> ENS name
 
     private var backgroundColor: Color { colorScheme == .dark ? .black : .white }
 
@@ -779,7 +780,14 @@ extension LocationChannelsSheet {
                     .font(.bitchatSystem(size: 10))
                     .foregroundColor(xmtpOrange)
                 
-                Text(contact.displayName)
+                // Priority: nickname > ENS name > truncated ID
+                let name: String = {
+                    if let nick = contact.nickname, !nick.isEmpty { return nick }
+                    if let ens = resolvedENSNames[contact.id] ?? resolvedENSNames[contact.truncatedId] { return ens }
+                    return contact.displayName
+                }()
+                
+                Text(name)
                     .font(.bitchatSystem(size: 12, design: .monospaced))
                     .foregroundColor(.primary)
                 
@@ -795,10 +803,12 @@ extension LocationChannelsSheet {
             .padding(.vertical, 6)
         }
         .buttonStyle(.plain)
+        .onAppear { resolveENSNameIfNeeded(for: contact.id) }
     }
     
     private func xmtpPeerRow(_ peerID: PeerID) -> some View {
-        Button(action: {
+        let truncated = peerID.bare
+        return Button(action: {
             viewModel.selectedPrivateChatPeer = peerID
             isPresented = false
         }) {
@@ -807,7 +817,10 @@ extension LocationChannelsSheet {
                     .font(.bitchatSystem(size: 10))
                     .foregroundColor(.secondary)
                 
-                Text("XMTP:\(peerID.bare.prefix(8))…")
+                // Show ENS name if resolved, otherwise truncated ID
+                let name = resolvedENSNames[truncated] ?? "XMTP:\(truncated.prefix(8))…"
+                
+                Text(name)
                     .font(.bitchatSystem(size: 12, design: .monospaced))
                     .foregroundColor(.primary)
                 
@@ -823,6 +836,31 @@ extension LocationChannelsSheet {
             .padding(.vertical, 6)
         }
         .buttonStyle(.plain)
+        .onAppear { resolveENSNameIfNeeded(forTruncated: truncated) }
+    }
+    
+    private func resolveENSNameIfNeeded(for inboxId: String) {
+        guard resolvedENSNames[inboxId] == nil else { return }
+        Task {
+            if let name = await xmtpContainer.clientService.resolveDstealthName(for: inboxId) {
+                await MainActor.run {
+                    resolvedENSNames[inboxId] = name
+                }
+            }
+        }
+    }
+    
+    private func resolveENSNameIfNeeded(forTruncated truncated: String) {
+        guard resolvedENSNames[truncated] == nil else { return }
+        // Try to find the full inbox ID from the map
+        guard let fullId = xmtpContainer.clientService.inboxIdMap[truncated] else { return }
+        Task {
+            if let name = await xmtpContainer.clientService.resolveDstealthName(for: fullId) {
+                await MainActor.run {
+                    resolvedENSNames[truncated] = name
+                }
+            }
+        }
     }
     
     private var xmtpOrange: Color {

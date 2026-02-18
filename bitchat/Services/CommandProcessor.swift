@@ -86,6 +86,8 @@ final class CommandProcessor {
         let inGeoDM = contextProvider?.selectedPrivateChatPeer?.isGeoDM == true
 
         switch cmd {
+        case "/help":
+            return handleHelp(args)
         case "/m", "/msg":
             return handleMessage(args)
         case "/w", "/who":
@@ -106,6 +108,7 @@ final class CommandProcessor {
         case "/unfav":
             if inGeoPublic || inGeoDM { return .error(message: "favorites are only for mesh peers in #mesh") }
             return handleFavorite(args, add: false)
+        // XMTP commands (bitchat originals)
         case "/xmtp":
             return handleXMTPStatus()
         case "/dm-wallet":
@@ -118,13 +121,506 @@ final class CommandProcessor {
             return handleTxStatus()
         case "/wallet":
             return handleWalletStatus()
+        // ━━ XMTP CLI-compatible commands ━━
+        // Root
+        case "/xmtp-can-message":
+            return handleCanMessage(args)
+        // Client
+        case "/xmtp-client-info":
+            return handleXMTPStatus()   // alias for /xmtp
+        // Conversations (plural)
+        case "/xmtp-conversations-list":
+            return handleXMTPList()     // alias for /xmtp-list
+        case "/xmtp-conversations-create-dm":
+            return handleDMWallet(args) // alias for /dm-wallet
+        case "/xmtp-conversations-create-group":
+            return handleCreateGroup(args)
+        case "/xmtp-conversations-get":
+            return handleConversationsGet(args)
+        case "/xmtp-conversations-sync":
+            return handleConversationsLightSync()
+        case "/xmtp-conversations-sync-all":
+            return handleXMTPSync()     // alias for /xmtp-sync
+        // Conversation (singular)
+        case "/xmtp-conversation-send-text":
+            return handleConversationSendText(args)
+        case "/xmtp-conversation-messages":
+            return handleConversationMessages(args)
+        case "/xmtp-conversation-members":
+            return handleConversationMembers(args)
+        case "/xmtp-conversation-add-members":
+            return handleConversationAddMembers(args)
+        case "/xmtp-conversation-remove-members":
+            return handleConversationRemoveMembers(args)
+        case "/xmtp-conversation-consent-state":
+            return handleConversationConsentState(args)
+        case "/xmtp-conversation-update-consent":
+            return handleConversationUpdateConsent(args)
+        // Preferences
+        case "/xmtp-preferences-get-consent":
+            return handlePreferencesGetConsent(args)
+        case "/xmtp-preferences-set-consent":
+            return handlePreferencesSetConsent(args)
+        case "/xmtp-preferences-inbox-state":
+            return handlePreferencesInboxState(args)
+        case "/xmtp-preferences-sync":
+            return handlePreferencesSync()
         default:
-            return .error(message: "unknown command: \(cmd)")
+            return .error(message: "unknown command: \(cmd)\nType /help to see all commands.")
         }
     }
 
     // MARK: - Command Handlers
-    
+
+    private func handleHelp(_ args: String) -> CommandResult {
+        let topic = args.trimmingCharacters(in: .whitespaces).lowercased()
+            .replacingOccurrences(of: "/", with: "")
+
+        // Per-command detailed help
+        if !topic.isEmpty {
+            return helpForCommand(topic)
+        }
+
+        // First-time tutorial / general help
+        let tutorial = """
+        👋 Welcome to bitchat!
+
+        ━━ Quick Start ━━━━━━━━━━━━━━━━━━━━
+
+        💬 Try messaging someone via XMTP:
+          /dm-wallet anon3728.dstealth.eth
+          /dm-wallet bankr.base.eth
+          /dm-wallet xmtp-docs.eth
+
+        💰 Check your wallet:
+          /wallet
+
+        👀 See who's around:
+          /who
+
+        ━━ Mesh Commands ━━━━━━━━━━━━━━━━━━
+
+        /help [command]    show this help
+        /dm  <nickname>    private message a mesh peer
+        /who               list online peers
+        /block <nickname>  block a peer
+        /unblock <nick>    unblock a peer
+        /fav <nickname>    add to favorites
+        /unfav <nickname>  remove from favorites
+        /hug <nickname>    hug someone 🫂
+        /slap <nickname>   slap with a trout 🐟
+        /clear             clear current chat
+
+        ━━ XMTP Commands ━━━━━━━━━━━━━━━━━━
+
+        /dm-wallet <addr>                  DM via ENS/wallet/inbox
+        /xmtp                              connection status
+        /xmtp-list                         list conversations
+        /xmtp-sync                         sync all conversations
+        /wallet                            wallet balances
+        /tx                                pending transactions
+
+        ━━ XMTP CLI-Compatible ━━━━━━━━━━━━
+
+        /xmtp-can-message <addr>           check XMTP reachability
+        /xmtp-conversations-create-group   create a group
+        /xmtp-conversations-get <id>       get conversation details
+        /xmtp-conversations-sync           light sync
+        /xmtp-conversation-send-text       send to conversation
+        /xmtp-conversation-messages <id>   read messages
+        /xmtp-conversation-members <id>    list members
+        /xmtp-conversation-add-members     add to group
+        /xmtp-conversation-remove-members  remove from group
+        /xmtp-conversation-consent-state   get consent
+        /xmtp-conversation-update-consent  set consent
+        /xmtp-preferences-get-consent      get consent by entity
+        /xmtp-preferences-set-consent      set consent by entity
+        /xmtp-preferences-inbox-state      inbox details
+        /xmtp-preferences-sync             sync preferences
+
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        Tip: /help <command> for details.
+        """
+        return .success(message: tutorial)
+    }
+
+    private func helpForCommand(_ topic: String) -> CommandResult {
+        switch topic {
+        case "dm-wallet":
+            return .success(message: """
+            📖 /dm-wallet — Start an XMTP DM
+
+            Send encrypted messages to anyone with an XMTP identity,
+            using their ENS name, wallet address, or raw inbox ID.
+
+            Usage:
+              /dm-wallet alice.dstealth.eth   (ENS name)
+              /dm-wallet vitalik.eth          (ENS name)
+              /dm-wallet 0x1234…abcd          (42-char wallet)
+              /dm-wallet <64-char-hex>        (inbox ID)
+
+            Try it now:
+              /dm-wallet anon3728.dstealth.eth
+              /dm-wallet bankr.base.eth
+              /dm-wallet xmtp-docs.eth
+
+            Requires XMTP to be enabled in Settings.
+            """)
+        case "wallet":
+            return .success(message: """
+            📖 /wallet — Wallet Status
+
+            Shows your wallet balances across all configured networks
+            (Ethereum, Base, Arbitrum, or testnets).
+
+            Usage:
+              /wallet
+
+            Use the Wallet view to send/receive funds.
+            """)
+        case "tx":
+            return .success(message: """
+            📖 /tx — Pending Transactions
+
+            Lists transactions waiting to be confirmed or relayed.
+
+            Usage:
+              /tx
+            """)
+        case "dm", "msg", "m", "message":
+            return .success(message: """
+            📖 /dm — Private Mesh Message
+
+            Start a private chat with a nearby mesh peer, or send
+            a message directly.
+
+            Usage:
+              /dm @nickname            open private chat
+              /dm @nickname hey there  send & open chat
+
+            Also works as /msg or /m.
+            """)
+        case "who", "w":
+            return .success(message: """
+            📖 /who — Online Peers
+
+            Lists peers currently visible on your mesh network
+            or in the active geohash channel.
+
+            Usage:
+              /who
+
+            Also works as /w.
+            """)
+        case "block":
+            return .success(message: """
+            📖 /block — Block a Peer
+
+            Blocks a user so you no longer see their messages.
+            Works for both mesh and geohash peers.
+
+            Usage:
+              /block @nickname   block a peer
+              /block             list currently blocked peers
+            """)
+        case "unblock":
+            return .success(message: """
+            📖 /unblock — Unblock a Peer
+
+            Removes a block so you can see their messages again.
+
+            Usage:
+              /unblock @nickname
+            """)
+        case "fav", "favorite":
+            return .success(message: """
+            📖 /fav — Favorite a Peer
+
+            Adds a mesh peer to your favorites list. They'll get
+            a notification and appear with a ⭐ indicator.
+
+            Usage:
+              /fav @nickname
+
+            Only works for mesh peers in #mesh.
+            """)
+        case "unfav", "unfavorite":
+            return .success(message: """
+            📖 /unfav — Remove Favorite
+
+            Removes a peer from your favorites list.
+
+            Usage:
+              /unfav @nickname
+            """)
+        case "hug":
+            return .success(message: """
+            📖 /hug — Hug Someone 🫂
+
+            Send a hug emote to a peer in chat.
+
+            Usage:
+              /hug @nickname
+            """)
+        case "slap":
+            return .success(message: """
+            📖 /slap — Slap with a Trout 🐟
+
+            The classic IRC move. Slaps a peer with a large trout.
+
+            Usage:
+              /slap @nickname
+            """)
+        case "clear":
+            return .success(message: """
+            📖 /clear — Clear Chat
+
+            Clears messages in the current chat view (public
+            timeline or active private chat).
+
+            Usage:
+              /clear
+            """)
+        case "xmtp":
+            return .success(message: """
+            📖 /xmtp — XMTP Status
+
+            Shows your XMTP wallet address, inbox ID, and
+            connection status.
+
+            Usage:
+              /xmtp
+            """)
+        case "xmtp-sync":
+            return .success(message: """
+            📖 /xmtp-sync — Sync Conversations
+
+            Forces a sync of all XMTP conversations from the
+            network. Useful after reconnecting.
+
+            Usage:
+              /xmtp-sync
+            """)
+        case "xmtp-list":
+            return .success(message: """
+            📖 /xmtp-list — List Conversations
+
+            Lists your active XMTP conversations with peer
+            inbox IDs.
+
+            Usage:
+              /xmtp-list
+            """)
+        case "help":
+            return .success(message: """
+            📖 /help — Help & Tutorial
+
+            Shows all available commands and a quick-start guide.
+            Use /help <command> for detailed info on any command.
+
+            Usage:
+              /help            show all commands
+              /help dm-wallet  learn about /dm-wallet
+              /help wallet     learn about /wallet
+            """)
+        // ━━ XMTP CLI-compatible help entries ━━
+        case "xmtp-can-message":
+            return .success(message: """
+            📖 /xmtp-can-message — Check Reachability
+
+            Checks whether one or more addresses are reachable
+            over XMTP (have registered identities).
+
+            Usage:
+              /xmtp-can-message 0x1234…abcd
+              /xmtp-can-message alice.eth bob.eth
+            """)
+        case "xmtp-client-info":
+            return .success(message: """
+            📖 /xmtp-client-info — Client Info
+
+            Alias for /xmtp. Shows wallet, inbox ID, and
+            connection status.
+
+            Usage:
+              /xmtp-client-info
+            """)
+        case "xmtp-conversations-list":
+            return .success(message: """
+            📖 /xmtp-conversations-list — List Conversations
+
+            Alias for /xmtp-list. Lists active XMTP conversations.
+
+            Usage:
+              /xmtp-conversations-list
+            """)
+        case "xmtp-conversations-create-dm":
+            return .success(message: """
+            📖 /xmtp-conversations-create-dm — Create DM
+
+            Alias for /dm-wallet. Start a 1:1 XMTP DM.
+
+            Usage:
+              /xmtp-conversations-create-dm alice.eth
+              /xmtp-conversations-create-dm 0x1234…abcd
+            """)
+        case "xmtp-conversations-create-group":
+            return .success(message: """
+            📖 /xmtp-conversations-create-group — Create Group
+
+            Creates a new XMTP group conversation with one or
+            more members (wallet addresses or ENS names).
+
+            Usage:
+              /xmtp-conversations-create-group 0xAddr1 0xAddr2
+              /xmtp-conversations-create-group --name "Team" 0xAddr1
+
+            Options:
+              --name "Group Name"       set group name
+              --description "About"     set group description
+              --permissions admin       admin-only permissions
+            """)
+        case "xmtp-conversations-get":
+            return .success(message: """
+            📖 /xmtp-conversations-get — Get Conversation
+
+            Looks up a conversation by its ID and shows details
+            (type, members, consent state).
+
+            Usage:
+              /xmtp-conversations-get <conversation-id>
+            """)
+        case "xmtp-conversations-sync":
+            return .success(message: """
+            📖 /xmtp-conversations-sync — Light Sync
+
+            Performs a light sync of conversations (metadata only).
+            Use /xmtp-conversations-sync-all for a full sync.
+
+            Usage:
+              /xmtp-conversations-sync
+            """)
+        case "xmtp-conversations-sync-all":
+            return .success(message: """
+            📖 /xmtp-conversations-sync-all — Full Sync
+
+            Alias for /xmtp-sync. Performs a full sync of all
+            XMTP conversations and messages.
+
+            Usage:
+              /xmtp-conversations-sync-all
+            """)
+        case "xmtp-conversation-send-text":
+            return .success(message: """
+            📖 /xmtp-conversation-send-text — Send Message
+
+            Sends a text message to a conversation by its ID.
+
+            Usage:
+              /xmtp-conversation-send-text <conv-id> <message>
+            """)
+        case "xmtp-conversation-messages":
+            return .success(message: """
+            📖 /xmtp-conversation-messages — Read Messages
+
+            Lists recent messages in a conversation.
+
+            Usage:
+              /xmtp-conversation-messages <conv-id>
+              /xmtp-conversation-messages <conv-id> --limit 20
+            """)
+        case "xmtp-conversation-members":
+            return .success(message: """
+            📖 /xmtp-conversation-members — List Members
+
+            Shows members of a conversation (inbox IDs, permissions).
+
+            Usage:
+              /xmtp-conversation-members <conv-id>
+            """)
+        case "xmtp-conversation-add-members":
+            return .success(message: """
+            📖 /xmtp-conversation-add-members — Add Members
+
+            Adds members to a group conversation by wallet address.
+
+            Usage:
+              /xmtp-conversation-add-members <conv-id> 0xAddr1 0xAddr2
+            """)
+        case "xmtp-conversation-remove-members":
+            return .success(message: """
+            📖 /xmtp-conversation-remove-members — Remove Members
+
+            Removes members from a group by inbox ID.
+
+            Usage:
+              /xmtp-conversation-remove-members <conv-id> <inbox-id>
+            """)
+        case "xmtp-conversation-consent-state":
+            return .success(message: """
+            📖 /xmtp-conversation-consent-state — Get Consent
+
+            Shows the consent state of a conversation (allowed,
+            denied, or unknown).
+
+            Usage:
+              /xmtp-conversation-consent-state <conv-id>
+            """)
+        case "xmtp-conversation-update-consent":
+            return .success(message: """
+            📖 /xmtp-conversation-update-consent — Set Consent
+
+            Updates consent state for a conversation.
+
+            Usage:
+              /xmtp-conversation-update-consent <conv-id> allowed
+              /xmtp-conversation-update-consent <conv-id> denied
+            """)
+        case "xmtp-preferences-get-consent":
+            return .success(message: """
+            📖 /xmtp-preferences-get-consent — Get Consent by Entity
+
+            Gets the consent state for an inbox ID or conversation ID.
+
+            Usage:
+              /xmtp-preferences-get-consent inbox <inbox-id>
+              /xmtp-preferences-get-consent conversation <conv-id>
+            """)
+        case "xmtp-preferences-set-consent":
+            return .success(message: """
+            📖 /xmtp-preferences-set-consent — Set Consent by Entity
+
+            Sets consent state for an inbox ID or conversation ID.
+
+            Usage:
+              /xmtp-preferences-set-consent inbox <id> allowed
+              /xmtp-preferences-set-consent conversation <id> denied
+            """)
+        case "xmtp-preferences-inbox-state":
+            return .success(message: """
+            📖 /xmtp-preferences-inbox-state — Inbox State
+
+            Shows detailed inbox state for one or more inbox IDs,
+            including identities and installations.
+
+            Usage:
+              /xmtp-preferences-inbox-state <inbox-id>
+              /xmtp-preferences-inbox-state <id1> <id2>
+            """)
+        case "xmtp-preferences-sync":
+            return .success(message: """
+            📖 /xmtp-preferences-sync — Sync Preferences
+
+            Syncs XMTP consent/preference state from the network.
+
+            Usage:
+              /xmtp-preferences-sync
+            """)
+        default:
+            return .error(message: "unknown command: /\(topic)\nType /help to see all commands.")
+        }
+    }
+
     private func handleMessage(_ args: String) -> CommandResult {
         let parts = args.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: false)
         guard !parts.isEmpty else {
@@ -552,6 +1048,588 @@ final class CommandProcessor {
         }
         
         return .handled
+    }
+    
+    // MARK: - XMTP CLI-Compatible Handlers
+    
+    private func handleCanMessage(_ args: String) -> CommandResult {
+        let input = args.trimmingCharacters(in: .whitespaces)
+        guard !input.isEmpty else {
+            return .error(message: "usage: /xmtp-can-message <address> [address2 …]")
+        }
+        guard XMTPServiceContainer.isConfigured, XMTPServiceContainer.shared.isInitialized else {
+            return .error(message: "XMTP not connected")
+        }
+        
+        let addresses = input.split(separator: " ").map(String.init)
+        
+        Task {
+            do {
+                let identities = addresses.map { PublicIdentity(kind: .ethereum, identifier: $0.lowercased()) }
+                let results = try await XMTPServiceContainer.shared.clientService.canMessage(identities: identities)
+                var output = "📡 Can-message results:\n"
+                for addr in addresses {
+                    let key = addr.lowercased()
+                    let reachable = results[key] ?? false
+                    output += "  \(addr.prefix(10))… → \(reachable ? "✅ reachable" : "❌ not on XMTP")\n"
+                }
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage(output)
+                }
+            } catch {
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage("❌ can-message failed: \(error.localizedDescription)")
+                }
+            }
+        }
+        
+        return .handled
+    }
+    
+    private func handleCreateGroup(_ args: String) -> CommandResult {
+        guard XMTPServiceContainer.isConfigured, XMTPServiceContainer.shared.isInitialized else {
+            return .error(message: "XMTP not connected")
+        }
+        
+        let input = args.trimmingCharacters(in: .whitespaces)
+        guard !input.isEmpty else {
+            return .error(message: "usage: /xmtp-conversations-create-group [--name \"N\"] [--description \"D\"] [--permissions admin] <addr1> [addr2 …]")
+        }
+        
+        // Parse optional flags
+        var tokens = input.components(separatedBy: " ")
+        var name: String?
+        var desc: String?
+        var permissions: GroupPermissionPreconfiguration = .allMembers
+        var addresses: [String] = []
+        
+        var i = 0
+        while i < tokens.count {
+            let t = tokens[i]
+            if t == "--name", i + 1 < tokens.count {
+                i += 1
+                name = tokens[i].trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+            } else if t == "--description", i + 1 < tokens.count {
+                i += 1
+                desc = tokens[i].trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+            } else if t == "--permissions", i + 1 < tokens.count {
+                i += 1
+                if tokens[i].lowercased() == "admin" { permissions = .adminOnly }
+            } else if !t.isEmpty {
+                addresses.append(t)
+            }
+            i += 1
+        }
+        
+        guard !addresses.isEmpty else {
+            return .error(message: "provide at least one member address")
+        }
+        
+        Task {
+            do {
+                let group = try await XMTPServiceContainer.shared.clientService.createGroup(
+                    memberAddresses: addresses,
+                    name: name,
+                    description: desc,
+                    permissions: permissions
+                )
+                let groupName = (try? group.name()) ?? "Unnamed"
+                let label = groupName.isEmpty ? group.id.prefix(12) : Substring(groupName)
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage("✅ Group created: \(label)\n  ID: \(group.id)")
+                }
+            } catch {
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage("❌ Create group failed: \(error.localizedDescription)")
+                }
+            }
+        }
+        
+        return .handled
+    }
+    
+    private func handleConversationsGet(_ args: String) -> CommandResult {
+        let convId = args.trimmingCharacters(in: .whitespaces)
+        guard !convId.isEmpty else {
+            return .error(message: "usage: /xmtp-conversations-get <conversation-id>")
+        }
+        guard XMTPServiceContainer.isConfigured, XMTPServiceContainer.shared.isInitialized else {
+            return .error(message: "XMTP not connected")
+        }
+        
+        Task {
+            do {
+                guard let conv = try await XMTPServiceContainer.shared.clientService.findConversation(conversationId: convId) else {
+                    await MainActor.run {
+                        contextProvider?.addPublicSystemMessage("⚠️ No conversation found for ID: \(convId.prefix(12))…")
+                    }
+                    return
+                }
+                
+                let typeStr: String
+                let detail: String
+                switch conv {
+                case .dm(let dm):
+                    typeStr = "DM"
+                    let peer = (try? dm.peerInboxId) ?? "unknown"
+                    detail = "Peer: \(peer.prefix(12))…"
+                case .group(let group):
+                    typeStr = "Group"
+                    let groupName = (try? group.name()) ?? "Unnamed"
+                    let memberCount = (try? await group.members.count) ?? 0
+                    detail = "Name: \(groupName.isEmpty ? "(none)" : groupName), Members: \(memberCount)"
+                }
+                let consent = (try? conv.consentState().rawValue) ?? "unknown"
+                let output = "📋 Conversation \(convId.prefix(12))…\n  Type: \(typeStr)\n  \(detail)\n  Consent: \(consent)"
+                
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage(output)
+                }
+            } catch {
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage("❌ Get conversation failed: \(error.localizedDescription)")
+                }
+            }
+        }
+        
+        return .handled
+    }
+    
+    private func handleConversationsLightSync() -> CommandResult {
+        guard XMTPServiceContainer.isConfigured, XMTPServiceContainer.shared.isInitialized else {
+            return .error(message: "XMTP not connected")
+        }
+        
+        Task {
+            do {
+                try await XMTPServiceContainer.shared.clientService.conversationsSync()
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage("✅ Conversations light sync complete")
+                }
+            } catch {
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage("❌ Conversations sync failed: \(error.localizedDescription)")
+                }
+            }
+        }
+        
+        return .handled
+    }
+    
+    private func handleConversationSendText(_ args: String) -> CommandResult {
+        let parts = args.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
+        guard parts.count == 2 else {
+            return .error(message: "usage: /xmtp-conversation-send-text <conversation-id> <message>")
+        }
+        let convId = String(parts[0])
+        let text = String(parts[1])
+        
+        guard XMTPServiceContainer.isConfigured, XMTPServiceContainer.shared.isInitialized else {
+            return .error(message: "XMTP not connected")
+        }
+        
+        Task {
+            do {
+                guard let conv = try await XMTPServiceContainer.shared.clientService.findConversation(conversationId: convId) else {
+                    await MainActor.run {
+                        contextProvider?.addPublicSystemMessage("⚠️ Conversation not found: \(convId.prefix(12))…")
+                    }
+                    return
+                }
+                _ = try await conv.send(text: text)
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage("✅ Sent to \(convId.prefix(12))…")
+                }
+            } catch {
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage("❌ Send failed: \(error.localizedDescription)")
+                }
+            }
+        }
+        
+        return .handled
+    }
+    
+    private func handleConversationMessages(_ args: String) -> CommandResult {
+        let tokens = args.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+        guard !tokens.isEmpty else {
+            return .error(message: "usage: /xmtp-conversation-messages <conversation-id> [--limit N]")
+        }
+        let convId = tokens[0]
+        var limit = 10
+        if let idx = tokens.firstIndex(of: "--limit"), idx + 1 < tokens.count,
+           let n = Int(tokens[idx + 1]) {
+            limit = min(n, 50)
+        }
+        
+        guard XMTPServiceContainer.isConfigured, XMTPServiceContainer.shared.isInitialized else {
+            return .error(message: "XMTP not connected")
+        }
+        
+        Task {
+            do {
+                guard let conv = try await XMTPServiceContainer.shared.clientService.findConversation(conversationId: convId) else {
+                    await MainActor.run {
+                        contextProvider?.addPublicSystemMessage("⚠️ Conversation not found: \(convId.prefix(12))…")
+                    }
+                    return
+                }
+                let msgs = try await conv.messages(limit: limit, direction: .descending)
+                if msgs.isEmpty {
+                    await MainActor.run {
+                        contextProvider?.addPublicSystemMessage("📭 No messages in \(convId.prefix(12))…")
+                    }
+                    return
+                }
+                var output = "📨 Messages in \(convId.prefix(12))… (last \(msgs.count)):\n"
+                for msg in msgs.reversed() {
+                    let time = DateFormatter.localizedString(from: msg.sentAt, dateStyle: .none, timeStyle: .short)
+                    let sender = String(msg.senderInboxId.prefix(8))
+                    let body = (try? msg.body) ?? "(non-text)"
+                    let preview = body.count > 80 ? String(body.prefix(80)) + "…" : body
+                    output += "  [\(time)] \(sender)…: \(preview)\n"
+                }
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage(output)
+                }
+            } catch {
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage("❌ Messages failed: \(error.localizedDescription)")
+                }
+            }
+        }
+        
+        return .handled
+    }
+    
+    private func handleConversationMembers(_ args: String) -> CommandResult {
+        let convId = args.trimmingCharacters(in: .whitespaces)
+        guard !convId.isEmpty else {
+            return .error(message: "usage: /xmtp-conversation-members <conversation-id>")
+        }
+        guard XMTPServiceContainer.isConfigured, XMTPServiceContainer.shared.isInitialized else {
+            return .error(message: "XMTP not connected")
+        }
+        
+        Task {
+            do {
+                guard let conv = try await XMTPServiceContainer.shared.clientService.findConversation(conversationId: convId) else {
+                    await MainActor.run {
+                        contextProvider?.addPublicSystemMessage("⚠️ Conversation not found: \(convId.prefix(12))…")
+                    }
+                    return
+                }
+                let members = try await conv.members()
+                var output = "👥 Members of \(convId.prefix(12))… (\(members.count)):\n"
+                for member in members {
+                    let permission: String
+                    switch member.permissionLevel {
+                    case .Member: permission = "member"
+                    case .Admin: permission = "admin"
+                    case .SuperAdmin: permission = "super-admin"
+                    }
+                    output += "  • \(member.inboxId.prefix(12))… [\(permission)]\n"
+                }
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage(output)
+                }
+            } catch {
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage("❌ Members failed: \(error.localizedDescription)")
+                }
+            }
+        }
+        
+        return .handled
+    }
+    
+    private func handleConversationAddMembers(_ args: String) -> CommandResult {
+        let tokens = args.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+        guard tokens.count >= 2 else {
+            return .error(message: "usage: /xmtp-conversation-add-members <conversation-id> <addr1> [addr2 …]")
+        }
+        let convId = tokens[0]
+        let addresses = Array(tokens.dropFirst())
+        
+        guard XMTPServiceContainer.isConfigured, XMTPServiceContainer.shared.isInitialized else {
+            return .error(message: "XMTP not connected")
+        }
+        
+        Task {
+            do {
+                guard let conv = try await XMTPServiceContainer.shared.clientService.findConversation(conversationId: convId) else {
+                    await MainActor.run {
+                        contextProvider?.addPublicSystemMessage("⚠️ Conversation not found: \(convId.prefix(12))…")
+                    }
+                    return
+                }
+                guard case .group(let group) = conv else {
+                    await MainActor.run {
+                        contextProvider?.addPublicSystemMessage("⚠️ add-members only works on group conversations")
+                    }
+                    return
+                }
+                let identities = addresses.map { PublicIdentity(kind: .ethereum, identifier: $0.lowercased()) }
+                _ = try await group.addMembersByIdentity(identities: identities)
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage("✅ Added \(addresses.count) member(s) to group \(convId.prefix(12))…")
+                }
+            } catch {
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage("❌ Add members failed: \(error.localizedDescription)")
+                }
+            }
+        }
+        
+        return .handled
+    }
+    
+    private func handleConversationRemoveMembers(_ args: String) -> CommandResult {
+        let tokens = args.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+        guard tokens.count >= 2 else {
+            return .error(message: "usage: /xmtp-conversation-remove-members <conversation-id> <inbox-id> [inbox-id2 …]")
+        }
+        let convId = tokens[0]
+        let inboxIds = Array(tokens.dropFirst())
+        
+        guard XMTPServiceContainer.isConfigured, XMTPServiceContainer.shared.isInitialized else {
+            return .error(message: "XMTP not connected")
+        }
+        
+        Task {
+            do {
+                guard let conv = try await XMTPServiceContainer.shared.clientService.findConversation(conversationId: convId) else {
+                    await MainActor.run {
+                        contextProvider?.addPublicSystemMessage("⚠️ Conversation not found: \(convId.prefix(12))…")
+                    }
+                    return
+                }
+                guard case .group(let group) = conv else {
+                    await MainActor.run {
+                        contextProvider?.addPublicSystemMessage("⚠️ remove-members only works on group conversations")
+                    }
+                    return
+                }
+                try await group.removeMembers(inboxIds: inboxIds)
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage("✅ Removed \(inboxIds.count) member(s) from group \(convId.prefix(12))…")
+                }
+            } catch {
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage("❌ Remove members failed: \(error.localizedDescription)")
+                }
+            }
+        }
+        
+        return .handled
+    }
+    
+    private func handleConversationConsentState(_ args: String) -> CommandResult {
+        let convId = args.trimmingCharacters(in: .whitespaces)
+        guard !convId.isEmpty else {
+            return .error(message: "usage: /xmtp-conversation-consent-state <conversation-id>")
+        }
+        guard XMTPServiceContainer.isConfigured, XMTPServiceContainer.shared.isInitialized else {
+            return .error(message: "XMTP not connected")
+        }
+        
+        Task {
+            do {
+                guard let conv = try await XMTPServiceContainer.shared.clientService.findConversation(conversationId: convId) else {
+                    await MainActor.run {
+                        contextProvider?.addPublicSystemMessage("⚠️ Conversation not found: \(convId.prefix(12))…")
+                    }
+                    return
+                }
+                let state = try conv.consentState()
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage("🔒 Consent for \(convId.prefix(12))…: \(state.rawValue)")
+                }
+            } catch {
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage("❌ Consent state failed: \(error.localizedDescription)")
+                }
+            }
+        }
+        
+        return .handled
+    }
+    
+    private func handleConversationUpdateConsent(_ args: String) -> CommandResult {
+        let tokens = args.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+        guard tokens.count == 2 else {
+            return .error(message: "usage: /xmtp-conversation-update-consent <conversation-id> <allowed|denied|unknown>")
+        }
+        let convId = tokens[0]
+        guard let state = parseConsentState(tokens[1]) else {
+            return .error(message: "invalid consent state: \(tokens[1]). Use: allowed, denied, or unknown")
+        }
+        guard XMTPServiceContainer.isConfigured, XMTPServiceContainer.shared.isInitialized else {
+            return .error(message: "XMTP not connected")
+        }
+        
+        Task {
+            do {
+                guard let conv = try await XMTPServiceContainer.shared.clientService.findConversation(conversationId: convId) else {
+                    await MainActor.run {
+                        contextProvider?.addPublicSystemMessage("⚠️ Conversation not found: \(convId.prefix(12))…")
+                    }
+                    return
+                }
+                try await conv.updateConsentState(state: state)
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage("✅ Consent updated to \(state.rawValue) for \(convId.prefix(12))…")
+                }
+            } catch {
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage("❌ Update consent failed: \(error.localizedDescription)")
+                }
+            }
+        }
+        
+        return .handled
+    }
+    
+    private func handlePreferencesGetConsent(_ args: String) -> CommandResult {
+        let tokens = args.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+        guard tokens.count == 2 else {
+            return .error(message: "usage: /xmtp-preferences-get-consent <inbox|conversation> <id>")
+        }
+        guard let entityType = parseEntryType(tokens[0]) else {
+            return .error(message: "invalid type: \(tokens[0]). Use: inbox or conversation")
+        }
+        let entityId = tokens[1]
+        
+        guard XMTPServiceContainer.isConfigured, XMTPServiceContainer.shared.isInitialized else {
+            return .error(message: "XMTP not connected")
+        }
+        
+        Task {
+            do {
+                let state = try await XMTPServiceContainer.shared.clientService.getConsentState(entityType: entityType, entity: entityId)
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage("🔒 Consent for \(tokens[0]) \(entityId.prefix(12))…: \(state.rawValue)")
+                }
+            } catch {
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage("❌ Get consent failed: \(error.localizedDescription)")
+                }
+            }
+        }
+        
+        return .handled
+    }
+    
+    private func handlePreferencesSetConsent(_ args: String) -> CommandResult {
+        let tokens = args.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+        guard tokens.count == 3 else {
+            return .error(message: "usage: /xmtp-preferences-set-consent <inbox|conversation> <id> <allowed|denied|unknown>")
+        }
+        guard let entityType = parseEntryType(tokens[0]) else {
+            return .error(message: "invalid type: \(tokens[0]). Use: inbox or conversation")
+        }
+        let entityId = tokens[1]
+        guard let state = parseConsentState(tokens[2]) else {
+            return .error(message: "invalid consent state: \(tokens[2]). Use: allowed, denied, or unknown")
+        }
+        
+        guard XMTPServiceContainer.isConfigured, XMTPServiceContainer.shared.isInitialized else {
+            return .error(message: "XMTP not connected")
+        }
+        
+        Task {
+            do {
+                try await XMTPServiceContainer.shared.clientService.setConsentState(entityType: entityType, entity: entityId, state: state)
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage("✅ Consent set to \(state.rawValue) for \(tokens[0]) \(entityId.prefix(12))…")
+                }
+            } catch {
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage("❌ Set consent failed: \(error.localizedDescription)")
+                }
+            }
+        }
+        
+        return .handled
+    }
+    
+    private func handlePreferencesInboxState(_ args: String) -> CommandResult {
+        let input = args.trimmingCharacters(in: .whitespaces)
+        guard !input.isEmpty else {
+            return .error(message: "usage: /xmtp-preferences-inbox-state <inbox-id> [inbox-id2 …]")
+        }
+        let inboxIds = input.split(separator: " ").map(String.init)
+        
+        guard XMTPServiceContainer.isConfigured, XMTPServiceContainer.shared.isInitialized else {
+            return .error(message: "XMTP not connected")
+        }
+        
+        Task {
+            do {
+                let states = try await XMTPServiceContainer.shared.clientService.getInboxStates(inboxIds: inboxIds)
+                if states.isEmpty {
+                    await MainActor.run {
+                        contextProvider?.addPublicSystemMessage("⚠️ No inbox states found")
+                    }
+                    return
+                }
+                var output = "📋 Inbox States (\(states.count)):\n"
+                for state in states {
+                    output += "  • Inbox: \(state.inboxId.prefix(12))…\n"
+                    output += "    Identities: \(state.identities.count), Installations: \(state.installations.count)\n"
+                    output += "    Recovery: \(state.recoveryIdentity.identifier.prefix(12))…\n"
+                }
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage(output)
+                }
+            } catch {
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage("❌ Inbox state failed: \(error.localizedDescription)")
+                }
+            }
+        }
+        
+        return .handled
+    }
+    
+    private func handlePreferencesSync() -> CommandResult {
+        guard XMTPServiceContainer.isConfigured, XMTPServiceContainer.shared.isInitialized else {
+            return .error(message: "XMTP not connected")
+        }
+        
+        Task {
+            do {
+                try await XMTPServiceContainer.shared.clientService.syncPreferences()
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage("✅ Preferences synced")
+                }
+            } catch {
+                await MainActor.run {
+                    contextProvider?.addPublicSystemMessage("❌ Preferences sync failed: \(error.localizedDescription)")
+                }
+            }
+        }
+        
+        return .handled
+    }
+    
+    // MARK: - Consent / Entry Type Helpers
+    
+    private func parseConsentState(_ value: String) -> ConsentState? {
+        switch value.lowercased() {
+        case "allowed": return .allowed
+        case "denied": return .denied
+        case "unknown": return .unknown
+        default: return nil
+        }
+    }
+    
+    private func parseEntryType(_ value: String) -> EntryType? {
+        switch value.lowercased() {
+        case "inbox", "inbox_id": return .inbox_id
+        case "conversation", "conversation_id": return .conversation_id
+        default: return nil
+        }
     }
     
     // MARK: - Transaction Commands

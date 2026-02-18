@@ -770,6 +770,115 @@ final class XMTPClientService: ObservableObject {
         )
     }
     
+    // MARK: - CLI Parity Methods
+    
+    /// Check if one or more identities can receive XMTP messages
+    /// Mirrors: `xmtp can-message <address>`
+    func canMessage(identities: [PublicIdentity]) async throws -> [String: Bool] {
+        guard let client = client else {
+            throw XMTPClientError.notConnected
+        }
+        return try await client.canMessage(identities: identities)
+    }
+    
+    /// Light sync — fetch new conversations without syncing all messages
+    /// Mirrors: `xmtp conversations sync`
+    func conversationsSync() async throws {
+        guard let client = client else {
+            throw XMTPClientError.notConnected
+        }
+        try await client.conversations.sync()
+    }
+    
+    /// Find a conversation by its XMTP conversation ID (works for DMs and groups)
+    /// Mirrors: `xmtp conversations get <id>`
+    func findConversation(conversationId: String) async throws -> Conversation? {
+        guard let client = client else {
+            throw XMTPClientError.notConnected
+        }
+        return try await client.conversations.findConversation(conversationId: conversationId)
+    }
+    
+    /// Remove a member from a group by their inbox ID
+    /// Mirrors: `xmtp conversation remove-members`
+    func removeMemberFromGroup(_ group: Group, inboxId: String) async throws {
+        try await group.removeMembers(inboxIds: [inboxId])
+        let groupName = (try? group.name()) ?? "unnamed"
+        SecureLogger.debug("Removed member \(inboxId.prefix(12))... from group \(groupName)", category: .session)
+    }
+    
+    /// Get inbox state for one or more inbox IDs (wallet addresses, installations, etc.)
+    /// Mirrors: `xmtp preferences inbox-state`
+    func getInboxStates(inboxIds: [String], refreshFromNetwork: Bool = true) async throws -> [InboxState] {
+        guard let client = client else {
+            throw XMTPClientError.notConnected
+        }
+        return try await client.inboxStatesForInboxIds(refreshFromNetwork: refreshFromNetwork, inboxIds: inboxIds)
+    }
+    
+    /// Create a new group conversation with members specified by wallet addresses
+    /// Mirrors: `xmtp conversations create-group <addr1> <addr2> --name "Name"`
+    func createGroup(memberAddresses: [String], name: String? = nil, description: String? = nil, permissions: GroupPermissionPreconfiguration = .allMembers) async throws -> Group {
+        guard let client = client else {
+            throw XMTPClientError.notConnected
+        }
+        
+        // Resolve wallet addresses to inbox IDs
+        var memberInboxIds: [String] = []
+        for address in memberAddresses {
+            let identity = PublicIdentity(kind: .ethereum, identifier: address.lowercased())
+            if let inboxId = try await client.inboxIdFromIdentity(identity: identity) {
+                memberInboxIds.append(inboxId)
+            } else {
+                throw XMTPClientError.identityNotFound(address)
+            }
+        }
+        
+        let group = try await client.conversations.newGroup(
+            with: memberInboxIds,
+            permissions: permissions,
+            name: name ?? "",
+            description: description ?? ""
+        )
+        
+        SecureLogger.info("Created group '\(name ?? "unnamed")' with \(memberInboxIds.count) members (ID: \(group.id.prefix(16))…)", category: .session)
+        return group
+    }
+    
+    /// Get consent state for an entity (inbox ID or conversation ID)
+    /// Mirrors: `xmtp preferences get-consent`
+    func getConsentState(entityType: EntryType, entity: String) async throws -> ConsentState {
+        guard let client = client else {
+            throw XMTPClientError.notConnected
+        }
+        switch entityType {
+        case .inbox_id:
+            return try await client.preferences.inboxIdState(inboxId: entity)
+        case .conversation_id:
+            return try await client.preferences.conversationState(conversationId: entity)
+        }
+    }
+    
+    /// Set consent state for an entity
+    /// Mirrors: `xmtp preferences set-consent`
+    func setConsentState(entityType: EntryType, entity: String, state: ConsentState) async throws {
+        guard let client = client else {
+            throw XMTPClientError.notConnected
+        }
+        try await client.preferences.setConsentState(
+            entries: [ConsentRecord(value: entity, entryType: entityType, consentType: state)]
+        )
+    }
+    
+    /// Sync preferences (consent states, HMAC keys) from the network
+    /// Mirrors: `xmtp preferences sync`
+    func syncPreferences() async throws {
+        guard let client = client else {
+            throw XMTPClientError.notConnected
+        }
+        try await client.preferences.sync()
+    }
+    
     // MARK: - Private Helpers
     
     private func getOrCreateDbEncryptionKey() throws -> Data {
@@ -906,6 +1015,7 @@ enum XMTPClientError: Error, LocalizedError {
     case keyGenerationFailed
     case conversationNotFound
     case invalidMessage
+    case identityNotFound(String)
     
     var errorDescription: String? {
         switch self {
@@ -917,6 +1027,8 @@ enum XMTPClientError: Error, LocalizedError {
             return "Conversation not found"
         case .invalidMessage:
             return "Invalid message format"
+        case .identityNotFound(let address):
+            return "No XMTP identity found for \(address)"
         }
     }
 }
