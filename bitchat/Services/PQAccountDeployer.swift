@@ -129,37 +129,92 @@ actor PQAccountDeployer {
         )
     }
     
+    // MARK: - Gas Estimation
+    
+    /// Fetch the current gas price from the network.
+    func getGasPrice() async throws -> UInt64 {
+        let result = try await rpcCall(method: "eth_gasPrice", params: [])
+        guard let hexStr = result as? String else {
+            throw DeployerError.invalidResponse("eth_gasPrice returned non-string")
+        }
+        let hex = hexStr.hasPrefix("0x") ? String(hexStr.dropFirst(2)) : hexStr
+        return UInt64(hex, radix: 16) ?? 1_000_000_000 // fallback 1 gwei
+    }
+    
+    /// Estimate gas for a transaction via eth_estimateGas.
+    func estimateGas(to: String, data: Data, from: String) async throws -> UInt64 {
+        let dataHex = "0x" + data.map { String(format: "%02x", $0) }.joined()
+        let callObj: [String: String] = [
+            "from": from,
+            "to": to,
+            "data": dataHex
+        ]
+        let result = try await rpcCall(method: "eth_estimateGas", params: [callObj])
+        guard let hexStr = result as? String else {
+            throw DeployerError.invalidResponse("eth_estimateGas returned non-string")
+        }
+        let hex = hexStr.hasPrefix("0x") ? String(hexStr.dropFirst(2)) : hexStr
+        return UInt64(hex, radix: 16) ?? 3_000_000
+    }
+    
     // MARK: - Direct Deployment via EOA Transaction
     
     /// Deploy a PQ account via a direct EOA transaction to the factory.
     /// This is a simple alternative to ERC-4337 for initial deployment.
+    /// Gas parameters are fetched dynamically from the network by default.
     /// - Parameters:
     ///   - wallet: The EOA wallet to send the deployment tx
     ///   - preQuantumPubKey: secp256k1 public key (uncompressed, 65 bytes)
     ///   - postQuantumPubKey: ML-DSA-44 public key (1312 bytes)
     ///   - nonce: EOA nonce
-    ///   - gasParams: Gas parameters for the transaction
+    ///   - gasParams: Gas parameters (nil = fetch dynamically from network)
     /// - Returns: Signed transaction data ready for eth_sendRawTransaction
     func buildDeployTransaction(
         wallet: EmbeddedWallet,
         preQuantumPubKey: Data,
         postQuantumPubKey: Data,
         nonce: UInt64,
-        maxPriorityFeePerGas: UInt64 = 2_000_000_000,  // 2 gwei
-        maxFeePerGas: UInt64 = 50_000_000_000,          // 50 gwei
-        gasLimit: UInt64 = 3_000_000                     // 3M gas for deployment
+        maxPriorityFeePerGas: UInt64? = nil,
+        maxFeePerGas: UInt64? = nil,
+        gasLimit: UInt64? = nil
     ) async throws -> Data {
         let calldata = ABIEncoder.encodeCreateAccount(
             preQuantumPubKey: preQuantumPubKey,
             postQuantumPubKey: postQuantumPubKey
         )
         
+        // Fetch live gas price if not provided
+        let baseGasPrice: UInt64
+        if let maxFeePerGas {
+            baseGasPrice = maxFeePerGas
+        } else {
+            baseGasPrice = try await getGasPrice()
+        }
+        
+        // Priority fee: use provided or 10% of base (min 100_000_000 = 0.1 gwei)
+        let priorityFee = maxPriorityFeePerGas ?? max(baseGasPrice / 10, 100_000_000)
+        // Max fee: base + priority with 50% headroom for base fee spikes
+        let maxFee = maxFeePerGas ?? (baseGasPrice * 3 / 2 + priorityFee)
+        
+        // Estimate gas if not provided
+        let gas: UInt64
+        if let gasLimit {
+            gas = gasLimit
+        } else {
+            let eoaAddress = try await wallet.getAddress()
+            let estimated = try await estimateGas(to: Self.factoryAddress, data: calldata, from: eoaAddress)
+            // Add 20% buffer for safety
+            gas = estimated * 6 / 5
+        }
+        
+        SecureLogger.info("PQ deploy gas: limit=\(gas), maxFee=\(maxFee / 1_000_000_000)gwei, priority=\(priorityFee / 1_000_000_000)gwei, est cost=\(Double(gas) * Double(maxFee) / 1e18) ETH", category: .session)
+        
         return try await wallet.signTransaction(
             chainId: chain.chainId,
             nonce: nonce,
-            maxPriorityFeePerGas: maxPriorityFeePerGas,
-            maxFeePerGas: maxFeePerGas,
-            gasLimit: gasLimit,
+            maxPriorityFeePerGas: priorityFee,
+            maxFeePerGas: maxFee,
+            gasLimit: gas,
             to: Self.factoryAddress,
             value: 0,
             data: calldata

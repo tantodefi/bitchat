@@ -106,7 +106,14 @@ actor PQTransactionSigner {
         // Get nonce from entrypoint (0 for first tx if not deployed)
         let nonce: UInt64 = deployed ? try await getEntryPointNonce(sender: sender) : 0
         
-        // Build initial UserOp with placeholder gas
+        // Fetch live gas price from the network
+        let baseGasPrice = try await deployer.getGasPrice()
+        let priorityFee = max(baseGasPrice / 10, 100_000_000) // 10% of base, min 0.1 gwei
+        let maxFee = baseGasPrice * 3 / 2 + priorityFee       // 1.5x base + priority
+        
+        SecureLogger.info("PQ UserOp gas: maxFee=\(maxFee / 1_000_000_000)gwei, priority=\(priorityFee / 1_000_000_000)gwei", category: .session)
+        
+        // Build initial UserOp with placeholder gas limits (bundler will estimate)
         var userOp = PackedUserOperation(
             sender: ABIEncoder.hexToData(String(sender.dropFirst(2))),
             nonce: nonce,
@@ -118,8 +125,8 @@ actor PQTransactionSigner {
             ),
             preVerificationGas: UInt64(100_000),
             gasFees: UserOperationBuilder.packGasFees(
-                maxPriorityFeePerGas: UInt64(2_000_000_000),
-                maxFeePerGas: UInt64(50_000_000_000)
+                maxPriorityFeePerGas: priorityFee,
+                maxFeePerGas: maxFee
             ),
             paymasterAndData: Data(),
             signature: Data()
