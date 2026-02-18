@@ -19,11 +19,16 @@ struct CommandSuggestionsView: View {
     
     private var filteredCommands: [CommandInfo] {
         guard messageText.hasPrefix("/") && !messageText.contains(" ") else { return [] }
+        let input = messageText.lowercased()
         let isGeoPublic = locationManager.selectedChannel.isLocation
         let isGeoDM = viewModel.selectedPrivateChatPeer?.isGeoDM == true
-        return CommandInfo.all(isGeoPublic: isGeoPublic, isGeoDM: isGeoDM).filter { command in
-            command.alias.starts(with: messageText.lowercased())
-        }
+
+        // When user types "/xmtp-", show only CLI commands; otherwise show primary commands
+        let commands: [CommandInfo] = input.hasPrefix("/xmtp-")
+            ? CommandInfo.cliCommands
+            : CommandInfo.all(isGeoPublic: isGeoPublic, isGeoDM: isGeoDM)
+
+        return commands.filter { $0.alias.starts(with: input) }
     }
     
     var body: some View {

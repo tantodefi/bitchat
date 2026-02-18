@@ -96,6 +96,13 @@ struct WalletView: View {
                 // MARK: - XMTP Inbox ID
                 if let inboxId = xmtpContainer.clientService.inboxId {
                     xmtpInboxSection(inboxId: inboxId)
+                    
+                    if activeAccountMode == .pqAccount {
+                        Text("This Inbox ID belongs to your EOA signing key. Your PQ smart account shares it because XMTP identity is tied to the signer, not the contract address.")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                            .padding(.horizontal, 4)
+                    }
                 }
                 
                 // MARK: - Loading / Error
@@ -222,11 +229,7 @@ struct WalletView: View {
     private var accountModePicker: some View {
         Picker("Account", selection: $activeAccountMode) {
             Text("EOA").tag(AccountMode.eoa)
-            HStack {
-                Image(systemName: "shield.checkered")
-                Text("PQ Account")
-            }
-            .tag(AccountMode.pqAccount)
+            Text("🛡 PQ Account").tag(AccountMode.pqAccount)
         }
         .pickerStyle(.segmented)
     }

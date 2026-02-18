@@ -506,6 +506,9 @@ struct WalletSettingsView: View {
                     pqKeyManager: container.pqKeyManager,
                     chainServiceSets: Array(container.pqChainServices.values)
                 )
+                
+                // Auto-initialize keys so deployed state is restored on revisit
+                await pqViewModel.initializeKeys(from: wallet)
             }
         }
         .sheet(item: $exportedPQSeed) { item in

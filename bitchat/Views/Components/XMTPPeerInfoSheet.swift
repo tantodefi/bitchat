@@ -727,7 +727,7 @@ struct XMTPPeerInfoSheet: View {
     private func loadInboxId() {
         let truncated = peerID.bare
         
-        // Check if we already have the full inbox ID mapped
+        // Check if we already have the full inbox ID mapped (in-memory cache)
         if let fullId = xmtpContainer.clientService.inboxIdMap[truncated] {
             fullInboxIdLoaded = fullId
             isLoading = false
@@ -737,30 +737,18 @@ struct XMTPPeerInfoSheet: View {
             return
         }
         
-        // peerID.bare is truncated to 16 chars; try to use it as-is for findOrCreateDM
-        // (this may work if the server can resolve a partial inbox ID)
-        let candidateId = peerID.id.hasPrefix("xmtp_") ? String(peerID.id.dropFirst(5)) : peerID.id
-        
+        // Scan existing DMs to resolve full inbox ID from truncated prefix.
+        // This handles the case after app restart when inboxIdMap is empty.
         Task {
-            do {
-                try await xmtpContainer.clientService.findOrCreateDM(with: candidateId)
+            if let resolved = await xmtpContainer.clientService.resolveFullInboxId(truncated: truncated) {
                 await MainActor.run {
-                    // Re-check inboxIdMap after findOrCreateDM which may have stored the mapping
-                    if let mapped = xmtpContainer.clientService.inboxIdMap[truncated] {
-                        self.fullInboxIdLoaded = mapped
-                    } else {
-                        self.fullInboxIdLoaded = candidateId
-                    }
+                    self.fullInboxIdLoaded = resolved
                     self.isLoading = false
                 }
-            } catch {
+            } else {
+                // Last resort: the bare value is all we have
                 await MainActor.run {
-                    // Fallback: re-check map, otherwise use candidate
-                    if let mapped = xmtpContainer.clientService.inboxIdMap[truncated] {
-                        self.fullInboxIdLoaded = mapped
-                    } else {
-                        self.fullInboxIdLoaded = candidateId
-                    }
+                    self.fullInboxIdLoaded = truncated
                     self.isLoading = false
                 }
             }

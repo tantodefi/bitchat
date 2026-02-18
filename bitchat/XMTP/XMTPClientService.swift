@@ -73,6 +73,36 @@ final class XMTPClientService: ObservableObject {
         }
     }
     
+    /// Resolve a full inbox ID from a truncated (16-char) prefix by scanning existing DMs.
+    /// This is needed after app restart when the in-memory inboxIdMap is empty.
+    func resolveFullInboxId(truncated: String) async -> String? {
+        // Check map first
+        if let cached = inboxIdMap[truncated] {
+            return cached
+        }
+        
+        guard let client = client else { return nil }
+        
+        // Scan all DMs (including denied) to find a matching peer inbox ID
+        do {
+            let dms = try client.conversations.listDms(consentStates: [.allowed, .unknown, .denied])
+            for dm in dms {
+                if let peerInbox = try? dm.peerInboxId {
+                    let peerTruncated = String(peerInbox.prefix(TransportConfig.nostrConvKeyPrefixLength))
+                    // Store mapping for future lookups
+                    storeInboxIdMapping(fullInboxId: peerInbox)
+                    if peerTruncated == truncated {
+                        return peerInbox
+                    }
+                }
+            }
+        } catch {
+            SecureLogger.debug("Failed to scan DMs for inbox ID resolution: \(error.localizedDescription)", category: .network)
+        }
+        
+        return nil
+    }
+    
     // MARK: - Initialization
     
     init(keychain: KeychainManagerProtocol, wallet: EmbeddedWallet, identityBridge: XMTPIdentityBridge) {
@@ -482,8 +512,8 @@ final class XMTPClientService: ObservableObject {
             throw XMTPClientError.notConnected
         }
         
-        // Check DMs first
-        let dms = try client.conversations.listDms(consentStates: [.allowed, .unknown])
+        // Check DMs first — include .denied so consent changes are still reflected
+        let dms = try client.conversations.listDms(consentStates: [.allowed, .unknown, .denied])
         for dm in dms {
             if let peerInbox = try? dm.peerInboxId, peerInbox == inboxId {
                 return .dm(dm)

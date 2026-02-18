@@ -131,22 +131,42 @@ enum CommandInfo: String, Identifiable {
         }
     }
     
+    /// Whether this is an XMTP CLI-level command (hidden from default menu)
+    var isCliCommand: Bool {
+        switch self {
+        case .xmtpCanMessage, .xmtpClientInfo,
+             .xmtpConversationsList, .xmtpConversationsCreateDm, .xmtpConversationsCreateGroup,
+             .xmtpConversationsGet, .xmtpConversationsSync, .xmtpConversationsSyncAll,
+             .xmtpConversationSendText, .xmtpConversationMessages, .xmtpConversationMembers,
+             .xmtpConversationAddMembers, .xmtpConversationRemoveMembers,
+             .xmtpConversationConsentState, .xmtpConversationUpdateConsent,
+             .xmtpPreferencesGetConsent, .xmtpPreferencesSetConsent,
+             .xmtpPreferencesInboxState, .xmtpPreferencesSync:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Primary commands shown in the default `/` menu (excludes CLI commands)
     static func all(isGeoPublic: Bool, isGeoDM: Bool) -> [CommandInfo] {
         let baseCommands: [CommandInfo] = [.help, .block, .unblock, .clear, .hug, .message, .slap, .who]
         let xmtpCommands: [CommandInfo] = [.xmtp, .dmWallet, .xmtpSync, .xmtpList, .tx, .wallet]
-        let cliCommands: [CommandInfo] = [
-            .xmtpCanMessage, .xmtpClientInfo,
-            .xmtpConversationsList, .xmtpConversationsCreateDm, .xmtpConversationsCreateGroup,
-            .xmtpConversationsGet, .xmtpConversationsSync, .xmtpConversationsSyncAll,
-            .xmtpConversationSendText, .xmtpConversationMessages, .xmtpConversationMembers,
-            .xmtpConversationAddMembers, .xmtpConversationRemoveMembers,
-            .xmtpConversationConsentState, .xmtpConversationUpdateConsent,
-            .xmtpPreferencesGetConsent, .xmtpPreferencesSetConsent,
-            .xmtpPreferencesInboxState, .xmtpPreferencesSync
-        ]
         if isGeoPublic || isGeoDM {
-            return baseCommands + [.favorite, .unfavorite] + xmtpCommands + cliCommands
+            return baseCommands + [.favorite, .unfavorite] + xmtpCommands
         }
-        return baseCommands + xmtpCommands + cliCommands
+        return baseCommands + xmtpCommands
     }
+
+    /// XMTP CLI commands — shown only when user types `/xmtp-`
+    static let cliCommands: [CommandInfo] = [
+        .xmtpCanMessage, .xmtpClientInfo,
+        .xmtpConversationsList, .xmtpConversationsCreateDm, .xmtpConversationsCreateGroup,
+        .xmtpConversationsGet, .xmtpConversationsSync, .xmtpConversationsSyncAll,
+        .xmtpConversationSendText, .xmtpConversationMessages, .xmtpConversationMembers,
+        .xmtpConversationAddMembers, .xmtpConversationRemoveMembers,
+        .xmtpConversationConsentState, .xmtpConversationUpdateConsent,
+        .xmtpPreferencesGetConsent, .xmtpPreferencesSetConsent,
+        .xmtpPreferencesInboxState, .xmtpPreferencesSync
+    ]
 }
