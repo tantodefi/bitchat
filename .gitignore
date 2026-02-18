@@ -84,3 +84,6 @@ Local.xcconfig
 # Secrets (API keys)
 Secrets.xcconfig
 Configs/Secrets.xcconfig
+
+# Private docs (contain API keys / certs)
+docs/uploading.md
