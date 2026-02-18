@@ -32,6 +32,18 @@ final class XMTPClientService: ObservableObject {
     @Published private(set) var inboxId: String?
     @Published private(set) var bootstrapProgress: Double = 0
     
+    /// Whether the message stream is currently active (not nil and not cancelled)
+    var isMessageStreamActive: Bool {
+        guard let task = streamTask else { return false }
+        return !task.isCancelled
+    }
+    
+    /// Whether the conversation stream is currently active
+    var isConversationStreamActive: Bool {
+        guard let task = conversationStreamTask else { return false }
+        return !task.isCancelled
+    }
+    
     // Cache of active DMs by inbox ID
     private var dmCache: [String: Dm] = [:]
     
@@ -97,10 +109,12 @@ final class XMTPClientService: ObservableObject {
         let dbKey = try getOrCreateDbEncryptionKey()
         bootstrapProgress = 0.4
         
-        // Register codecs for attachments and read receipts before creating client
+        // Register codecs for attachments, reactions, and read receipts before creating client
         Client.register(codec: AttachmentCodec())
         Client.register(codec: RemoteAttachmentCodec())
         Client.register(codec: ReadReceiptCodec())
+        Client.register(codec: ReactionCodec())
+        Client.register(codec: ReactionV2Codec())
         
         // Create XMTP client with encryption
         let xmtpClient = try await Client.create(
@@ -454,6 +468,40 @@ final class XMTPClientService: ObservableObject {
         }
     }
     
+    /// Restart message and conversation streams (callable from UI)
+    func restartStreams() {
+        SecureLogger.info("📡 Manually restarting XMTP streams", category: .network)
+        startMessageStream()
+        startConversationStream()
+    }
+    
+    /// Get the conversation type and details for a given inbox ID
+    /// Returns the conversation if found, nil otherwise
+    func getConversationDetails(for inboxId: String) async throws -> Conversation? {
+        guard let client = client else {
+            throw XMTPClientError.notConnected
+        }
+        
+        // Check DMs first
+        let dms = try client.conversations.listDms(consentStates: [.allowed, .unknown])
+        for dm in dms {
+            if let peerInbox = try? dm.peerInboxId, peerInbox == inboxId {
+                return .dm(dm)
+            }
+        }
+        
+        // Check groups
+        let groups = try await client.conversations.listGroups()
+        for group in groups {
+            let members = try await group.members
+            if members.contains(where: { $0.inboxId == inboxId }) {
+                return .group(group)
+            }
+        }
+        
+        return nil
+    }
+    
     private func handleIncomingMessage(_ message: DecodedMessage) async {
         // Filter out our own messages to prevent storing our own inbox ID in the map
         // This is critical - without it, replies would try to DM ourselves
@@ -509,7 +557,31 @@ final class XMTPClientService: ObservableObject {
             SecureLogger.debug("📥 Received inline attachment: \(attachment.filename)", category: .network)
             // For now, just notify with a text message
             delegate?.xmtpClient(self, didReceiveMessage: "[attachment] \(attachment.filename)", from: message.senderInboxId, messageId: message.id)
+            return
         }
+        
+        // Check for reaction content type
+        if let reaction = try? message.content() as Reaction {
+            let displayText: String
+            switch reaction.action {
+            case .added:
+                displayText = "reacted \(reaction.content)"
+            case .removed:
+                displayText = "removed reaction \(reaction.content)"
+            case .unknown:
+                displayText = reaction.content
+            }
+            delegate?.xmtpClient(self, didReceiveMessage: displayText, from: message.senderInboxId, messageId: message.id)
+            return
+        }
+        
+        // Fallback: use the built-in fallback text for unknown content types
+        if let fallbackText = try? message.fallback, !fallbackText.isEmpty {
+            delegate?.xmtpClient(self, didReceiveMessage: fallbackText, from: message.senderInboxId, messageId: message.id)
+            return
+        }
+        
+        SecureLogger.debug("⚠️ Unhandled XMTP message content type from \(message.senderInboxId.prefix(8))…", category: .network)
     }
     
     /// Parse location message JSON format and extract just the content
@@ -526,15 +598,55 @@ final class XMTPClientService: ObservableObject {
     
     // MARK: - Sync
     
-    /// Sync all conversations and messages
+    /// Sync all conversations and messages, then process any new messages
     func syncAll() async throws {
         guard let client = client else {
             throw XMTPClientError.notConnected
         }
         
         // Sync both allowed and unknown so new inbound conversations are discovered
-        _ = try await client.conversations.syncAllConversations(consentStates: [.allowed, .unknown])
-        SecureLogger.debug("📥 Synced all XMTP conversations", category: .network)
+        let summary = try await client.conversations.syncAllConversations(consentStates: [.allowed, .unknown])
+        SecureLogger.debug("📥 Synced XMTP conversations: \(summary.numSynced)/\(summary.numEligible)", category: .network)
+        
+        // After syncing, process recent messages from all DMs
+        // This catches messages that arrived while streams were disconnected
+        do {
+            let dms = try client.conversations.listDms(consentStates: [.allowed, .unknown])
+            var totalNewMessages = 0
+            
+            for dm in dms {
+                // Fetch the last few messages (limit 10 per convo) to process any missed ones
+                let messages = try await dm.messages(
+                    limit: 10,
+                    direction: .descending
+                )
+                
+                for message in messages {
+                    // Only process messages from the last 5 minutes to avoid re-processing old ones
+                    let fiveMinutesAgo = Date().addingTimeInterval(-300)
+                    if message.sentAt > fiveMinutesAgo {
+                        await handleIncomingMessage(message)
+                        totalNewMessages += 1
+                    }
+                }
+            }
+            
+            if totalNewMessages > 0 {
+                SecureLogger.debug("📥 Processed \(totalNewMessages) recent messages after sync", category: .network)
+            }
+        } catch {
+            SecureLogger.debug("📥 Error processing messages after sync: \(error.localizedDescription)", category: .network)
+        }
+        
+        // Ensure streams are alive — restart if they were cancelled
+        if streamTask == nil || streamTask?.isCancelled == true {
+            SecureLogger.info("📡 Restarting message stream after sync", category: .network)
+            startMessageStream()
+        }
+        if conversationStreamTask == nil || conversationStreamTask?.isCancelled == true {
+            SecureLogger.info("📡 Restarting conversation stream after sync", category: .network)
+            startConversationStream()
+        }
     }
     
     // MARK: - User Consent
@@ -551,19 +663,88 @@ final class XMTPClientService: ObservableObject {
         return state.identities.map { $0.identifier }
     }
     
-    /// Resolve the .dstealth.eth name for an inbox ID (if registered)
+    /// Resolve the ENS name for an inbox ID (checks .dstealth.eth, .base.eth, and .eth)
     func resolveDstealthName(for inboxId: String) async -> String? {
         do {
             let addresses = try await getWalletAddresses(for: inboxId)
             for address in addresses {
-                let records = try await NamestoneService.shared.getNames(address: address)
-                if let record = records.first {
+                // 1. Check Namestone for .dstealth.eth names
+                if let records = try? await NamestoneService.shared.getNames(address: address),
+                   let record = records.first {
                     return record.fullName
+                }
+                
+                // 2. Check Basenames API for .base.eth reverse resolution
+                if let baseName = try? await resolveBasename(for: address) {
+                    return baseName
+                }
+                
+                // 3. Check web3.bio for any ENS name (.eth)
+                if let ensName = try? await resolveWeb3BioName(for: address) {
+                    return ensName
                 }
             }
         } catch {
-            SecureLogger.debug("Failed to resolve .dstealth.eth for \(inboxId.prefix(8))…: \(error.localizedDescription)", category: .network)
+            SecureLogger.debug("Failed to resolve ENS name for \(inboxId.prefix(8))…: \(error.localizedDescription)", category: .network)
         }
+        return nil
+    }
+    
+    /// Reverse resolve a .base.eth Basename from a wallet address
+    private func resolveBasename(for address: String) async throws -> String? {
+        guard let url = URL(string: "https://resolver-api.basename.app/address/\(address)") else {
+            return nil
+        }
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.addValue("application/json", forHTTPHeaderField: "Accept")
+        request.timeoutInterval = 8
+        
+        let (data, response) = try await URLSession.shared.data(for: request)
+        
+        guard let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 200 else {
+            return nil
+        }
+        
+        // Parse response - expects {"name": "something.base.eth"}
+        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let name = json["name"] as? String, !name.isEmpty {
+            return name
+        }
+        
+        return nil
+    }
+    
+    /// Reverse resolve any ENS name from a wallet address via web3.bio
+    private func resolveWeb3BioName(for address: String) async throws -> String? {
+        guard let url = URL(string: "https://api.web3.bio/profile/\(address)") else {
+            return nil
+        }
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.addValue("application/json", forHTTPHeaderField: "Accept")
+        request.timeoutInterval = 8
+        
+        let (data, response) = try await URLSession.shared.data(for: request)
+        
+        guard let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 200 else {
+            return nil
+        }
+        
+        // Parse array of profiles and find first ENS identity
+        if let profiles = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+            for profile in profiles {
+                if let identity = profile["identity"] as? String,
+                   identity.hasSuffix(".eth") {
+                    return identity
+                }
+            }
+        }
+        
         return nil
     }
     

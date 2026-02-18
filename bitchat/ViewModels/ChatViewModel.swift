@@ -898,15 +898,20 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
             return
         }
         
-        // Wait for XMTP to be ready (max 30 seconds)
+        // Wait for XMTP to be ready with a valid inbox ID (max 30 seconds)
         var attempts = 0
-        while !XMTPServiceContainer.isConfigured && attempts < 30 {
+        while attempts < 30 {
+            if XMTPServiceContainer.isConfigured,
+               XMTPServiceContainer.shared.clientService.inboxId != nil {
+                break
+            }
             try? await Task.sleep(nanoseconds: 1_000_000_000)
             attempts += 1
         }
         
-        guard XMTPServiceContainer.isConfigured else {
-            SecureLogger.debug("XMTP not ready, skipping ENS registration", category: .network)
+        guard XMTPServiceContainer.isConfigured,
+              let inboxId = XMTPServiceContainer.shared.clientService.inboxId else {
+            SecureLogger.debug("XMTP not ready or inbox ID unavailable, skipping ENS registration", category: .network)
             return
         }
         
@@ -915,7 +920,6 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         
         do {
             let address = try await wallet.getAddress()
-            let inboxId = XMTPServiceContainer.shared.clientService.inboxId
             
             // Try to register the ENS name
             let success = try await NamestoneService.shared.setName(
@@ -929,14 +933,13 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
                 await MainActor.run {
                     groupDefaults.set(fullName, forKey: ensKey)
                 }
-                SecureLogger.info("Registered ENS name: \(fullName)", category: .network)
+                SecureLogger.info("Registered ENS name: \(fullName) with inboxId: \(inboxId.prefix(16))…", category: .network)
             }
         } catch NamestoneError.nameAlreadyTaken {
             // Name collision - try with a different suffix
             let uniqueNickname = "\(nickname)-\(Int.random(in: 100...999))"
             do {
                 let address = try await wallet.getAddress()
-                let inboxId = XMTPServiceContainer.shared.clientService.inboxId
                 
                 let success = try await NamestoneService.shared.setName(
                     name: uniqueNickname,
