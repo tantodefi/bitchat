@@ -22,6 +22,7 @@
 
 import BitLogger
 import Foundation
+import Tor
 
 // MARK: - FFI Declarations (resolve when helios.xcframework is linked)
 //
@@ -316,10 +317,12 @@ public final class HeliosManager: ObservableObject {
             : true  // Default to testnet for safety
         let network: EthereumNetwork = useTestnet ? .sepolia : .mainnet
 
-        SecureLogger.info("HeliosManager: Tor is ready, auto-starting Helios on \(network.rawValue)", category: .network)
+        // Tor triggered this, so we know it's ready — pass the port explicitly
+        let torPort: UInt16 = 39050
+        SecureLogger.info("HeliosManager: Tor is ready, auto-starting Helios on \(network.rawValue) via Tor (:\(torPort))", category: .network)
 
         do {
-            try await start(network: network)
+            try await start(network: network, torSocksPort: torPort)
         } catch {
             SecureLogger.error("HeliosManager: Auto-start failed: \(error)", category: .network)
         }
@@ -334,26 +337,39 @@ public final class HeliosManager: ObservableObject {
 
     // MARK: - Lifecycle
 
-    /// Start the Helios light client with Tor proxy integration.
+    /// Start the Helios light client with optional Tor proxy integration.
     ///
-    /// 1. Initializes the Rust FFI layer (creates EthereumClient)
-    /// 2. Begins consensus sync in the background
-    /// 3. Blocks until first sync completes (~2s on WiFi, ~10s via Tor)
-    /// 4. Once synced, `getBalance()` and `getLogs()` return verified data
+    /// 1. Checks if Tor is available; uses direct connection if not
+    /// 2. Initializes the Rust FFI layer (creates EthereumClient)
+    /// 3. Begins consensus sync in the background
+    /// 4. Blocks until first sync completes (~2s on WiFi, ~10s via Tor)
+    /// 5. Once synced, `getBalance()` and `getLogs()` return verified data
     ///
-    /// All upstream requests are routed through Tor SOCKS5 at port 39050.
+    /// If Tor is ready, upstream requests are routed through SOCKS5 for IP
+    /// privacy. If Tor is not available, Helios connects directly — still
+    /// providing cryptographic verification, just without IP privacy.
     public func start(
         network: EthereumNetwork = .mainnet,
         rpcUrl: String? = nil,
         consensusRpc: String? = nil,
         checkpoint: String? = nil,
-        torSocksPort: UInt16 = 39050
+        torSocksPort: UInt16? = nil
     ) async throws {
         #if HELIOS_FFI_AVAILABLE
         guard !isRunning else { throw HeliosError.alreadyRunning }
 
         let effectiveRpc = rpcUrl ?? network.defaultRpcUrl
         let effectiveConsensus = consensusRpc ?? network.defaultConsensusRpc
+
+        // Resolve Tor port: use explicit value, or auto-detect from TorManager
+        let resolvedTorPort: UInt16
+        if let torSocksPort {
+            resolvedTorPort = torSocksPort
+        } else if TorManager.shared.isReady {
+            resolvedTorPort = 39050 // Standard Arti SOCKS5 port
+        } else {
+            resolvedTorPort = 0 // Direct connection (no Tor)
+        }
 
         syncStatus = .syncing(progress: 0)
         lastError = nil
@@ -366,8 +382,9 @@ public final class HeliosManager: ObservableObject {
             checkpointStr = await Self.fetchLatestCheckpoint(network: network)
         }
 
+        let torLabel = resolvedTorPort > 0 ? "via Tor (:\(resolvedTorPort))" : "direct (no Tor)"
         SecureLogger.info(
-            "HeliosManager: Starting \(network.rawValue) with RPC=\(effectiveRpc), consensus=\(effectiveConsensus), torPort=\(torSocksPort)",
+            "HeliosManager: Starting \(network.rawValue) \(torLabel) with RPC=\(effectiveRpc), consensus=\(effectiveConsensus)",
             category: .network
         )
 
@@ -378,7 +395,7 @@ public final class HeliosManager: ObservableObject {
                     effectiveConsensus.withCString { consensus in
                         checkpointStr.withCString { cp in
                             network.ffiName.withCString { net in
-                                _helios_init(rpc, consensus, cp, net, torSocksPort)
+                                _helios_init(rpc, consensus, cp, net, resolvedTorPort)
                             }
                         }
                     }
@@ -407,10 +424,20 @@ public final class HeliosManager: ObservableObject {
         }
 
         guard syncResult == 0 else {
-            let err = HeliosError.syncFailed(code: syncResult)
-            syncStatus = .error(err.localizedDescription ?? "Sync failed")
-            lastError = err.localizedDescription
+            // Sync failed — shut down the FFI layer so it can be re-initialized
+            heliosQueue.sync { _ = _helios_shutdown() }
             isRunning = false
+
+            let torDetail = resolvedTorPort > 0
+                ? " (Tor port \(resolvedTorPort) — is Tor actually running?)"
+                : " (direct connection)"
+            let err = HeliosError.syncFailed(code: syncResult)
+            syncStatus = .error((err.localizedDescription ?? "Sync failed") + torDetail)
+            lastError = (err.localizedDescription ?? "Sync failed") + torDetail
+            SecureLogger.error(
+                "HeliosManager: Sync failed (code \(syncResult))\(torDetail). FFI state cleared for retry.",
+                category: .network
+            )
             throw err
         }
 
@@ -424,21 +451,22 @@ public final class HeliosManager: ObservableObject {
         #endif
     }
 
-    /// Stop the Helios client.
+    /// Stop the Helios client and clear FFI state (allows re-initialization).
     public func stop() {
-        guard isRunning else { return }
-
         syncPollTask?.cancel()
         syncPollTask = nil
 
         #if HELIOS_FFI_AVAILABLE
-        heliosQueue.sync { _ = _helios_shutdown() }
+        if isRunning {
+            heliosQueue.sync { _ = _helios_shutdown() }
+        }
         #endif
 
         isRunning = false
         syncStatus = .notStarted
         lastError = nil
-        SecureLogger.info("HeliosManager: Stopped", category: .network)
+        autoStartAttempted = false  // Allow auto-start on next Tor ready
+        SecureLogger.info("HeliosManager: Stopped, FFI state cleared", category: .network)
     }
 
     // MARK: - Verified Queries

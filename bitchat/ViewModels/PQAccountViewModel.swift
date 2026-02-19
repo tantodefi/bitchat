@@ -316,30 +316,49 @@ final class PQAccountViewModel: ObservableObject {
         }
     }
     
+    /// Chains that are not yet deployed but have services configured.
+    var undeployedChains: [PQAccountDeployer.Chain] {
+        PQAccountDeployer.Chain.allCases.filter { chain in
+            let deployed = chainStatuses.first(where: { $0.chain.chainId == chain.chainId })?.isDeployed == true
+            let hasServices = chainServices[chain.chainId] != nil
+            return !deployed && hasServices
+        }
+    }
+    
+    /// Whether there are additional chains available for deployment
+    /// (e.g., deployed on Sepolia but not yet on Arbitrum Sepolia).
+    var hasUndeployedChains: Bool {
+        !undeployedChains.isEmpty
+    }
+    
     // MARK: - Deployment
     
     /// Deploy the PQ smart account on the selected target chain(s).
+    /// Works in both .keysReady and .deployed states — if already deployed
+    /// on one chain, deploys on any remaining undeployed chains.
+    /// CREATE2 guarantees the same address on all EVM chains.
     func deployToTarget() async {
         let chains = deployTarget.chains
         
         // Filter to only undeployed chains that have services
-        let chainsToDeply = chains.filter { chain in
+        let chainsToDeploy = chains.filter { chain in
             let alreadyDeployed = chainStatuses.first(where: { $0.chain.chainId == chain.chainId })?.isDeployed == true
             let hasServices = chainServices[chain.chainId] != nil
             return !alreadyDeployed && hasServices
         }
         
-        guard !chainsToDeply.isEmpty else {
+        guard !chainsToDeploy.isEmpty else {
             lastError = "All selected chains already deployed or not configured"
             return
         }
         
+        let previousState = state
         state = .deploying
         lastError = nil
         
         // Deploy on each chain concurrently
         await withTaskGroup(of: Void.self) { group in
-            for chain in chainsToDeply {
+            for chain in chainsToDeploy {
                 group.addTask { [weak self] in
                     await self?.deployOnChain(chain)
                 }
@@ -352,10 +371,24 @@ final class PQAccountViewModel: ObservableObject {
             state = .deployed(address)
         } else if chainStatuses.contains(where: { $0.error != nil }) {
             let errors = chainStatuses.compactMap(\.error).joined(separator: "; ")
-            state = .error(errors)
+            // If we were already deployed on at least one chain, stay deployed
+            if case .deployed(let addr) = previousState {
+                state = .deployed(addr)
+                lastError = errors
+            } else {
+                state = .error(errors)
+            }
         } else {
             state = .keysReady
         }
+    }
+    
+    /// Deploy on all remaining undeployed chains (convenience for "Deploy Everywhere").
+    func deployOnRemainingChains() async {
+        let saved = deployTarget
+        deployTarget = .both
+        await deployToTarget()
+        deployTarget = saved
     }
     
     /// Deploy on a specific chain

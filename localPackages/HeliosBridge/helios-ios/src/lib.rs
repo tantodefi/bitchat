@@ -25,7 +25,7 @@ use std::sync::Mutex;
 use alloy::eips::BlockNumberOrTag;
 use alloy::primitives::{Address, B256};
 use alloy::rpc::types::{Filter, TransactionRequest};
-use once_cell::sync::OnceCell;
+use once_cell::sync::Lazy;
 use tokio::runtime::Runtime;
 
 use helios_ethereum::config::networks::Network;
@@ -47,7 +47,11 @@ struct HeliosState {
     client: EthereumClient,
 }
 
-static HELIOS_STATE: OnceCell<Mutex<HeliosState>> = OnceCell::new();
+/// Resettable global state. Using `Mutex<Option<...>>` instead of `OnceCell`
+/// so that `helios_shutdown()` can fully clear the state, allowing
+/// `helios_init()` to be called again (e.g., after a sync failure or
+/// network change) without requiring an app restart.
+static HELIOS_STATE: Lazy<Mutex<Option<HeliosState>>> = Lazy::new(|| Mutex::new(None));
 static IS_RUNNING: AtomicBool = AtomicBool::new(false);
 static IS_SYNCED: AtomicBool = AtomicBool::new(false);
 /// Sync progress: 0 = not started, 1-99 = syncing, 100 = synced, -1 = error
@@ -147,10 +151,13 @@ pub extern "C" fn helios_init(
         }
     };
 
-    // Store global state
+    // Store global state (replaces any previous state)
     let state = HeliosState { runtime, client };
-    if HELIOS_STATE.set(Mutex::new(state)).is_err() {
-        return -3; // Already initialized (OnceCell)
+    match HELIOS_STATE.lock() {
+        Ok(mut guard) => {
+            *guard = Some(state);
+        }
+        Err(_) => return -3,
     }
 
     IS_RUNNING.store(true, Ordering::SeqCst);
@@ -175,8 +182,12 @@ pub extern "C" fn helios_wait_synced() -> c_int {
         return -1;
     }
 
-    let state = match HELIOS_STATE.get().and_then(|s| s.lock().ok()) {
-        Some(g) => g,
+    let guard = match HELIOS_STATE.lock() {
+        Ok(g) => g,
+        Err(_) => return -1,
+    };
+    let state = match guard.as_ref() {
+        Some(s) => s,
         None => return -1,
     };
 
@@ -261,8 +272,12 @@ pub extern "C" fn helios_get_balance(
         Err(_) => return -2,
     };
 
-    let state = match HELIOS_STATE.get().and_then(|s| s.lock().ok()) {
-        Some(g) => g,
+    let guard = match HELIOS_STATE.lock() {
+        Ok(g) => g,
+        Err(_) => return -1,
+    };
+    let state = match guard.as_ref() {
+        Some(s) => s,
         None => return -1,
     };
 
@@ -326,8 +341,12 @@ pub extern "C" fn helios_get_logs(
         }
     };
 
-    let state = match HELIOS_STATE.get().and_then(|s| s.lock().ok()) {
-        Some(g) => g,
+    let guard = match HELIOS_STATE.lock() {
+        Ok(g) => g,
+        Err(_) => return -1,
+    };
+    let state = match guard.as_ref() {
+        Some(s) => s,
         None => return -1,
     };
 
@@ -393,8 +412,12 @@ pub extern "C" fn helios_eth_call(
         }
     };
 
-    let state = match HELIOS_STATE.get().and_then(|s| s.lock().ok()) {
-        Some(g) => g,
+    let guard = match HELIOS_STATE.lock() {
+        Ok(g) => g,
+        Err(_) => return -1,
+    };
+    let state = match guard.as_ref() {
+        Some(s) => s,
         None => return -1,
     };
 
@@ -454,8 +477,12 @@ pub extern "C" fn helios_get_nonce(
         Err(_) => return -2,
     };
 
-    let state = match HELIOS_STATE.get().and_then(|s| s.lock().ok()) {
-        Some(g) => g,
+    let guard = match HELIOS_STATE.lock() {
+        Ok(g) => g,
+        Err(_) => return -1,
+    };
+    let state = match guard.as_ref() {
+        Some(s) => s,
         None => return -1,
     };
 
@@ -511,8 +538,12 @@ pub extern "C" fn helios_get_transaction_receipt(
         Err(_) => return -2,
     };
 
-    let state = match HELIOS_STATE.get().and_then(|s| s.lock().ok()) {
-        Some(g) => g,
+    let guard = match HELIOS_STATE.lock() {
+        Ok(g) => g,
+        Err(_) => return -1,
+    };
+    let state = match guard.as_ref() {
+        Some(s) => s,
         None => return -1,
     };
 
@@ -585,8 +616,12 @@ pub extern "C" fn helios_get_block_by_number(
         }
     };
 
-    let state = match HELIOS_STATE.get().and_then(|s| s.lock().ok()) {
-        Some(g) => g,
+    let guard = match HELIOS_STATE.lock() {
+        Ok(g) => g,
+        Err(_) => return -1,
+    };
+    let state = match guard.as_ref() {
+        Some(s) => s,
         None => return -1,
     };
 
@@ -651,8 +686,12 @@ pub extern "C" fn helios_estimate_gas(
         }
     };
 
-    let state = match HELIOS_STATE.get().and_then(|s| s.lock().ok()) {
-        Some(g) => g,
+    let guard = match HELIOS_STATE.lock() {
+        Ok(g) => g,
+        Err(_) => return -1,
+    };
+    let state = match guard.as_ref() {
+        Some(s) => s,
         None => return -1,
     };
 
@@ -703,8 +742,12 @@ pub extern "C" fn helios_send_raw_transaction(
         Err(_) => return -2,
     };
 
-    let state = match HELIOS_STATE.get().and_then(|s| s.lock().ok()) {
-        Some(g) => g,
+    let guard = match HELIOS_STATE.lock() {
+        Ok(g) => g,
+        Err(_) => return -1,
+    };
+    let state = match guard.as_ref() {
+        Some(s) => s,
         None => return -1,
     };
 
@@ -741,8 +784,12 @@ pub extern "C" fn helios_gas_price(
         return -1;
     }
 
-    let state = match HELIOS_STATE.get().and_then(|s| s.lock().ok()) {
-        Some(g) => g,
+    let guard = match HELIOS_STATE.lock() {
+        Ok(g) => g,
+        Err(_) => return -1,
+    };
+    let state = match guard.as_ref() {
+        Some(s) => s,
         None => return -1,
     };
 
@@ -793,8 +840,12 @@ pub extern "C" fn helios_get_pending_nonce(
         Err(_) => return -2,
     };
 
-    let state = match HELIOS_STATE.get().and_then(|s| s.lock().ok()) {
-        Some(g) => g,
+    let guard = match HELIOS_STATE.lock() {
+        Ok(g) => g,
+        Err(_) => return -1,
+    };
+    let state = match guard.as_ref() {
+        Some(s) => s,
         None => return -1,
     };
 
@@ -832,8 +883,12 @@ pub extern "C" fn helios_finalized_block() -> i64 {
         return -1;
     }
 
-    let state = match HELIOS_STATE.get().and_then(|s| s.lock().ok()) {
-        Some(g) => g,
+    let guard = match HELIOS_STATE.lock() {
+        Ok(g) => g,
+        Err(_) => return -1,
+    };
+    let state = match guard.as_ref() {
+        Some(s) => s,
         None => return -1,
     };
 
@@ -889,9 +944,12 @@ pub extern "C" fn helios_shutdown() -> c_int {
         std::env::remove_var("HTTPS_PROXY");
     }
 
+    // Drop the client and runtime so helios_init() can be called again
+    if let Ok(mut guard) = HELIOS_STATE.lock() {
+        *guard = None;
+    }
+
     tracing::info!("Helios client shut down");
-    // Note: OnceCell cannot be reset, so re-initialization requires app restart.
-    // The EthereumClient will be dropped when the state is dropped.
     0
 }
 

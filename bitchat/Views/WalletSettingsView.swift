@@ -336,19 +336,70 @@ struct WalletSettingsView: View {
                         }
                     }
                 } else if case .deployed = pqViewModel.state {
-                    // Show per-chain deployment status
-                    ForEach(pqViewModel.chainStatuses.filter { $0.isDeployed }) { status in
+                    // Show per-chain deployment status (deployed + undeployed)
+                    ForEach(pqViewModel.chainStatuses) { status in
                         HStack(spacing: 8) {
-                            Image(systemName: "checkmark.circle.fill")
-                                .foregroundColor(.green)
+                            Image(systemName: status.isDeployed ? "checkmark.circle.fill" : "circle.dashed")
+                                .foregroundColor(status.isDeployed ? .green : .secondary)
                                 .font(.caption)
                             Text(status.displayName)
                                 .font(.caption)
                             Spacer()
-                            Text("Deployed")
-                                .font(.caption2)
-                                .foregroundColor(.green)
+                            if status.isDeployed {
+                                Text("Deployed")
+                                    .font(.caption2)
+                                    .foregroundColor(.green)
+                            } else if status.isDeploying {
+                                ProgressView().scaleEffect(0.6)
+                            } else {
+                                Text("Not deployed")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
                         }
+                    }
+                    
+                    // Deploy on remaining chains button
+                    if pqViewModel.hasUndeployedChains && !pqViewModel.isAnyTargetDeploying {
+                        let undeployed = pqViewModel.undeployedChains
+                        let names = undeployed.map(\.name).joined(separator: " & ")
+                        
+                        // Check gas on undeployed chains
+                        let lowChains = undeployed.filter { chain in
+                            let (sufficient, _) = pqViewModel.checkDeploymentBalance(
+                                chain: chain,
+                                balanceService: balanceService
+                            )
+                            return !sufficient
+                        }
+                        
+                        if !lowChains.isEmpty {
+                            Label {
+                                Text("Need ≥ \(String(format: "%.3f", PQAccountViewModel.minimumDeploymentGasETH)) ETH on \(lowChains.map(\.name).joined(separator: " & "))")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            } icon: {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundColor(.orange)
+                            }
+                        }
+                        
+                        Button {
+                            Task { await pqViewModel.deployOnRemainingChains() }
+                        } label: {
+                            HStack {
+                                Image(systemName: "arrow.up.circle.fill")
+                                Text("Deploy on \(names)")
+                            }
+                            .font(.caption)
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(.orange)
+                        .disabled(!lowChains.isEmpty)
+                        
+                        Text("Same address via CREATE2 — deploy the same Safe on multiple networks.")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
                     }
                 }
                 
@@ -641,9 +692,12 @@ struct WalletSettingsView: View {
             let network: HeliosManager.EthereumNetwork = balanceService.useTestnet ? .sepolia : .mainnet
             Task {
                 do {
+                    // Let HeliosManager auto-detect Tor readiness
+                    // (uses Tor if available, direct connection otherwise)
                     try await helios.start(network: network)
                 } catch {
-                    print("HeliosManager: Manual start failed: \(error)")
+                    let torStatus = TorManager.shared.isReady ? "Tor ready" : "Tor not ready"
+                    SecureLogger.error("HeliosManager: Manual start failed (\(torStatus)): \(error)", category: .network)
                 }
                 await MainActor.run { isStartingHelios = false }
             }
