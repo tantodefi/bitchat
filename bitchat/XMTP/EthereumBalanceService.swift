@@ -313,13 +313,14 @@ final class EthereumBalanceService: ObservableObject {
     /// Also verifies Helios is synced to the matching network.
     private func heliosAvailableForNetwork(_ network: Network) async -> Bool {
         // Only use Helios for networks it supports
+        let isRunning = await HeliosManager.shared.isRunning
+        guard isRunning else { return false }
+        let activeNet = await HeliosManager.shared.activeNetwork
         switch network {
         case .ethereum:
-            return await HeliosManager.shared.isRunning
-                && await HeliosManager.shared.activeNetwork == .mainnet
+            return activeNet == .mainnet
         case .sepolia:
-            return await HeliosManager.shared.isRunning
-                && await HeliosManager.shared.activeNetwork == .sepolia
+            return activeNet == .sepolia
         case .base, .arbitrum, .arbitrumSepolia:
             // Phase 2: Add Base (OP Stack) support
             return false
