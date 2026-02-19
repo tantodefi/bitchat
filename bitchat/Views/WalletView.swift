@@ -583,16 +583,21 @@ struct WalletView: View {
             }
             
             // Pending transactions indicator
-            let txCount = xmtpContainer.meshTransactionRelay.pendingRelays.count + xmtpContainer.meshTransactionRelay.confirmedTransactions.count
+            let currentAddr = displayAddress.lowercased()
+            let filteredConfirmed = xmtpContainer.meshTransactionRelay.confirmedTransactions.filter { tx in
+                let from = tx.fromAddress?.lowercased() ?? currentAddr
+                return from == currentAddr || tx.toAddress.lowercased() == currentAddr
+            }
+            let txCount = xmtpContainer.meshTransactionRelay.pendingRelays.count + filteredConfirmed.count
             if txCount > 0 {
                 Button {
                     showHistorySheet = true
-                } label: {
+                } label:{
                     HStack {
                         if xmtpContainer.meshTransactionRelay.pendingRelays.isEmpty {
                             Image(systemName: "checkmark.circle.fill")
                                 .foregroundColor(.green)
-                            Text("\(xmtpContainer.meshTransactionRelay.confirmedTransactions.count) confirmed transaction(s)")
+                            Text("\(filteredConfirmed.count) confirmed transaction(s)")
                         } else {
                             Image(systemName: "clock.badge.fill")
                                 .foregroundColor(.orange)

@@ -82,6 +82,16 @@ struct AppInfoView: View {
                 title: "app_info.xmtp.tor_privacy.title",
                 description: "app_info.xmtp.tor_privacy.description"
             )
+            static let postQuantumAccount = AppInfoFeatureInfo(
+                icon: "atom",
+                title: "app_info.xmtp.pq_account.title",
+                description: "app_info.xmtp.pq_account.description"
+            )
+            static let heliosLightClient = AppInfoFeatureInfo(
+                icon: "checkmark.shield.fill",
+                title: "app_info.xmtp.helios.title",
+                description: "app_info.xmtp.helios.description"
+            )
         }
 
         enum Privacy {
@@ -296,6 +306,8 @@ struct AppInfoView: View {
                 FeatureRow(info: Strings.XMTP.messaging)
                 FeatureRow(info: Strings.XMTP.offlineTransactions)
                 FeatureRow(info: Strings.XMTP.torPrivacy)
+                FeatureRow(info: Strings.XMTP.postQuantumAccount)
+                FeatureRow(info: Strings.XMTP.heliosLightClient)
                 
                 // Wallet button
                 Button {

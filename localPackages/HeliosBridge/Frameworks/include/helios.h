@@ -19,6 +19,7 @@
  * * `rpc_url` – Upstream execution-layer RPC (e.g. "https://rpc.flashbots.net")
  * * `consensus_rpc` – Beacon API endpoint (e.g. "https://www.lightclientdata.org")
  * * `checkpoint` – Weak subjectivity checkpoint (hex, 0x-prefixed, or empty for external fallback)
+ * * `network` – Network name: "mainnet" or "sepolia" (defaults to mainnet if unrecognised)
  * * `socks_proxy_port` – Tor SOCKS5 port (0 to disable proxy)
  *
  * # Returns
@@ -31,6 +32,7 @@
 int helios_init(const char *rpc_url,
                 const char *consensus_rpc,
                 const char *checkpoint,
+                const char *network,
                 uint16_t socks_proxy_port);
 
 /**

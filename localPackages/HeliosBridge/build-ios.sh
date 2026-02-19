@@ -152,6 +152,7 @@ extern "C" {
  * @param rpc_url Upstream execution RPC URL (C string)
  * @param consensus_rpc Beacon API endpoint (C string)
  * @param checkpoint Weak subjectivity checkpoint hex (C string)
+ * @param network Network name: "mainnet" or "sepolia" (C string)
  * @param socks_proxy_port Tor SOCKS5 port (0 to disable)
  * @return 0 on success, negative on error
  */
@@ -159,6 +160,7 @@ int32_t helios_init(
     const char *rpc_url,
     const char *consensus_rpc,
     const char *checkpoint,
+    const char *network,
     uint16_t socks_proxy_port
 );
 

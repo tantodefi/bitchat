@@ -310,11 +310,16 @@ final class EthereumBalanceService: ObservableObject {
     
     /// Check if Helios is available for a given network.
     /// Currently Helios supports Ethereum mainnet and Sepolia.
+    /// Also verifies Helios is synced to the matching network.
     private func heliosAvailableForNetwork(_ network: Network) async -> Bool {
         // Only use Helios for networks it supports
         switch network {
-        case .ethereum, .sepolia:
+        case .ethereum:
             return await HeliosManager.shared.isRunning
+                && await HeliosManager.shared.activeNetwork == .mainnet
+        case .sepolia:
+            return await HeliosManager.shared.isRunning
+                && await HeliosManager.shared.activeNetwork == .sepolia
         case .base, .arbitrum, .arbitrumSepolia:
             // Phase 2: Add Base (OP Stack) support
             return false

@@ -236,13 +236,14 @@ struct TransactionHistoryView: View {
     // MARK: - Helpers
 
     private func refreshHistory() async {
-        // Default to Ethereum mainnet for on-chain history fetch.
-        // Helios is mainnet-only; testnet txs come from MeshTransactionRelay local state.
+        // Use the correct chain and testnet flag based on balance service settings.
+        let useTestnet = balanceService.useTestnet
+        let chainId: UInt64 = useTestnet ? 11155111 : 1  // Sepolia or Ethereum mainnet
         await historyService.fetchHistory(
             for: filterAddress,
             meshRelay: meshRelay,
-            chainId: 1,
-            useTestnet: false
+            chainId: chainId,
+            useTestnet: useTestnet
         )
     }
 

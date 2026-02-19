@@ -71,6 +71,7 @@ static SYNC_PROGRESS: AtomicI32 = AtomicI32::new(0);
 /// * `rpc_url` – Upstream execution-layer RPC (e.g. "https://rpc.flashbots.net")
 /// * `consensus_rpc` – Beacon API endpoint (e.g. "https://www.lightclientdata.org")
 /// * `checkpoint` – Weak subjectivity checkpoint (hex, 0x-prefixed, or empty for external fallback)
+/// * `network` – Network name: "mainnet" or "sepolia" (defaults to mainnet if unrecognised)
 /// * `socks_proxy_port` – Tor SOCKS5 port (0 to disable proxy)
 ///
 /// # Returns
@@ -84,6 +85,7 @@ pub extern "C" fn helios_init(
     rpc_url: *const c_char,
     consensus_rpc: *const c_char,
     checkpoint: *const c_char,
+    network: *const c_char,
     socks_proxy_port: u16,
 ) -> c_int {
     if IS_RUNNING.load(Ordering::SeqCst) {
@@ -103,6 +105,12 @@ pub extern "C" fn helios_init(
         Some(s) => s,
         None => return -2,
     };
+    let network_str = parse_cstr(network).unwrap_or_else(|| "mainnet".to_string());
+    let net = match network_str.to_lowercase().as_str() {
+        "sepolia" => Network::Sepolia,
+        _ => Network::Mainnet,
+    };
+    tracing::info!("Helios network: {:?}", net);
 
     // Route all HTTP traffic through Tor SOCKS5 proxy.
     // Reqwest respects ALL_PROXY/HTTPS_PROXY when the "socks" feature is enabled.
@@ -131,7 +139,7 @@ pub extern "C" fn helios_init(
     let _guard = runtime.enter();
 
     // Build the Helios Ethereum light client
-    let client = match build_client(&execution_rpc, &consensus, &checkpoint_str) {
+    let client = match build_client(&execution_rpc, &consensus, &checkpoint_str, net) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("Failed to build Helios client: {}", e);
@@ -899,6 +907,7 @@ fn build_client(
     execution_rpc: &str,
     consensus_rpc: &str,
     checkpoint: &str,
+    network: Network,
 ) -> eyre::Result<EthereumClient> {
     // Use a sensible data directory for checkpoint caching
     let data_dir = PathBuf::from(
@@ -907,7 +916,7 @@ fn build_client(
     .join(".helios");
 
     let mut builder = EthereumClientBuilder::new()
-        .network(Network::Mainnet)
+        .network(network)
         .consensus_rpc(consensus_rpc)?
         .execution_rpc(execution_rpc)?
         .load_external_fallback()

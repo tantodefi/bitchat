@@ -638,11 +638,12 @@ struct WalletSettingsView: View {
         .onTapGesture {
             guard helios.isFFIAvailable && !helios.isRunning && !isStartingHelios else { return }
             isStartingHelios = true
+            let network: HeliosManager.EthereumNetwork = balanceService.useTestnet ? .sepolia : .mainnet
             Task {
                 do {
-                    try await helios.start()
+                    try await helios.start(network: network)
                 } catch {
-                    print("HeliosManager: Manual start failed: \\(error)")
+                    print("HeliosManager: Manual start failed: \(error)")
                 }
                 await MainActor.run { isStartingHelios = false }
             }

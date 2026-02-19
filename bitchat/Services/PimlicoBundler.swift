@@ -176,19 +176,77 @@ actor PimlicoBundler {
     
     // MARK: - Helpers
     
-    /// Convert PackedUserOperation to a JSON-RPC compatible dictionary
-    private func userOpToDict(_ op: PackedUserOperation) -> [String: String] {
-        [
+    /// Convert PackedUserOperation to a JSON-RPC compatible dictionary.
+    ///
+    /// ERC-4337 v0.7 uses a *packed* on-chain representation (gasFees, accountGasLimits,
+    /// initCode, paymasterAndData) but the JSON-RPC API expects the *unpacked* individual
+    /// fields (maxFeePerGas, maxPriorityFeePerGas, callGasLimit, verificationGasLimit,
+    /// factory, factoryData, paymaster, etc.).
+    private func userOpToDict(_ op: PackedUserOperation) -> [String: Any] {
+        var dict: [String: Any] = [
             "sender": ABIEncoder.dataToHex(op.sender, prefixed: true),
             "nonce": ABIEncoder.dataToHex(op.nonce, prefixed: true),
-            "initCode": ABIEncoder.dataToHex(op.initCode, prefixed: true),
             "callData": ABIEncoder.dataToHex(op.callData, prefixed: true),
-            "accountGasLimits": ABIEncoder.dataToHex(op.accountGasLimits, prefixed: true),
-            "preVerificationGas": ABIEncoder.dataToHex(op.preVerificationGas, prefixed: true),
-            "gasFees": ABIEncoder.dataToHex(op.gasFees, prefixed: true),
-            "paymasterAndData": ABIEncoder.dataToHex(op.paymasterAndData, prefixed: true),
-            "signature": ABIEncoder.dataToHex(op.signature, prefixed: true)
+            "signature": ABIEncoder.dataToHex(op.signature, prefixed: true),
         ]
+        
+        // Unpack accountGasLimits (32 bytes) → verificationGasLimit (upper 16) + callGasLimit (lower 16)
+        if op.accountGasLimits.count == 32 {
+            let vgl = unpackUInt256Hex(op.accountGasLimits.subdata(in: 0..<16))
+            let cgl = unpackUInt256Hex(op.accountGasLimits.subdata(in: 16..<32))
+            dict["verificationGasLimit"] = vgl
+            dict["callGasLimit"] = cgl
+        }
+        
+        // preVerificationGas as hex string
+        dict["preVerificationGas"] = ABIEncoder.dataToHex(op.preVerificationGas, prefixed: true)
+        
+        // Unpack gasFees (32 bytes) → maxPriorityFeePerGas (upper 16) + maxFeePerGas (lower 16)
+        if op.gasFees.count == 32 {
+            let mpfpg = unpackUInt256Hex(op.gasFees.subdata(in: 0..<16))
+            let mfpg = unpackUInt256Hex(op.gasFees.subdata(in: 16..<32))
+            dict["maxPriorityFeePerGas"] = mpfpg
+            dict["maxFeePerGas"] = mfpg
+        }
+        
+        // Unpack initCode → factory (first 20 bytes) + factoryData (rest)
+        if op.initCode.count >= 20 {
+            let factory = "0x" + op.initCode.subdata(in: 0..<20).map { String(format: "%02x", $0) }.joined()
+            let factoryData = "0x" + op.initCode.subdata(in: 20..<op.initCode.count).map { String(format: "%02x", $0) }.joined()
+            dict["factory"] = factory
+            dict["factoryData"] = factoryData
+        } else if op.initCode.isEmpty {
+            // No factory needed (account already deployed)
+        } else {
+            // Malformed initCode — pass as-is for debugging
+            dict["factory"] = ABIEncoder.dataToHex(op.initCode, prefixed: true)
+            dict["factoryData"] = "0x"
+        }
+        
+        // Unpack paymasterAndData → paymaster (20) + paymasterVerificationGasLimit (16) + paymasterPostOpGasLimit (16) + paymasterData (rest)
+        if op.paymasterAndData.count >= 52 {
+            let paymaster = "0x" + op.paymasterAndData.subdata(in: 0..<20).map { String(format: "%02x", $0) }.joined()
+            let pmVGL = unpackUInt256Hex(op.paymasterAndData.subdata(in: 20..<36))
+            let pmPOGL = unpackUInt256Hex(op.paymasterAndData.subdata(in: 36..<52))
+            let pmData = "0x" + op.paymasterAndData.subdata(in: 52..<op.paymasterAndData.count).map { String(format: "%02x", $0) }.joined()
+            dict["paymaster"] = paymaster
+            dict["paymasterVerificationGasLimit"] = pmVGL
+            dict["paymasterPostOpGasLimit"] = pmPOGL
+            dict["paymasterData"] = pmData
+        } else if op.paymasterAndData.isEmpty {
+            // No paymaster
+        }
+        
+        return dict
+    }
+    
+    /// Convert big-endian bytes (up to 16 bytes / 128-bit) to a 0x-prefixed hex uint256 string.
+    /// Strips leading zeros for a clean minimal hex representation.
+    private func unpackUInt256Hex(_ data: Data) -> String {
+        let hex = data.map { String(format: "%02x", $0) }.joined()
+        // Strip leading zeros but keep at least one digit
+        let stripped = String(hex.drop(while: { $0 == "0" }))
+        return "0x" + (stripped.isEmpty ? "0" : stripped)
     }
     
     private func parseHexUInt64(_ value: Any?) -> UInt64? {

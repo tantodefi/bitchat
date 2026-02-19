@@ -34,6 +34,7 @@ private func _helios_init(
     _ rpcUrl: UnsafePointer<CChar>,
     _ consensusRpc: UnsafePointer<CChar>,
     _ checkpoint: UnsafePointer<CChar>,
+    _ network: UnsafePointer<CChar>,
     _ socksProxyPort: UInt16
 ) -> Int32
 
@@ -151,8 +152,50 @@ public final class HeliosManager: ObservableObject {
     @Published public private(set) var isRunning = false
     @Published public private(set) var syncStatus: SyncStatus = .notStarted
     @Published public private(set) var lastError: String?
+    @Published public private(set) var activeNetwork: EthereumNetwork = .mainnet
 
     // MARK: - Types
+
+    /// The Ethereum network Helios should sync to.
+    public enum EthereumNetwork: String {
+        case mainnet
+        case sepolia
+
+        /// Default execution-layer RPC for this network
+        public var defaultRpcUrl: String {
+            switch self {
+            case .mainnet: return "https://rpc.flashbots.net"
+            case .sepolia: return "https://ethereum-sepolia-rpc.publicnode.com"
+            }
+        }
+
+        /// Default consensus-layer (beacon) RPC for this network
+        public var defaultConsensusRpc: String {
+            switch self {
+            case .mainnet: return "https://www.lightclientdata.org"
+            case .sepolia: return "https://lodestar-sepolia.chainsafe.io"
+            }
+        }
+
+        /// Checkpoint sources for fetching a fresh weak subjectivity checkpoint
+        public var checkpointSources: [String] {
+            switch self {
+            case .mainnet:
+                return [
+                    "https://www.lightclientdata.org/mainnet/head",
+                    "https://beaconcha.in/api/v1/epoch/finalized",
+                ]
+            case .sepolia:
+                return [
+                    "https://sepolia.beaconstate.info/eth/v1/beacon/headers/finalized",
+                    "https://lodestar-sepolia.chainsafe.io/eth/v1/beacon/headers/finalized",
+                ]
+            }
+        }
+
+        /// FFI network string passed to the Rust layer
+        public var ffiName: String { rawValue }
+    }
 
     public enum SyncStatus: Equatable {
         case notStarted
@@ -267,10 +310,16 @@ public final class HeliosManager: ObservableObject {
         guard !isRunning else { return }
         guard isFFIAvailable else { return }
 
-        SecureLogger.info("HeliosManager: Tor is ready, auto-starting Helios", category: .network)
+        // Detect testnet/mainnet from the user's wallet preference
+        let useTestnet = UserDefaults.standard.object(forKey: "wallet-use-testnet") != nil
+            ? UserDefaults.standard.bool(forKey: "wallet-use-testnet")
+            : true  // Default to testnet for safety
+        let network: EthereumNetwork = useTestnet ? .sepolia : .mainnet
+
+        SecureLogger.info("HeliosManager: Tor is ready, auto-starting Helios on \(network.rawValue)", category: .network)
 
         do {
-            try await start()
+            try await start(network: network)
         } catch {
             SecureLogger.error("HeliosManager: Auto-start failed: \(error)", category: .network)
         }
@@ -294,36 +343,43 @@ public final class HeliosManager: ObservableObject {
     ///
     /// All upstream requests are routed through Tor SOCKS5 at port 39050.
     public func start(
-        rpcUrl: String = "https://rpc.flashbots.net",
-        consensusRpc: String = "https://www.lightclientdata.org",
+        network: EthereumNetwork = .mainnet,
+        rpcUrl: String? = nil,
+        consensusRpc: String? = nil,
         checkpoint: String? = nil,
         torSocksPort: UInt16 = 39050
     ) async throws {
         #if HELIOS_FFI_AVAILABLE
         guard !isRunning else { throw HeliosError.alreadyRunning }
 
+        let effectiveRpc = rpcUrl ?? network.defaultRpcUrl
+        let effectiveConsensus = consensusRpc ?? network.defaultConsensusRpc
+
         syncStatus = .syncing(progress: 0)
         lastError = nil
+        activeNetwork = network
 
         let checkpointStr: String
         if let checkpoint {
             checkpointStr = checkpoint
         } else {
-            checkpointStr = await Self.fetchLatestCheckpoint()
+            checkpointStr = await Self.fetchLatestCheckpoint(network: network)
         }
 
         SecureLogger.info(
-            "HeliosManager: Starting with RPC=\(rpcUrl), consensus=\(consensusRpc), torPort=\(torSocksPort)",
+            "HeliosManager: Starting \(network.rawValue) with RPC=\(effectiveRpc), consensus=\(effectiveConsensus), torPort=\(torSocksPort)",
             category: .network
         )
 
         // Step 1: Initialize the Helios client (non-blocking, starts sync loop)
         let initResult: Int32 = try await withCheckedThrowingContinuation { continuation in
             heliosQueue.async {
-                let code = rpcUrl.withCString { rpc in
-                    consensusRpc.withCString { consensus in
+                let code = effectiveRpc.withCString { rpc in
+                    effectiveConsensus.withCString { consensus in
                         checkpointStr.withCString { cp in
-                            _helios_init(rpc, consensus, cp, torSocksPort)
+                            network.ffiName.withCString { net in
+                                _helios_init(rpc, consensus, cp, net, torSocksPort)
+                            }
                         }
                     }
                 }
@@ -723,11 +779,8 @@ public final class HeliosManager: ObservableObject {
     ///
     /// Sources are queried in order; the first valid response wins.
     /// Falls back to the bundled checkpoint if all sources fail.
-    public static func fetchLatestCheckpoint() async -> String {
-        let sources = [
-            "https://www.lightclientdata.org/mainnet/head",
-            "https://beaconcha.in/api/v1/epoch/finalized",
-        ]
+    public static func fetchLatestCheckpoint(network: EthereumNetwork = .mainnet) async -> String {
+        let sources = network.checkpointSources
 
         for source in sources {
             guard let url = URL(string: source) else { continue }
@@ -735,18 +788,28 @@ public final class HeliosManager: ObservableObject {
                 let (data, response) = try await URLSession.shared.data(from: url)
                 guard let httpResponse = response as? HTTPURLResponse,
                       httpResponse.statusCode == 200 else { continue }
-                if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   let checkpoint = json["data"] as? String,
-                   checkpoint.hasPrefix("0x") {
-                    SecureLogger.info("HeliosManager: Got checkpoint from \(source)", category: .network)
-                    return checkpoint
+
+                // Try standard beacon API response format: {"data":{"root":"0x..."}}
+                if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    // Format 1: lightclientdata.org style {"data": "0x..."}
+                    if let checkpoint = json["data"] as? String, checkpoint.hasPrefix("0x") {
+                        SecureLogger.info("HeliosManager: Got \(network.rawValue) checkpoint from \(source)", category: .network)
+                        return checkpoint
+                    }
+                    // Format 2: Beacon API style {"data":{"root":"0x..."}}
+                    if let dataObj = json["data"] as? [String: Any],
+                       let root = dataObj["root"] as? String,
+                       root.hasPrefix("0x") {
+                        SecureLogger.info("HeliosManager: Got \(network.rawValue) checkpoint from \(source)", category: .network)
+                        return root
+                    }
                 }
             } catch {
                 continue
             }
         }
 
-        SecureLogger.info("HeliosManager: Using bundled checkpoint (external sources failed)", category: .network)
+        SecureLogger.info("HeliosManager: Using bundled checkpoint for \(network.rawValue) (external sources failed)", category: .network)
         return bundledCheckpoint
     }
 }

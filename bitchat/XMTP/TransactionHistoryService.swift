@@ -223,7 +223,7 @@ final class TransactionHistoryService: ObservableObject {
 
         // Confirmed transactions
         for confirmed in relay.confirmedTransactions {
-            let from = confirmed.fromAddress?.lowercased() ?? ""
+            let from = confirmed.fromAddress?.lowercased() ?? normalizedAddr
             let isFrom = from == normalizedAddr
             let isTo = confirmed.toAddress.lowercased() == normalizedAddr
 
@@ -252,7 +252,7 @@ final class TransactionHistoryService: ObservableObject {
 
         // Failed transactions
         for failed in relay.failedTransactions {
-            let from = failed.fromAddress?.lowercased() ?? ""
+            let from = failed.fromAddress?.lowercased() ?? normalizedAddr
             guard from == normalizedAddr else { continue }
 
             results.append(OnChainTransaction(

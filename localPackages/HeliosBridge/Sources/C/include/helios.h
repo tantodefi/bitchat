@@ -11,14 +11,16 @@ extern "C" {
 /**
  * Initialize the Helios light client.
  *
- * Builds an EthereumClient configured for mainnet. If socks_proxy_port > 0,
- * all upstream HTTP requests are routed through Tor at 127.0.0.1:<port>.
+ * Builds an EthereumClient configured for the specified network.
+ * If socks_proxy_port > 0, all upstream HTTP requests are routed
+ * through Tor at 127.0.0.1:<port>.
  * The client begins consensus sync immediately. Use helios_wait_synced()
  * to block until ready, or poll with helios_is_synced().
  *
  * @param rpc_url Upstream execution RPC URL (C string)
  * @param consensus_rpc Beacon API endpoint (C string)
  * @param checkpoint Weak subjectivity checkpoint hex (C string, or empty)
+ * @param network Network name: "mainnet" or "sepolia" (C string)
  * @param socks_proxy_port Tor SOCKS5 port (0 to disable)
  * @return 0 on success, -1 already running, -2 bad params, -3 runtime error, -4 build error
  */
@@ -26,6 +28,7 @@ int32_t helios_init(
     const char *rpc_url,
     const char *consensus_rpc,
     const char *checkpoint,
+    const char *network,
     uint16_t socks_proxy_port
 );
 
