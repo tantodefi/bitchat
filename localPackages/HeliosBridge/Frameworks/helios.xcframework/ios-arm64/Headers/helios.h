@@ -41,6 +41,10 @@ int helios_init(const char *rpc_url,
  * This blocks the calling thread. Call from a background queue/thread.
  * After this returns 0, `helios_get_balance` etc. will return verified data.
  *
+ * The state is temporarily taken out of the global mutex during the
+ * blocking sync call to prevent mutex poisoning if the Helios client
+ * panics internally. The state is always put back afterward.
+ *
  * # Returns
  * * 0 on success (synced)
  * * -1 if not initialized

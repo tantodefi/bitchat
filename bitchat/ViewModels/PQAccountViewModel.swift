@@ -117,6 +117,9 @@ final class PQAccountViewModel: ObservableObject {
     /// Minimum gas required for deployment (rough estimate: ~0.005 ETH)
     static let minimumDeploymentGasETH: Double = 0.002
     
+    /// UserDefaults key for persisting deployed chain IDs
+    private static let deployedChainsKey = "pq-deployed-chain-ids"
+    
     /// Whether the deployment services are configured (Pimlico API key set)
     var canDeploy: Bool {
         !chainServices.isEmpty
@@ -164,11 +167,12 @@ final class PQAccountViewModel: ObservableObject {
         self.pqKeyManager = pqKeyManager
         self.chainServices = Dictionary(uniqueKeysWithValues: chainServiceSets.map { ($0.chain.chainId, $0) })
         
-        // Initialize per-chain status tracking
+        // Initialize per-chain status tracking, restoring persisted deployment state
+        let persistedChainIds = Self.loadDeployedChainIds()
         chainStatuses = PQAccountDeployer.Chain.allCases.map { chain in
             PQChainDeploymentStatus(
                 chain: chain,
-                isDeployed: false,
+                isDeployed: persistedChainIds.contains(chain.chainId),
                 isDeploying: false
             )
         }
@@ -282,9 +286,11 @@ final class PQAccountViewModel: ObservableObject {
         }
     }
     
-    /// Check deployment status on all configured chains (concurrent with timeout)
+    /// Check deployment status on all configured chains (concurrent with timeout).
+    /// Never downgrades a persisted "deployed" status on RPC failure — only
+    /// upgrades "not deployed" → "deployed" when an RPC confirms it.
     private func checkAllChainDeployments(address: String) async {
-        await withTaskGroup(of: (UInt64, Bool).self) { group in
+        await withTaskGroup(of: (UInt64, Bool?).self) { group in
             for (chainId, serviceSet) in chainServices {
                 group.addTask {
                     do {
@@ -297,20 +303,31 @@ final class PQAccountViewModel: ObservableObject {
                                 try await Task.sleep(nanoseconds: 10_000_000_000)
                                 throw DeployerError.networkError("Timeout checking deployment")
                             }
-                            // First to finish wins
                             let result = try await inner.next()!
                             inner.cancelAll()
                             return result
                         }
                         return (chainId, deployed)
                     } catch {
-                        return (chainId, false)
+                        // RPC failed — return nil so we don't override persisted state
+                        return (chainId, nil)
                     }
                 }
             }
-            for await (chainId, deployed) in group {
+            for await (chainId, rpcResult) in group {
                 if let idx = chainStatuses.firstIndex(where: { $0.chain.chainId == chainId }) {
-                    chainStatuses[idx].isDeployed = deployed
+                    if let rpcResult {
+                        // RPC responded — update and persist if newly deployed
+                        if rpcResult && !chainStatuses[idx].isDeployed {
+                            chainStatuses[idx].isDeployed = true
+                            Self.persistDeployedChainId(chainId)
+                        } else if rpcResult {
+                            chainStatuses[idx].isDeployed = true
+                        }
+                        // Note: we do NOT set isDeployed=false here even if RPC says so,
+                        // because a confirmed deployment can't un-deploy (contract is permanent).
+                    }
+                    // If rpcResult is nil (RPC failed), keep the persisted state as-is.
                 }
             }
         }
@@ -417,6 +434,7 @@ final class PQAccountViewModel: ObservableObject {
                             chainStatuses[idx].isDeployed = true
                             chainStatuses[idx].isDeploying = false
                         }
+                        Self.persistDeployedChainId(chain.chainId)
                         SecureLogger.info("PQ account deployed on \(chain.name) at \(address)", category: .session)
                         return
                     }
@@ -554,5 +572,24 @@ final class PQAccountViewModel: ObservableObject {
         chainStatuses = chainStatuses.map { status in
             PQChainDeploymentStatus(chain: status.chain, isDeployed: false, isDeploying: false)
         }
+        // Clear persisted deployment state
+        UserDefaults.standard.removeObject(forKey: Self.deployedChainsKey)
+    }
+    
+    // MARK: - Deployment Persistence
+    
+    /// Load persisted deployed chain IDs from UserDefaults.
+    /// Note: UserDefaults stores numbers as NSNumber which bridges to Int,
+    /// so we read [Int] and convert to UInt64.
+    private static func loadDeployedChainIds() -> Set<UInt64> {
+        let stored = UserDefaults.standard.array(forKey: deployedChainsKey) as? [Int] ?? []
+        return Set(stored.map { UInt64($0) })
+    }
+    
+    /// Persist a newly-deployed chain ID to UserDefaults.
+    private static func persistDeployedChainId(_ chainId: UInt64) {
+        var current = loadDeployedChainIds()
+        current.insert(chainId)
+        UserDefaults.standard.set(current.map { Int($0) }, forKey: deployedChainsKey)
     }
 }

@@ -9,7 +9,9 @@
 // For more information, see <https://unlicense.org>
 //
 
+import BitLogger
 import SwiftUI
+import Tor
 
 /// Settings view for wallet and transaction configuration
 struct WalletSettingsView: View {
@@ -697,7 +699,17 @@ struct WalletSettingsView: View {
                     try await helios.start(network: network)
                 } catch {
                     let torStatus = TorManager.shared.isReady ? "Tor ready" : "Tor not ready"
-                    SecureLogger.error("HeliosManager: Manual start failed (\(torStatus)): \(error)", category: .network)
+                    SecureLogger.error("HeliosManager: Manual start attempt 1 failed (\(torStatus)): \(error)", category: .network)
+
+                    // Retry once with fallback consensus endpoint
+                    if !helios.isRunning {
+                        try? await Task.sleep(nanoseconds: 1_000_000_000)
+                        do {
+                            try await helios.start(network: network, consensusRpc: network.fallbackConsensusRpc)
+                        } catch {
+                            SecureLogger.error("HeliosManager: Manual start attempt 2 failed (\(torStatus)): \(error)", category: .network)
+                        }
+                    }
                 }
                 await MainActor.run { isStartingHelios = false }
             }

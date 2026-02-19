@@ -20,7 +20,7 @@ use std::ffi::{c_char, c_int, CStr, CString};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use alloy::eips::BlockNumberOrTag;
 use alloy::primitives::{Address, B256};
@@ -56,6 +56,42 @@ static IS_RUNNING: AtomicBool = AtomicBool::new(false);
 static IS_SYNCED: AtomicBool = AtomicBool::new(false);
 /// Sync progress: 0 = not started, 1-99 = syncing, 100 = synced, -1 = error
 static SYNC_PROGRESS: AtomicI32 = AtomicI32::new(0);
+
+// ---------------------------------------------------------------------------
+// Mutex Helpers
+// ---------------------------------------------------------------------------
+
+/// Lock the global state mutex, recovering from poisoning if needed.
+///
+/// If a previous panic left the mutex poisoned (e.g., during `block_on`
+/// in `wait_synced`), we recover by extracting the inner guard. The data
+/// may be stale but callers always check `Option::is_some()` before use
+/// and `helios_init` does a forced clear before reinitializing.
+fn lock_state() -> MutexGuard<'static, Option<HeliosState>> {
+    HELIOS_STATE.lock().unwrap_or_else(|poisoned| {
+        tracing::warn!("HELIOS_STATE mutex was poisoned, recovering");
+        poisoned.into_inner()
+    })
+}
+
+/// Unconditionally clear all global state. Called at the start of
+/// `helios_init` to ensure a clean slate regardless of how the previous
+/// session ended (normal shutdown, sync failure, panic/poison, etc.).
+fn force_clear_state() {
+    IS_RUNNING.store(false, Ordering::SeqCst);
+    IS_SYNCED.store(false, Ordering::SeqCst);
+    SYNC_PROGRESS.store(0, Ordering::SeqCst);
+
+    // Clear proxy env vars from any previous session
+    unsafe {
+        std::env::remove_var("ALL_PROXY");
+        std::env::remove_var("HTTPS_PROXY");
+    }
+
+    // Drop any existing client/runtime, recovering from poison
+    let mut guard = lock_state();
+    *guard = None;
+}
 
 // ---------------------------------------------------------------------------
 // FFI: Initialization
@@ -95,6 +131,10 @@ pub extern "C" fn helios_init(
     if IS_RUNNING.load(Ordering::SeqCst) {
         return -1;
     }
+
+    // Force-clear any stale state from previous failed init/sync/shutdown.
+    // This handles mutex poisoning, incomplete drops, lingering runtimes, etc.
+    force_clear_state();
 
     // Parse C strings
     let execution_rpc = match parse_cstr(rpc_url) {
@@ -153,11 +193,9 @@ pub extern "C" fn helios_init(
 
     // Store global state (replaces any previous state)
     let state = HeliosState { runtime, client };
-    match HELIOS_STATE.lock() {
-        Ok(mut guard) => {
-            *guard = Some(state);
-        }
-        Err(_) => return -3,
+    {
+        let mut guard = lock_state();
+        *guard = Some(state);
     }
 
     IS_RUNNING.store(true, Ordering::SeqCst);
@@ -172,6 +210,10 @@ pub extern "C" fn helios_init(
 /// This blocks the calling thread. Call from a background queue/thread.
 /// After this returns 0, `helios_get_balance` etc. will return verified data.
 ///
+/// The state is temporarily taken out of the global mutex during the
+/// blocking sync call to prevent mutex poisoning if the Helios client
+/// panics internally. The state is always put back afterward.
+///
 /// # Returns
 /// * 0 on success (synced)
 /// * -1 if not initialized
@@ -182,18 +224,20 @@ pub extern "C" fn helios_wait_synced() -> c_int {
         return -1;
     }
 
-    let guard = match HELIOS_STATE.lock() {
-        Ok(g) => g,
-        Err(_) => return -1,
-    };
-    let state = match guard.as_ref() {
-        Some(s) => s,
-        None => return -1,
+    // Take the state OUT of the mutex so we don't hold the lock during
+    // the potentially long-running block_on(). This prevents mutex
+    // poisoning if anything panics during sync.
+    let state = {
+        let mut guard = lock_state();
+        match guard.take() {
+            Some(s) => s,
+            None => return -1,
+        }
     };
 
     SYNC_PROGRESS.store(50, Ordering::SeqCst);
 
-    match state.runtime.block_on(state.client.wait_synced()) {
+    let result = match state.runtime.block_on(state.client.wait_synced()) {
         Ok(()) => {
             IS_SYNCED.store(true, Ordering::SeqCst);
             SYNC_PROGRESS.store(100, Ordering::SeqCst);
@@ -205,7 +249,15 @@ pub extern "C" fn helios_wait_synced() -> c_int {
             SYNC_PROGRESS.store(-1, Ordering::SeqCst);
             -2
         }
+    };
+
+    // Put state back into the mutex (so shutdown/queries can find it)
+    {
+        let mut guard = lock_state();
+        *guard = Some(state);
     }
+
+    result
 }
 
 /// Check if Helios has completed its initial sync.
@@ -272,10 +324,7 @@ pub extern "C" fn helios_get_balance(
         Err(_) => return -2,
     };
 
-    let guard = match HELIOS_STATE.lock() {
-        Ok(g) => g,
-        Err(_) => return -1,
-    };
+    let guard = lock_state();
     let state = match guard.as_ref() {
         Some(s) => s,
         None => return -1,
@@ -341,10 +390,7 @@ pub extern "C" fn helios_get_logs(
         }
     };
 
-    let guard = match HELIOS_STATE.lock() {
-        Ok(g) => g,
-        Err(_) => return -1,
-    };
+    let guard = lock_state();
     let state = match guard.as_ref() {
         Some(s) => s,
         None => return -1,
@@ -412,10 +458,7 @@ pub extern "C" fn helios_eth_call(
         }
     };
 
-    let guard = match HELIOS_STATE.lock() {
-        Ok(g) => g,
-        Err(_) => return -1,
-    };
+    let guard = lock_state();
     let state = match guard.as_ref() {
         Some(s) => s,
         None => return -1,
@@ -477,10 +520,7 @@ pub extern "C" fn helios_get_nonce(
         Err(_) => return -2,
     };
 
-    let guard = match HELIOS_STATE.lock() {
-        Ok(g) => g,
-        Err(_) => return -1,
-    };
+    let guard = lock_state();
     let state = match guard.as_ref() {
         Some(s) => s,
         None => return -1,
@@ -538,10 +578,7 @@ pub extern "C" fn helios_get_transaction_receipt(
         Err(_) => return -2,
     };
 
-    let guard = match HELIOS_STATE.lock() {
-        Ok(g) => g,
-        Err(_) => return -1,
-    };
+    let guard = lock_state();
     let state = match guard.as_ref() {
         Some(s) => s,
         None => return -1,
@@ -616,10 +653,7 @@ pub extern "C" fn helios_get_block_by_number(
         }
     };
 
-    let guard = match HELIOS_STATE.lock() {
-        Ok(g) => g,
-        Err(_) => return -1,
-    };
+    let guard = lock_state();
     let state = match guard.as_ref() {
         Some(s) => s,
         None => return -1,
@@ -686,10 +720,7 @@ pub extern "C" fn helios_estimate_gas(
         }
     };
 
-    let guard = match HELIOS_STATE.lock() {
-        Ok(g) => g,
-        Err(_) => return -1,
-    };
+    let guard = lock_state();
     let state = match guard.as_ref() {
         Some(s) => s,
         None => return -1,
@@ -742,10 +773,7 @@ pub extern "C" fn helios_send_raw_transaction(
         Err(_) => return -2,
     };
 
-    let guard = match HELIOS_STATE.lock() {
-        Ok(g) => g,
-        Err(_) => return -1,
-    };
+    let guard = lock_state();
     let state = match guard.as_ref() {
         Some(s) => s,
         None => return -1,
@@ -784,10 +812,7 @@ pub extern "C" fn helios_gas_price(
         return -1;
     }
 
-    let guard = match HELIOS_STATE.lock() {
-        Ok(g) => g,
-        Err(_) => return -1,
-    };
+    let guard = lock_state();
     let state = match guard.as_ref() {
         Some(s) => s,
         None => return -1,
@@ -840,10 +865,7 @@ pub extern "C" fn helios_get_pending_nonce(
         Err(_) => return -2,
     };
 
-    let guard = match HELIOS_STATE.lock() {
-        Ok(g) => g,
-        Err(_) => return -1,
-    };
+    let guard = lock_state();
     let state = match guard.as_ref() {
         Some(s) => s,
         None => return -1,
@@ -883,10 +905,7 @@ pub extern "C" fn helios_finalized_block() -> i64 {
         return -1;
     }
 
-    let guard = match HELIOS_STATE.lock() {
-        Ok(g) => g,
-        Err(_) => return -1,
-    };
+    let guard = lock_state();
     let state = match guard.as_ref() {
         Some(s) => s,
         None => return -1,
@@ -945,7 +964,8 @@ pub extern "C" fn helios_shutdown() -> c_int {
     }
 
     // Drop the client and runtime so helios_init() can be called again
-    if let Ok(mut guard) = HELIOS_STATE.lock() {
+    {
+        let mut guard = lock_state();
         *guard = None;
     }
 

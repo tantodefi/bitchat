@@ -178,6 +178,14 @@ public final class HeliosManager: ObservableObject {
             }
         }
 
+        /// Fallback consensus-layer RPC (used if default fails during auto-start)
+        public var fallbackConsensusRpc: String {
+            switch self {
+            case .mainnet: return "https://www.lightclientdata.org"
+            case .sepolia: return "https://ethereum-sepolia-beacon-api.publicnode.com"
+            }
+        }
+
         /// Checkpoint sources for fetching a fresh weak subjectivity checkpoint
         public var checkpointSources: [String] {
             switch self {
@@ -190,6 +198,7 @@ public final class HeliosManager: ObservableObject {
                 return [
                     "https://sepolia.beaconstate.info/eth/v1/beacon/headers/finalized",
                     "https://lodestar-sepolia.chainsafe.io/eth/v1/beacon/headers/finalized",
+                    "https://ethereum-sepolia-beacon-api.publicnode.com/eth/v1/beacon/headers/finalized",
                 ]
             }
         }
@@ -303,7 +312,11 @@ public final class HeliosManager: ObservableObject {
         #endif
     }
 
-    /// Auto-start Helios after Tor is ready (called at most once per session).
+    /// Auto-start Helios after Tor is ready (with retry on sync failure).
+    ///
+    /// When Tor becomes ready, attempts to start Helios via the Tor proxy.
+    /// On sync failure, retries once with a different consensus endpoint
+    /// before giving up for this session.
     private func autoStartIfNeeded() async {
         guard !autoStartAttempted else { return }
         autoStartAttempted = true
@@ -321,10 +334,28 @@ public final class HeliosManager: ObservableObject {
         let torPort: UInt16 = 39050
         SecureLogger.info("HeliosManager: Tor is ready, auto-starting Helios on \(network.rawValue) via Tor (:\(torPort))", category: .network)
 
+        // Try with default endpoints first
         do {
             try await start(network: network, torSocksPort: torPort)
+            return
         } catch {
-            SecureLogger.error("HeliosManager: Auto-start failed: \(error)", category: .network)
+            SecureLogger.error("HeliosManager: Auto-start attempt 1 failed: \(error)", category: .network)
+        }
+
+        // Wait before retry to let Tor/network stabilize
+        try? await Task.sleep(nanoseconds: 3_000_000_000) // 3 seconds
+
+        // Retry with alternative consensus endpoint
+        guard !isRunning else { return }
+        SecureLogger.info("HeliosManager: Retrying auto-start with fallback consensus endpoint", category: .network)
+        do {
+            try await start(
+                network: network,
+                consensusRpc: network.fallbackConsensusRpc,
+                torSocksPort: torPort
+            )
+        } catch {
+            SecureLogger.error("HeliosManager: Auto-start attempt 2 failed: \(error)", category: .network)
         }
     }
 
@@ -389,6 +420,8 @@ public final class HeliosManager: ObservableObject {
         )
 
         // Step 1: Initialize the Helios client (non-blocking, starts sync loop)
+        // The Rust FFI layer calls force_clear_state() internally to handle any
+        // stale state from previous failed init/sync/shutdown cycles.
         let initResult: Int32 = try await withCheckedThrowingContinuation { continuation in
             heliosQueue.async {
                 let code = effectiveRpc.withCString { rpc in
@@ -405,9 +438,18 @@ public final class HeliosManager: ObservableObject {
         }
 
         guard initResult == 0 else {
+            let codeDesc: String
+            switch initResult {
+            case -1: codeDesc = "already running"
+            case -2: codeDesc = "parameter parsing failed"
+            case -3: codeDesc = "tokio runtime creation failed"
+            case -4: codeDesc = "client build failed"
+            default: codeDesc = "unknown"
+            }
             let err = HeliosError.initFailed(code: initResult)
-            syncStatus = .error(err.localizedDescription ?? "Init failed")
-            lastError = err.localizedDescription
+            syncStatus = .error("Init failed: \(codeDesc)")
+            lastError = "Init failed: \(codeDesc)"
+            SecureLogger.error("HeliosManager: Init failed (code \(initResult): \(codeDesc))", category: .network)
             throw err
         }
 
