@@ -126,6 +126,10 @@ pub extern "C" fn helios_init(
         }
     };
 
+    // Enter the runtime context so that tokio::spawn (used inside
+    // HeliosClient::new / Node::new) can find the current runtime handle.
+    let _guard = runtime.enter();
+
     // Build the Helios Ethereum light client
     let client = match build_client(&execution_rpc, &consensus, &checkpoint_str) {
         Ok(c) => c,
@@ -583,7 +587,7 @@ pub extern "C" fn helios_get_block_by_number(
     let block_result = state.runtime.block_on(async {
         state
             .client
-            .get_block_by_number(block_id.into(), include_txs)
+            .get_block(block_id.into(), include_txs)
             .await
     });
 
@@ -645,7 +649,7 @@ pub extern "C" fn helios_estimate_gas(
     };
 
     let estimate_result = state.runtime.block_on(async {
-        state.client.estimate_gas(&tx).await
+        state.client.estimate_gas(&tx, None, None).await
     });
 
     match estimate_result {
