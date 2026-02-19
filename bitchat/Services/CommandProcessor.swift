@@ -108,9 +108,7 @@ final class CommandProcessor {
         case "/unfav":
             if inGeoPublic || inGeoDM { return .error(message: "favorites are only for mesh peers in #mesh") }
             return handleFavorite(args, add: false)
-        // XMTP commands (bitchat originals)
-        case "/xmtp":
-            return handleXMTPStatus()
+        // XMTP commands (bitchat originals — kept for backward compat)
         case "/dm-wallet":
             return handleDMWallet(args)
         case "/xmtp-sync":
@@ -121,50 +119,101 @@ final class CommandProcessor {
             return handleTxStatus()
         case "/wallet":
             return handleWalletStatus()
-        // ━━ XMTP CLI-compatible commands ━━
-        // Root
+        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        // Unified XMTP CLI — full parity with @xmtp/cli via JSCore bridge
+        // Usage: /xmtp <topic> <command> [args] [--flags]
+        // Examples:
+        //   /xmtp client info --json
+        //   /xmtp conversations create-dm 0xABC
+        //   /xmtp conversation send-text <id> "Hello!"
+        //   /xmtp can-message 0xABC 0xDEF
+        //   /xmtp conversations list --type dm --limit 10
+        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        case "/xmtp":
+            return handleUnifiedXMTPCLI(args)
+        // Legacy dash-separated aliases → route through unified engine
         case "/xmtp-can-message":
-            return handleCanMessage(args)
-        // Client
+            return handleUnifiedXMTPCLI("can-message \(args)")
         case "/xmtp-client-info":
-            return handleXMTPStatus()   // alias for /xmtp
-        // Conversations (plural)
+            return handleUnifiedXMTPCLI("client info \(args)")
         case "/xmtp-conversations-list":
-            return handleXMTPList()     // alias for /xmtp-list
+            return handleUnifiedXMTPCLI("conversations list \(args)")
         case "/xmtp-conversations-create-dm":
-            return handleDMWallet(args) // alias for /dm-wallet
+            return handleUnifiedXMTPCLI("conversations create-dm \(args)")
         case "/xmtp-conversations-create-group":
-            return handleCreateGroup(args)
+            return handleUnifiedXMTPCLI("conversations create-group \(args)")
         case "/xmtp-conversations-get":
-            return handleConversationsGet(args)
+            return handleUnifiedXMTPCLI("conversations get \(args)")
+        case "/xmtp-conversations-get-dm":
+            return handleUnifiedXMTPCLI("conversations get-dm \(args)")
+        case "/xmtp-conversations-get-message":
+            return handleUnifiedXMTPCLI("conversations get-message \(args)")
         case "/xmtp-conversations-sync":
-            return handleConversationsLightSync()
+            return handleUnifiedXMTPCLI("conversations sync \(args)")
         case "/xmtp-conversations-sync-all":
-            return handleXMTPSync()     // alias for /xmtp-sync
-        // Conversation (singular)
+            return handleXMTPSync()
+        case "/xmtp-conversations-stream":
+            return handleUnifiedXMTPCLI("conversations stream \(args)")
+        case "/xmtp-conversations-stream-all-messages":
+            return handleUnifiedXMTPCLI("conversations stream-all-messages \(args)")
         case "/xmtp-conversation-send-text":
-            return handleConversationSendText(args)
+            return handleUnifiedXMTPCLI("conversation send-text \(args)")
+        case "/xmtp-conversation-send-markdown":
+            return handleUnifiedXMTPCLI("conversation send-markdown \(args)")
+        case "/xmtp-conversation-send-reply":
+            return handleUnifiedXMTPCLI("conversation send-reply \(args)")
+        case "/xmtp-conversation-send-reaction":
+            return handleUnifiedXMTPCLI("conversation send-reaction \(args)")
         case "/xmtp-conversation-messages":
-            return handleConversationMessages(args)
+            return handleUnifiedXMTPCLI("conversation messages \(args)")
+        case "/xmtp-conversation-count-messages":
+            return handleUnifiedXMTPCLI("conversation count-messages \(args)")
         case "/xmtp-conversation-members":
-            return handleConversationMembers(args)
+            return handleUnifiedXMTPCLI("conversation members \(args)")
         case "/xmtp-conversation-add-members":
-            return handleConversationAddMembers(args)
+            return handleUnifiedXMTPCLI("conversation add-members \(args)")
         case "/xmtp-conversation-remove-members":
-            return handleConversationRemoveMembers(args)
+            return handleUnifiedXMTPCLI("conversation remove-members \(args)")
         case "/xmtp-conversation-consent-state":
-            return handleConversationConsentState(args)
+            return handleUnifiedXMTPCLI("conversation consent-state \(args)")
         case "/xmtp-conversation-update-consent":
-            return handleConversationUpdateConsent(args)
-        // Preferences
+            return handleUnifiedXMTPCLI("conversation update-consent \(args)")
+        case "/xmtp-conversation-stream":
+            return handleUnifiedXMTPCLI("conversation stream \(args)")
+        case "/xmtp-conversation-sync":
+            return handleUnifiedXMTPCLI("conversation sync \(args)")
+        case "/xmtp-conversation-publish-messages":
+            return handleUnifiedXMTPCLI("conversation publish-messages \(args)")
+        case "/xmtp-conversation-debug-info":
+            return handleUnifiedXMTPCLI("conversation debug-info \(args)")
+        case "/xmtp-conversation-permissions":
+            return handleUnifiedXMTPCLI("conversation permissions \(args)")
+        case "/xmtp-conversation-leave":
+            return handleUnifiedXMTPCLI("conversation leave \(args)")
+        case "/xmtp-conversation-update-name":
+            return handleUnifiedXMTPCLI("conversation update-name \(args)")
+        case "/xmtp-conversation-update-description":
+            return handleUnifiedXMTPCLI("conversation update-description \(args)")
+        case "/xmtp-conversation-update-image-url":
+            return handleUnifiedXMTPCLI("conversation update-image-url \(args)")
+        case "/xmtp-conversation-update-pinned-frame-url":
+            return handleUnifiedXMTPCLI("conversation update-pinned-frame-url \(args)")
         case "/xmtp-preferences-get-consent":
-            return handlePreferencesGetConsent(args)
+            return handleUnifiedXMTPCLI("preferences get-consent \(args)")
         case "/xmtp-preferences-set-consent":
-            return handlePreferencesSetConsent(args)
+            return handleUnifiedXMTPCLI("preferences set-consent \(args)")
         case "/xmtp-preferences-inbox-state":
-            return handlePreferencesInboxState(args)
+            return handleUnifiedXMTPCLI("preferences inbox-state \(args)")
         case "/xmtp-preferences-sync":
-            return handlePreferencesSync()
+            return handleUnifiedXMTPCLI("preferences sync \(args)")
+        case "/xmtp-preferences-stream":
+            return handleUnifiedXMTPCLI("preferences stream \(args)")
+        case "/xmtp-preferences-hmac-keys":
+            return handleUnifiedXMTPCLI("preferences hmac-keys \(args)")
+        case "/xmtp-client-sign":
+            return handleUnifiedXMTPCLI("client sign \(args)")
+        case "/xmtp-client-verify-signature":
+            return handleUnifiedXMTPCLI("client verify-signature \(args)")
         default:
             return .error(message: "unknown command: \(cmd)\nType /help to see all commands.")
         }
@@ -214,29 +263,44 @@ final class CommandProcessor {
         ━━ XMTP Commands ━━━━━━━━━━━━━━━━━━
 
         /dm-wallet <addr>                  DM via ENS/wallet/inbox
-        /xmtp                              connection status
+        /xmtp                              XMTP CLI (full @xmtp/cli parity)
         /xmtp-list                         list conversations
         /xmtp-sync                         sync all conversations
         /wallet                            wallet balances
         /tx                                pending transactions
 
-        ━━ XMTP CLI-Compatible ━━━━━━━━━━━━
+        ━━ XMTP CLI (via /xmtp <command>) ━━━
 
-        /xmtp-can-message <addr>           check XMTP reachability
-        /xmtp-conversations-create-group   create a group
-        /xmtp-conversations-get <id>       get conversation details
-        /xmtp-conversations-sync           light sync
-        /xmtp-conversation-send-text       send to conversation
-        /xmtp-conversation-messages <id>   read messages
-        /xmtp-conversation-members <id>    list members
-        /xmtp-conversation-add-members     add to group
-        /xmtp-conversation-remove-members  remove from group
-        /xmtp-conversation-consent-state   get consent
-        /xmtp-conversation-update-consent  set consent
-        /xmtp-preferences-get-consent      get consent by entity
-        /xmtp-preferences-set-consent      set consent by entity
-        /xmtp-preferences-inbox-state      inbox details
-        /xmtp-preferences-sync             sync preferences
+        /xmtp client info                  show identity & status
+        /xmtp client sign <msg>            sign a message
+        /xmtp can-message <addr>           check reachability
+        /xmtp conversations list           list conversations
+        /xmtp conversations create-dm      create a DM
+        /xmtp conversations create-group   create a group
+        /xmtp conversations get <id>       conversation details
+        /xmtp conversations get-dm <addr>  find DM by address
+        /xmtp conversations sync           sync conversations
+        /xmtp conversation send-text       send text message
+        /xmtp conversation send-markdown   send markdown message
+        /xmtp conversation send-reply      reply to a message
+        /xmtp conversation send-reaction   react to a message
+        /xmtp conversation messages <id>   read messages
+        /xmtp conversation count-messages  count messages
+        /xmtp conversation members <id>    list members
+        /xmtp conversation add-members     add to group
+        /xmtp conversation remove-members  remove from group
+        /xmtp conversation consent-state   get consent
+        /xmtp conversation update-consent  set consent
+        /xmtp conversation sync <id>       sync single conversation
+        /xmtp conversation leave <id>      leave a group
+        /xmtp conversation update-name     update group name
+        /xmtp conversation permissions     view group permissions
+        /xmtp preferences get-consent      get consent by entity
+        /xmtp preferences set-consent      set consent by entity
+        /xmtp preferences inbox-state      inbox details
+        /xmtp preferences sync             sync preferences
+
+        All /xmtp commands support --json for machine output.
 
         ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         Tip: /help <command> for details.
@@ -383,13 +447,31 @@ final class CommandProcessor {
             """)
         case "xmtp":
             return .success(message: """
-            📖 /xmtp — XMTP Status
+            📖 /xmtp — XMTP CLI (full @xmtp/cli parity)
 
-            Shows your XMTP wallet address, inbox ID, and
-            connection status.
+            Unified XMTP command interface matching the official
+            @xmtp/cli. Run subcommands with spaces, not dashes.
 
-            Usage:
-              /xmtp
+            Topics:
+              client         identity & signing
+              conversations  list, create, sync
+              conversation   send, read, manage
+              preferences    consent & inbox state
+
+            Examples:
+              /xmtp client info
+              /xmtp can-message alice.eth
+              /xmtp conversations list --type dm
+              /xmtp conversations create-group --name "Team" 0xAddr
+              /xmtp conversation send-text <id> Hello!
+              /xmtp conversation messages <id> --limit 20
+              /xmtp preferences inbox-state <inbox-id>
+
+            All commands support --json for machine-readable output.
+            Use /xmtp help for the full built-in command list.
+
+            Legacy dash-separated aliases still work:
+              /xmtp-can-message, /xmtp-conversations-list, etc.
             """)
         case "xmtp-sync":
             return .success(message: """
@@ -855,6 +937,36 @@ final class CommandProcessor {
             
             return .success(message: "removed \(nickname) from favorites")
         }
+    }
+    
+    // MARK: - Unified XMTP CLI (JavaScriptCore Bridge)
+    
+    /// Routes through the XMTPCLIEngine which uses JavaScriptCore for
+    /// command parsing and JSON formatting, matching the official @xmtp/cli.
+    /// The actual XMTP operations run against the native Swift SDK.
+    private func handleUnifiedXMTPCLI(_ args: String) -> CommandResult {
+        let input = args.trimmingCharacters(in: .whitespaces)
+        
+        // No args → show help
+        if input.isEmpty {
+            let help = XMTPCLIEngine.shared.helpText()
+            return .success(message: help)
+        }
+        
+        // Execute via the JSCore-backed engine
+        Task {
+            let output = await XMTPCLIEngine.shared.execute(input)
+            
+            // Check if --json was requested
+            let isJSON = input.contains("--json")
+            let message = isJSON ? output.json : output.human
+            
+            await MainActor.run {
+                contextProvider?.addPublicSystemMessage(message)
+            }
+        }
+        
+        return .handled
     }
     
     // MARK: - XMTP Commands
