@@ -12,6 +12,7 @@
 
 import BitLogger
 import Foundation
+import Tor
 
 // MARK: - PQ Transaction Signer
 
@@ -313,6 +314,8 @@ actor PQTransactionSigner {
         ]
         
         let allRPCs = [chain.rpcURL] + chain.fallbackRPCURLs
+        // Use Tor for non-testnet chains
+        let session = (chainId == 1 || chainId == 8453) ? TorURLSession.shared.session : URLSession.shared
         
         for rpcEndpoint in allRPCs {
             guard let url = URL(string: rpcEndpoint) else { continue }
@@ -324,7 +327,7 @@ actor PQTransactionSigner {
                 request.httpBody = try JSONSerialization.data(withJSONObject: body)
                 request.timeoutInterval = 20
                 
-                let (responseData, _) = try await URLSession.shared.data(for: request)
+                let (responseData, _) = try await session.data(for: request)
                 guard let json = try JSONSerialization.jsonObject(with: responseData) as? [String: Any],
                       let hexResult = json["result"] as? String else {
                     continue

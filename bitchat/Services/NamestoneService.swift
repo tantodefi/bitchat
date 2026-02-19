@@ -12,6 +12,7 @@
 //
 
 import Foundation
+import Tor
 
 /// Service for managing ENS subdomains via Namestone API
 actor NamestoneService {
@@ -244,7 +245,7 @@ actor NamestoneService {
         request.addValue(apiKey, forHTTPHeaderField: "Authorization")
         request.addValue("application/json", forHTTPHeaderField: "Accept")
         
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await TorURLSession.shared.session.data(for: request)
         
         try validateResponse(response, data: data)
         
@@ -264,7 +265,7 @@ actor NamestoneService {
         request.addValue("application/json", forHTTPHeaderField: "Accept")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await TorURLSession.shared.session.data(for: request)
         
         try validateResponse(response, data: data)
         

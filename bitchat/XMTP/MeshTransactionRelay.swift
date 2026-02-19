@@ -12,6 +12,7 @@
 import BitLogger
 import Combine
 import Foundation
+import Tor
 
 /// Service for relaying signed transactions through BLE mesh
 @MainActor
@@ -291,20 +292,31 @@ final class MeshTransactionRelay: ObservableObject {
     
     // MARK: - RPC Broadcasting
     
-    /// Broadcast signed transaction to RPC endpoint with fallback support
+    /// Broadcast signed transaction to RPC endpoint with fallback support.
+    /// Uses Helios over Tor for Ethereum mainnet, Tor-proxied RPC for other chains.
     private func broadcastToRPC(_ payload: TxSignedPayload) async throws -> String {
+        let txHex = "0x" + payload.signedTx.map { String(format: "%02x", $0) }.joined()
+
+        // Tier 1: Try Helios broadcast (Ethereum mainnet — routes via Tor internally)
+        if payload.chainId == 1, await HeliosManager.shared.isRunning {
+            do {
+                let txHash = try await HeliosManager.shared.sendRawTransaction(rawTxHex: txHex)
+                SecureLogger.info("📡 Broadcast tx via Helios (Tor): \(txHash.prefix(16))…", category: .network)
+                return txHash
+            } catch {
+                SecureLogger.warning("Helios broadcast failed, falling back to RPC: \(error)", category: .network)
+            }
+        }
+
+        // Tier 2: Tor-proxied (mainnet) or direct (testnet) RPC
         guard let primaryRPC = rpcEndpoints[payload.chainId] else {
             throw TransactionError.unsupportedChain
         }
         
-        // Build list of RPCs to try: primary + fallbacks
         var rpcsToTry = [primaryRPC]
         if let fallbacks = fallbackRPCs[payload.chainId] {
             rpcsToTry.append(contentsOf: fallbacks)
         }
-        
-        // Prepare eth_sendRawTransaction request
-        let txHex = "0x" + payload.signedTx.map { String(format: "%02x", $0) }.joined()
         
         let requestBody: [String: Any] = [
             "jsonrpc": "2.0",
@@ -313,6 +325,10 @@ final class MeshTransactionRelay: ObservableObject {
             "params": [txHex]
         ]
         
+        // Use Tor for mainnet chains, direct for testnets
+        let isMainnet = payload.chainId == 1 || payload.chainId == 8453
+        let session = isMainnet ? TorURLSession.shared.session : URLSession.shared
+
         var lastError: Error = TransactionError.rpcFailed
         
         for rpcURL in rpcsToTry {
@@ -323,9 +339,9 @@ final class MeshTransactionRelay: ObservableObject {
                 request.httpMethod = "POST"
                 request.setValue("application/json", forHTTPHeaderField: "Content-Type")
                 request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
-                request.timeoutInterval = 15 // Shorter timeout for faster fallback
+                request.timeoutInterval = 15
                 
-                let (data, response) = try await URLSession.shared.data(for: request)
+                let (data, response) = try await session.data(for: request)
                 
                 guard let httpResponse = response as? HTTPURLResponse,
                       httpResponse.statusCode == 200 else {
@@ -333,14 +349,12 @@ final class MeshTransactionRelay: ObservableObject {
                     continue
                 }
                 
-                // Parse response
                 guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                     continue
                 }
                 
                 if let error = json["error"] as? [String: Any],
                    let message = error["message"] as? String {
-                    // Real RPC error (not connectivity) - don't retry on other RPCs
                     throw TransactionError.rpcError(message)
                 }
                 
@@ -352,7 +366,6 @@ final class MeshTransactionRelay: ObservableObject {
                 return txHash
                 
             } catch let error as TransactionError {
-                // Real transaction error, don't retry
                 throw error
             } catch {
                 SecureLogger.debug("RPC \(url.host ?? "unknown") failed: \(error.localizedDescription)", category: .network)
@@ -451,13 +464,15 @@ final class MeshTransactionRelay: ObservableObject {
     
     /// Poll for a transaction receipt to verify on-chain success/failure.
     ///
-    /// After `eth_sendRawTransaction` returns a tx hash, the transaction is in the
-    /// mempool but may still revert on-chain (e.g. out-of-gas when sending to a
-    /// smart contract wallet). This method polls `eth_getTransactionReceipt` to
-    /// check the actual on-chain outcome.
+    /// Tier 1: Helios verified receipt (Ethereum mainnet).
+    /// Tier 2: RPC over Tor (mainnet) or direct (testnet).
     ///
     /// - Returns: Receipt result, or nil if receipt not available after timeout.
     private func pollForReceipt(txHash: String, chainId: UInt64, maxAttempts: Int = 15, intervalSeconds: UInt64 = 4) async -> TxReceiptResult? {
+        // Use Tor session for mainnet chains
+        let isMainnet = chainId == 1 || chainId == 8453
+        let session = isMainnet ? TorURLSession.shared.session : URLSession.shared
+
         guard let primaryRPC = rpcEndpoints[chainId] else { return nil }
         
         var rpcsToTry = [primaryRPC]
@@ -476,7 +491,37 @@ final class MeshTransactionRelay: ObservableObject {
             if attempt > 0 {
                 try? await Task.sleep(nanoseconds: intervalSeconds * 1_000_000_000)
             }
-            
+
+            // Tier 1: Try Helios verified receipt for Ethereum mainnet
+            if chainId == 1, await HeliosManager.shared.isRunning {
+                do {
+                    let receiptJSON = try await HeliosManager.shared.getTransactionReceipt(txHash: txHash)
+                    if let data = receiptJSON.data(using: .utf8),
+                       let result = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                        let statusHex = result["status"] as? String ?? "0x1"
+                        let succeeded = statusHex != "0x0"
+                        var blockNumber: UInt64?
+                        if let blockHex = result["blockNumber"] as? String {
+                            let hex = blockHex.hasPrefix("0x") ? String(blockHex.dropFirst(2)) : blockHex
+                            blockNumber = UInt64(hex, radix: 16)
+                        }
+                        var revertReason: String?
+                        if !succeeded {
+                            if let gasUsedHex = result["gasUsed"] as? String,
+                               let gasUsed = UInt64(gasUsedHex.hasPrefix("0x") ? String(gasUsedHex.dropFirst(2)) : gasUsedHex, radix: 16) {
+                                revertReason = "Transaction reverted (gas used: \(gasUsed))."
+                            } else {
+                                revertReason = "Transaction reverted on-chain (status: 0x0)"
+                            }
+                        }
+                        return TxReceiptResult(succeeded: succeeded, blockNumber: blockNumber, revertReason: revertReason)
+                    }
+                } catch {
+                    // Receipt not yet available via Helios — fall through to RPC
+                }
+            }
+
+            // Tier 2: RPC over Tor/direct
             for rpcURL in rpcsToTry {
                 guard let url = URL(string: rpcURL) else { continue }
                 
@@ -487,7 +532,7 @@ final class MeshTransactionRelay: ObservableObject {
                     request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
                     request.timeoutInterval = 10
                     
-                    let (data, response) = try await URLSession.shared.data(for: request)
+                    let (data, response) = try await session.data(for: request)
                     
                     guard let httpResponse = response as? HTTPURLResponse,
                           httpResponse.statusCode == 200 else {
@@ -590,6 +635,8 @@ final class MeshTransactionRelay: ObservableObject {
     
     private func hasInternetConnectivity() async -> Bool {
         // Quick connectivity check using reliable public endpoints
+        // Use Tor session for privacy on mainnet
+        let session = TorURLSession.shared.session
         let checkURLs = [
             "https://sepolia.drpc.org",     // Fast, reliable public endpoint
             "https://rpc.flashbots.net"     // Fallback
@@ -610,7 +657,7 @@ final class MeshTransactionRelay: ObservableObject {
             request.timeoutInterval = 5
             
             do {
-                let (_, response) = try await URLSession.shared.data(for: request)
+                let (_, response) = try await session.data(for: request)
                 if (response as? HTTPURLResponse)?.statusCode == 200 {
                     return true
                 }

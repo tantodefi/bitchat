@@ -9,6 +9,7 @@
 //
 
 import SwiftUI
+import Tor
 
 /// Gas speed presets for transaction fee selection
 enum GasSpeed: String, CaseIterable, Identifiable {
@@ -662,7 +663,7 @@ struct SendTransactionView: View {
         request.timeoutInterval = 5
         
         do {
-            let (_, response) = try await URLSession.shared.data(for: request)
+            let (_, response) = try await TorURLSession.shared.session.data(for: request)
             if let httpResponse = response as? HTTPURLResponse {
                 isOnline = httpResponse.statusCode == 200
             } else {

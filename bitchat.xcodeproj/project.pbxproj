@@ -9,6 +9,8 @@
 /* Begin PBXBuildFile section */
 		11380E352F2D47F800932780 /* (null) in Frameworks */ = {isa = PBXBuildFile; };
 		115624A72F2E5119000C7E3D /* (null) in Frameworks */ = {isa = PBXBuildFile; };
+		11931D702F47042000B87BCE /* HeliosFFI in Frameworks */ = {isa = PBXBuildFile; productRef = HB0011008464F1EA38F4E286 /* HeliosFFI */; };
+		11931D712F47042000B87BCE /* HeliosFFI in Frameworks */ = {isa = PBXBuildFile; productRef = HB0021008464F1EA38F4E286 /* HeliosFFI */; };
 		11E7E5502F457C670003051C /* SwiftDilithium in Frameworks */ = {isa = PBXBuildFile; productRef = PQ0011008464F1EA38F4E286 /* SwiftDilithium */; };
 		11E7E5512F457C670003051C /* BigInt in Frameworks */ = {isa = PBXBuildFile; productRef = PQ0012008464F1EA38F4E286 /* BigInt */; };
 		11E7E5522F457C670003051C /* Digest in Frameworks */ = {isa = PBXBuildFile; productRef = PQ0013008464F1EA38F4E286 /* Digest */; };
@@ -169,6 +171,7 @@
 		31F6FDADA63050361C14F3A1 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			files = (
+				11931D712F47042000B87BCE /* HeliosFFI in Frameworks */,
 				11E7E5552F457C670003051C /* Digest in Frameworks */,
 				11E7E5542F457C670003051C /* BigInt in Frameworks */,
 				11E7E5532F457C670003051C /* SwiftDilithium in Frameworks */,
@@ -186,6 +189,7 @@
 		B5A5CC493FFB3D8966548140 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			files = (
+				11931D702F47042000B87BCE /* HeliosFFI in Frameworks */,
 				11E7E5522F457C670003051C /* Digest in Frameworks */,
 				11E7E5512F457C670003051C /* BigInt in Frameworks */,
 				11E7E5502F457C670003051C /* SwiftDilithium in Frameworks */,
@@ -718,10 +722,7 @@
 				SUPPORTS_MACCATALYST = NO;
 				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
-				SWIFT_ACTIVE_COMPILATION_CONDITIONS = (
-					"$(inherited)",
-					HELIOS_FFI_AVAILABLE,
-				);
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) HELIOS_FFI_AVAILABLE";
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = 1;
@@ -785,10 +786,7 @@
 				SUPPORTS_MACCATALYST = NO;
 				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
-				SWIFT_ACTIVE_COMPILATION_CONDITIONS = (
-					"$(inherited)",
-					HELIOS_FFI_AVAILABLE,
-				);
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) HELIOS_FFI_AVAILABLE";
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = 1;
@@ -824,10 +822,7 @@
 				PRODUCT_NAME = bitchat;
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = macosx;
-				SWIFT_ACTIVE_COMPILATION_CONDITIONS = (
-					"$(inherited)",
-					HELIOS_FFI_AVAILABLE,
-				);
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) HELIOS_FFI_AVAILABLE";
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_VERSION = 5.0;
 			};
@@ -923,10 +918,7 @@
 				PRODUCT_NAME = bitchat;
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = macosx;
-				SWIFT_ACTIVE_COMPILATION_CONDITIONS = (
-					"$(inherited)",
-					HELIOS_FFI_AVAILABLE,
-				);
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) HELIOS_FFI_AVAILABLE";
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_VERSION = 5.0;
 			};
@@ -1163,6 +1155,14 @@
 			package = B8C407587481BBB190741C93 /* XCRemoteSwiftPackageReference "swift-secp256k1" */;
 			productName = P256K;
 		};
+		HB0011008464F1EA38F4E286 /* HeliosFFI */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = HeliosFFI;
+		};
+		HB0021008464F1EA38F4E286 /* HeliosFFI */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = HeliosFFI;
+		};
 		PQ0011008464F1EA38F4E286 /* SwiftDilithium */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = PQ0001007481BBB190741C93 /* XCRemoteSwiftPackageReference "SwiftDilithium" */;
@@ -1192,14 +1192,6 @@
 			isa = XCSwiftPackageProductDependency;
 			package = PQ0003007481BBB190741C93 /* XCRemoteSwiftPackageReference "Digest" */;
 			productName = Digest;
-		};
-		HB0011008464F1EA38F4E286 /* HeliosFFI */ = {
-			isa = XCSwiftPackageProductDependency;
-			productName = HeliosFFI;
-		};
-		HB0021008464F1EA38F4E286 /* HeliosFFI */ = {
-			isa = XCSwiftPackageProductDependency;
-			productName = HeliosFFI;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

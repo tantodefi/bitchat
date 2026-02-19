@@ -44,6 +44,9 @@ struct WalletView: View {
     @AppStorage("active-account-mode") private var activeAccountMode: AccountMode = .eoa
     @StateObject private var pqViewModel = PQAccountViewModel()
     
+    // Track the address we're fetching balances for to avoid race conditions
+    @State private var currentFetchAddress: String = ""
+    
     // Stealth address support
     @StateObject private var stealthStore = StealthAddressStore()
     private var stealthManager: StealthAddressManager {
@@ -165,6 +168,7 @@ struct WalletView: View {
                 isLoading = false
                 return
             }
+            currentFetchAddress = targetAddress
             balanceService.clearBalances()
             await balanceService.fetchBalances(for: targetAddress)
             isLoading = false
@@ -174,16 +178,21 @@ struct WalletView: View {
                 try? await Task.sleep(for: .seconds(refreshInterval))
                 guard !Task.isCancelled else { break }
                 let addr = displayAddress
-                guard !addr.isEmpty else { continue }
+                // Skip if address changed (user switched modes)
+                guard addr == currentFetchAddress && !addr.isEmpty else { continue }
                 await balanceService.fetchBalances(for: addr)
             }
         }
         .onChange(of: activeAccountMode) { _ in
             // Clear stale balances and re-fetch for the new address
+            let newAddress = displayAddress
+            guard !newAddress.isEmpty else { return }
+            currentFetchAddress = newAddress
             balanceService.clearBalances()
             Task {
-                guard !displayAddress.isEmpty else { return }
-                await balanceService.fetchBalances(for: displayAddress)
+                // Double-check address hasn't changed again
+                guard displayAddress == newAddress else { return }
+                await balanceService.fetchBalances(for: newAddress)
             }
         }
         .onAppear {

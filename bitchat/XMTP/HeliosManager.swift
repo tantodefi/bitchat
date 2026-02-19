@@ -64,6 +64,48 @@ private func _helios_eth_call(
     _ result: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>
 ) -> Int32
 
+@_silgen_name("helios_get_nonce")
+private func _helios_get_nonce(
+    _ address: UnsafePointer<CChar>,
+    _ result: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>
+) -> Int32
+
+@_silgen_name("helios_get_pending_nonce")
+private func _helios_get_pending_nonce(
+    _ address: UnsafePointer<CChar>,
+    _ result: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>
+) -> Int32
+
+@_silgen_name("helios_get_transaction_receipt")
+private func _helios_get_transaction_receipt(
+    _ txHash: UnsafePointer<CChar>,
+    _ result: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>
+) -> Int32
+
+@_silgen_name("helios_get_block_by_number")
+private func _helios_get_block_by_number(
+    _ blockTag: UnsafePointer<CChar>,
+    _ fullTxs: Int32,
+    _ result: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>
+) -> Int32
+
+@_silgen_name("helios_estimate_gas")
+private func _helios_estimate_gas(
+    _ callJson: UnsafePointer<CChar>,
+    _ result: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>
+) -> Int32
+
+@_silgen_name("helios_send_raw_transaction")
+private func _helios_send_raw_transaction(
+    _ rawTx: UnsafePointer<CChar>,
+    _ result: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>
+) -> Int32
+
+@_silgen_name("helios_gas_price")
+private func _helios_gas_price(
+    _ result: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>
+) -> Int32
+
 @_silgen_name("helios_finalized_block")
 private func _helios_finalized_block() -> Int64
 
@@ -443,6 +485,181 @@ public final class HeliosManager: ObservableObject {
                 continuation.resume(returning: result)
             }
         }
+        #else
+        throw HeliosError.ffiNotAvailable
+        #endif
+    }
+
+    /// Get the verified nonce (transaction count) for an address.
+    public func getNonce(address: String, pending: Bool = false) async throws -> UInt64 {
+        #if HELIOS_FFI_AVAILABLE
+        guard isRunning else { throw HeliosError.notInitialized }
+        guard isValidAddress(address) else { throw HeliosError.invalidAddress }
+
+        let hexResult: String = try await withCheckedThrowingContinuation { continuation in
+            heliosQueue.async {
+                var resultPtr: UnsafeMutablePointer<CChar>?
+                let code = address.withCString { addr in
+                    pending ? _helios_get_pending_nonce(addr, &resultPtr)
+                            : _helios_get_nonce(addr, &resultPtr)
+                }
+
+                guard code == 0, let ptr = resultPtr else {
+                    continuation.resume(throwing: HeliosError.queryFailed(code: code))
+                    return
+                }
+
+                let result = String(cString: ptr)
+                _helios_free_string(ptr)
+                continuation.resume(returning: result)
+            }
+        }
+
+        let hex = hexResult.hasPrefix("0x") ? String(hexResult.dropFirst(2)) : hexResult
+        return UInt64(hex, radix: 16) ?? 0
+        #else
+        throw HeliosError.ffiNotAvailable
+        #endif
+    }
+
+    /// Get verified transaction receipt by hash.
+    /// Returns raw JSON string (caller decodes as needed).
+    public func getTransactionReceipt(txHash: String) async throws -> String {
+        #if HELIOS_FFI_AVAILABLE
+        guard isRunning else { throw HeliosError.notInitialized }
+
+        return try await withCheckedThrowingContinuation { continuation in
+            heliosQueue.async {
+                var resultPtr: UnsafeMutablePointer<CChar>?
+                let code = txHash.withCString { hash in
+                    _helios_get_transaction_receipt(hash, &resultPtr)
+                }
+
+                guard code == 0, let ptr = resultPtr else {
+                    continuation.resume(throwing: HeliosError.queryFailed(code: code))
+                    return
+                }
+
+                let result = String(cString: ptr)
+                _helios_free_string(ptr)
+                continuation.resume(returning: result)
+            }
+        }
+        #else
+        throw HeliosError.ffiNotAvailable
+        #endif
+    }
+
+    /// Get a verified block by number. Returns raw JSON.
+    /// - Parameters:
+    ///   - blockTag: "latest", "finalized", or hex block number
+    ///   - fullTransactions: Whether to include full tx objects or just hashes
+    public func getBlockByNumber(blockTag: String, fullTransactions: Bool = false) async throws -> String {
+        #if HELIOS_FFI_AVAILABLE
+        guard isRunning else { throw HeliosError.notInitialized }
+
+        return try await withCheckedThrowingContinuation { continuation in
+            heliosQueue.async {
+                var resultPtr: UnsafeMutablePointer<CChar>?
+                let code = blockTag.withCString { tag in
+                    _helios_get_block_by_number(tag, fullTransactions ? 1 : 0, &resultPtr)
+                }
+
+                guard code == 0, let ptr = resultPtr else {
+                    continuation.resume(throwing: HeliosError.queryFailed(code: code))
+                    return
+                }
+
+                let result = String(cString: ptr)
+                _helios_free_string(ptr)
+                continuation.resume(returning: result)
+            }
+        }
+        #else
+        throw HeliosError.ffiNotAvailable
+        #endif
+    }
+
+    /// Estimate gas for a transaction via Helios (verified).
+    public func estimateGas(callJSON: String) async throws -> UInt64 {
+        #if HELIOS_FFI_AVAILABLE
+        guard isRunning else { throw HeliosError.notInitialized }
+
+        let hexResult: String = try await withCheckedThrowingContinuation { continuation in
+            heliosQueue.async {
+                var resultPtr: UnsafeMutablePointer<CChar>?
+                let code = callJSON.withCString { call in
+                    _helios_estimate_gas(call, &resultPtr)
+                }
+
+                guard code == 0, let ptr = resultPtr else {
+                    continuation.resume(throwing: HeliosError.queryFailed(code: code))
+                    return
+                }
+
+                let result = String(cString: ptr)
+                _helios_free_string(ptr)
+                continuation.resume(returning: result)
+            }
+        }
+
+        let hex = hexResult.hasPrefix("0x") ? String(hexResult.dropFirst(2)) : hexResult
+        return UInt64(hex, radix: 16) ?? 21000
+        #else
+        throw HeliosError.ffiNotAvailable
+        #endif
+    }
+
+    /// Send a raw signed transaction through Helios (routed via Tor).
+    public func sendRawTransaction(rawTxHex: String) async throws -> String {
+        #if HELIOS_FFI_AVAILABLE
+        guard isRunning else { throw HeliosError.notInitialized }
+
+        return try await withCheckedThrowingContinuation { continuation in
+            heliosQueue.async {
+                var resultPtr: UnsafeMutablePointer<CChar>?
+                let code = rawTxHex.withCString { tx in
+                    _helios_send_raw_transaction(tx, &resultPtr)
+                }
+
+                guard code == 0, let ptr = resultPtr else {
+                    continuation.resume(throwing: HeliosError.queryFailed(code: code))
+                    return
+                }
+
+                let result = String(cString: ptr)
+                _helios_free_string(ptr)
+                continuation.resume(returning: result)
+            }
+        }
+        #else
+        throw HeliosError.ffiNotAvailable
+        #endif
+    }
+
+    /// Get the current gas price via Helios (verified).
+    public func getGasPrice() async throws -> UInt64 {
+        #if HELIOS_FFI_AVAILABLE
+        guard isRunning else { throw HeliosError.notInitialized }
+
+        let hexResult: String = try await withCheckedThrowingContinuation { continuation in
+            heliosQueue.async {
+                var resultPtr: UnsafeMutablePointer<CChar>?
+                let code = _helios_gas_price(&resultPtr)
+
+                guard code == 0, let ptr = resultPtr else {
+                    continuation.resume(throwing: HeliosError.queryFailed(code: code))
+                    return
+                }
+
+                let result = String(cString: ptr)
+                _helios_free_string(ptr)
+                continuation.resume(returning: result)
+            }
+        }
+
+        let hex = hexResult.hasPrefix("0x") ? String(hexResult.dropFirst(2)) : hexResult
+        return UInt64(hex, radix: 16) ?? 1_000_000_000
         #else
         throw HeliosError.ffiNotAvailable
         #endif

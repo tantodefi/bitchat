@@ -39,6 +39,9 @@ struct WalletSettingsView: View {
     @StateObject private var pqViewModel = PQAccountViewModel()
     @State private var exportedPQSeed: IdentifiableString?
     
+    // Helios
+    @State private var isStartingHelios = false
+    
     var body: some View {
         List {
             // MARK: - Transaction Relay Settings
@@ -601,9 +604,18 @@ struct WalletSettingsView: View {
                             .foregroundColor(.green)
                     }
                 } else if helios.isFFIAvailable {
-                    Text("Available — tap to start")
+                    if isStartingHelios {
+                        HStack(spacing: 4) {
+                            ProgressView().scaleEffect(0.6)
+                            Text("Starting...")
+                        }
                         .font(.caption)
-                        .foregroundColor(.secondary)
+                        .foregroundColor(.orange)
+                    } else {
+                        Text("Available — tap to start")
+                            .font(.caption)
+                            .foregroundColor(.blue)
+                    }
                 } else {
                     Text("Not built — run build-ios.sh in localPackages/HeliosBridge/")
                         .font(.caption)
@@ -621,6 +633,19 @@ struct WalletSettingsView: View {
         } icon: {
             Image(systemName: helios.isRunning ? "checkmark.shield.fill" : "shield.righthalf.inset.filled")
                 .foregroundColor(helios.isRunning ? .green : .secondary)
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            guard helios.isFFIAvailable && !helios.isRunning && !isStartingHelios else { return }
+            isStartingHelios = true
+            Task {
+                do {
+                    try await helios.start()
+                } catch {
+                    print("HeliosManager: Manual start failed: \\(error)")
+                }
+                await MainActor.run { isStartingHelios = false }
+            }
         }
     }
 }

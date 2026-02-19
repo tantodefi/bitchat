@@ -11,6 +11,7 @@
 
 import BitLogger
 import Foundation
+import Tor
 
 /// Service for signing and queueing transactions for mesh relay
 @MainActor
@@ -201,7 +202,20 @@ final class TransactionSigner {
     // MARK: - Helpers
     
     private func fetchNonce(for address: String, chainId: UInt64) async throws -> UInt64 {
-        // Primary and fallback RPCs for each chain
+        // Tier 1: Try Helios verified nonce (Ethereum mainnet)
+        if chainId == 1 || chainId == 11155111 {
+            if await HeliosManager.shared.isRunning {
+                do {
+                    let nonce = try await HeliosManager.shared.getNonce(address: address, pending: true)
+                    SecureLogger.debug("Got Helios-verified nonce \(nonce) for \(address.prefix(10))…", category: .session)
+                    return nonce
+                } catch {
+                    SecureLogger.warning("Helios nonce fetch failed, falling back to RPC: \(error)", category: .session)
+                }
+            }
+        }
+
+        // Tier 2: Fallback to RPC over Tor
         let rpcURLs: [String]
         switch chainId {
         case 1:
@@ -221,6 +235,9 @@ final class TransactionSigner {
             "params": [address, "pending"]
         ]
         
+        // Use Tor for mainnet, direct for testnets
+        let session = (chainId == 1 || chainId == 8453) ? TorURLSession.shared.session : URLSession.shared
+
         var lastError: Error = TransactionError.rpcFailed
         
         for rpcURL in rpcURLs {
@@ -233,7 +250,7 @@ final class TransactionSigner {
                 request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
                 request.timeoutInterval = 10
                 
-                let (data, _) = try await URLSession.shared.data(for: request)
+                let (data, _) = try await session.data(for: request)
                 
                 guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                       let result = json["result"] as? String else {
@@ -268,12 +285,36 @@ final class TransactionSigner {
         }
     }
     
-    /// Estimate gas for a transaction via eth_estimateGas RPC.
+    /// Estimate gas for a transaction.
+    ///
+    /// Tier 1: Helios verified estimate (Ethereum mainnet/Sepolia).
+    /// Tier 2: RPC over Tor (mainnet) or direct (testnet).
     ///
     /// For simple EOA→EOA ETH transfers this returns 21000.
     /// For transfers to smart contract wallets (e.g. PQ accounts), this returns
     /// a higher value because the contract's receive/fallback function executes code.
     private func estimateGas(from: String, to: String, value: UInt64, data: Data = Data(), chainId: UInt64) async throws -> UInt64 {
+        // Tier 1: Try Helios verified gas estimation
+        if (chainId == 1 || chainId == 11155111), await HeliosManager.shared.isRunning {
+            do {
+                var callObj: [String: String] = [
+                    "from": from,
+                    "to": to,
+                    "value": String(format: "0x%llx", value),
+                ]
+                if !data.isEmpty {
+                    callObj["data"] = "0x" + data.map { String(format: "%02x", $0) }.joined()
+                }
+                let callJSON = try String(data: JSONSerialization.data(withJSONObject: callObj), encoding: .utf8) ?? "{}"
+                let gas = try await HeliosManager.shared.estimateGas(callJSON: callJSON)
+                SecureLogger.debug("Helios gas estimate: \(gas)", category: .session)
+                return gas
+            } catch {
+                SecureLogger.warning("Helios gas estimate failed, falling back to RPC: \(error)", category: .session)
+            }
+        }
+
+        // Tier 2: Fallback to RPC over Tor
         let rpcURLs: [String]
         switch chainId {
         case 1:
@@ -302,6 +343,8 @@ final class TransactionSigner {
             "params": [txObject]
         ]
         
+        let session = (chainId == 1 || chainId == 8453) ? TorURLSession.shared.session : URLSession.shared
+
         var lastError: Error = TransactionError.rpcFailed
         
         for rpcURL in rpcURLs {
@@ -314,7 +357,7 @@ final class TransactionSigner {
                 request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
                 request.timeoutInterval = 10
                 
-                let (responseData, _) = try await URLSession.shared.data(for: request)
+                let (responseData, _) = try await session.data(for: request)
                 
                 guard let json = try JSONSerialization.jsonObject(with: responseData) as? [String: Any] else {
                     continue

@@ -12,6 +12,7 @@
 //
 
 import Foundation
+import Tor
 
 /// Unified ENS resolver supporting multiple domain types
 actor ENSResolver {
@@ -185,7 +186,7 @@ actor ENSResolver {
         request.httpMethod = "GET"
         request.addValue("application/json", forHTTPHeaderField: "Accept")
         
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await TorURLSession.shared.session.data(for: request)
 
         guard let httpResponse = response as? HTTPURLResponse else {
             throw ENSError.networkError
@@ -233,7 +234,7 @@ actor ENSResolver {
         request.httpMethod = "GET"
         request.timeoutInterval = 10
         
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await TorURLSession.shared.session.data(for: request)
         
         guard let httpResponse = response as? HTTPURLResponse,
               httpResponse.statusCode == 200 else {
@@ -266,7 +267,7 @@ actor ENSResolver {
         request.timeoutInterval = 10
         request.addValue("application/json", forHTTPHeaderField: "Accept")
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await TorURLSession.shared.session.data(for: request)
 
         guard let httpResponse = response as? HTTPURLResponse,
               httpResponse.statusCode == 200 else {
@@ -312,7 +313,7 @@ actor ENSResolver {
         request.httpMethod = "HEAD" // Just check if it resolves
         request.timeoutInterval = 5
         
-        let (_, response) = try await URLSession.shared.data(for: request)
+        let (_, response) = try await TorURLSession.shared.session.data(for: request)
         
         // If we get a response, the name exists - but eth.limo doesn't give us the address
         // So this is mostly a validation step
@@ -354,7 +355,7 @@ actor ENSResolver {
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         request.timeoutInterval = 10
         
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await TorURLSession.shared.session.data(for: request)
         
         guard let httpResponse = response as? HTTPURLResponse,
               httpResponse.statusCode == 200 else {

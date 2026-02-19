@@ -406,6 +406,406 @@ pub extern "C" fn helios_eth_call(
 }
 
 // ---------------------------------------------------------------------------
+// FFI: Transaction Queries
+// ---------------------------------------------------------------------------
+
+/// Get the transaction count (nonce) for an address.
+///
+/// Verified against the consensus-attested state root, so no RPC can
+/// lie about the nonce value.
+///
+/// # Arguments
+/// * `address` – Hex Ethereum address (0x-prefixed)
+/// * `result` – Out pointer: hex nonce. Caller must free with `helios_free_string`
+///
+/// # Returns
+/// * 0 on success
+/// * -1 if not initialized
+/// * -2 if address is invalid
+/// * -3 if query failed
+#[no_mangle]
+pub extern "C" fn helios_get_nonce(
+    address: *const c_char,
+    result: *mut *mut c_char,
+) -> c_int {
+    if !IS_RUNNING.load(Ordering::SeqCst) {
+        return -1;
+    }
+
+    let addr_str = match parse_cstr(address) {
+        Some(s) => s,
+        None => return -2,
+    };
+
+    let addr = match Address::from_str(&addr_str) {
+        Ok(a) => a,
+        Err(_) => return -2,
+    };
+
+    let state = match HELIOS_STATE.get().and_then(|s| s.lock().ok()) {
+        Some(g) => g,
+        None => return -1,
+    };
+
+    let nonce_result = state.runtime.block_on(async {
+        state
+            .client
+            .get_nonce(addr, BlockNumberOrTag::Latest.into())
+            .await
+    });
+
+    match nonce_result {
+        Ok(nonce) => {
+            let hex = format!("0x{:x}", nonce);
+            write_result_string(hex, result)
+        }
+        Err(e) => {
+            tracing::error!("helios_get_nonce failed: {}", e);
+            -3
+        }
+    }
+}
+
+/// Get the transaction receipt by hash, verified against consensus.
+///
+/// Returns a JSON-encoded receipt including status, gasUsed, blockNumber,
+/// logs, etc. Used for tx history and confirmation tracking.
+///
+/// # Arguments
+/// * `tx_hash` – Transaction hash (0x-prefixed, 66 chars)
+/// * `result` – Out pointer: JSON receipt. Caller must free with `helios_free_string`
+///
+/// # Returns
+/// * 0 on success (receipt found)
+/// * -1 if not initialized
+/// * -2 if hash is invalid
+/// * -3 if query failed or receipt not found
+#[no_mangle]
+pub extern "C" fn helios_get_transaction_receipt(
+    tx_hash: *const c_char,
+    result: *mut *mut c_char,
+) -> c_int {
+    if !IS_RUNNING.load(Ordering::SeqCst) {
+        return -1;
+    }
+
+    let hash_str = match parse_cstr(tx_hash) {
+        Some(s) => s,
+        None => return -2,
+    };
+
+    let hash = match B256::from_str(&hash_str) {
+        Ok(h) => h,
+        Err(_) => return -2,
+    };
+
+    let state = match HELIOS_STATE.get().and_then(|s| s.lock().ok()) {
+        Some(g) => g,
+        None => return -1,
+    };
+
+    let receipt_result = state
+        .runtime
+        .block_on(async { state.client.get_transaction_receipt(hash).await });
+
+    match receipt_result {
+        Ok(Some(receipt)) => {
+            let json = match serde_json::to_string(&receipt) {
+                Ok(j) => j,
+                Err(e) => {
+                    tracing::error!("Failed to serialize receipt: {}", e);
+                    return -3;
+                }
+            };
+            write_result_string(json, result)
+        }
+        Ok(None) => -3, // Receipt not found (tx pending or non-existent)
+        Err(e) => {
+            tracing::error!("helios_get_transaction_receipt failed: {}", e);
+            -3
+        }
+    }
+}
+
+/// Get a block by number, verified against consensus.
+///
+/// Returns JSON-encoded block data including transactions list.
+/// When `full_txs` is true, returns full transaction objects;
+/// when false, returns only transaction hashes.
+///
+/// # Arguments
+/// * `block_tag` – Block number as hex (0x-prefixed) or "latest"/"finalized"
+/// * `full_txs` – 1 for full transaction objects, 0 for hashes only
+/// * `result` – Out pointer: JSON block. Caller must free with `helios_free_string`
+///
+/// # Returns
+/// * 0 on success
+/// * -1 if not initialized
+/// * -2 if block_tag is invalid
+/// * -3 if query failed
+#[no_mangle]
+pub extern "C" fn helios_get_block_by_number(
+    block_tag: *const c_char,
+    full_txs: c_int,
+    result: *mut *mut c_char,
+) -> c_int {
+    if !IS_RUNNING.load(Ordering::SeqCst) {
+        return -1;
+    }
+
+    let tag_str = match parse_cstr(block_tag) {
+        Some(s) => s,
+        None => return -2,
+    };
+
+    let block_id: BlockNumberOrTag = match tag_str.as_str() {
+        "latest" => BlockNumberOrTag::Latest,
+        "finalized" => BlockNumberOrTag::Finalized,
+        "pending" => BlockNumberOrTag::Pending,
+        "earliest" => BlockNumberOrTag::Earliest,
+        s => {
+            // Parse hex block number
+            let stripped = s.strip_prefix("0x").unwrap_or(s);
+            match u64::from_str_radix(stripped, 16) {
+                Ok(n) => BlockNumberOrTag::Number(n),
+                Err(_) => return -2,
+            }
+        }
+    };
+
+    let state = match HELIOS_STATE.get().and_then(|s| s.lock().ok()) {
+        Some(g) => g,
+        None => return -1,
+    };
+
+    let include_txs = full_txs != 0;
+
+    let block_result = state.runtime.block_on(async {
+        state
+            .client
+            .get_block_by_number(block_id.into(), include_txs)
+            .await
+    });
+
+    match block_result {
+        Ok(Some(block)) => {
+            let json = match serde_json::to_string(&block) {
+                Ok(j) => j,
+                Err(e) => {
+                    tracing::error!("Failed to serialize block: {}", e);
+                    return -3;
+                }
+            };
+            write_result_string(json, result)
+        }
+        Ok(None) => -3,
+        Err(e) => {
+            tracing::error!("helios_get_block_by_number failed: {}", e);
+            -3
+        }
+    }
+}
+
+/// Estimate gas for a transaction, verified against consensus.
+///
+/// # Arguments
+/// * `call_json` – JSON-encoded TransactionRequest (from, to, data, value)
+/// * `result` – Out pointer: hex gas estimate. Caller must free with `helios_free_string`
+///
+/// # Returns
+/// * 0 on success
+/// * -1 if not initialized
+/// * -2 if call params invalid
+/// * -3 if estimation failed
+#[no_mangle]
+pub extern "C" fn helios_estimate_gas(
+    call_json: *const c_char,
+    result: *mut *mut c_char,
+) -> c_int {
+    if !IS_RUNNING.load(Ordering::SeqCst) {
+        return -1;
+    }
+
+    let call_str = match parse_cstr(call_json) {
+        Some(s) => s,
+        None => return -2,
+    };
+
+    let tx: TransactionRequest = match serde_json::from_str(&call_str) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!("Invalid estimate_gas JSON: {}", e);
+            return -2;
+        }
+    };
+
+    let state = match HELIOS_STATE.get().and_then(|s| s.lock().ok()) {
+        Some(g) => g,
+        None => return -1,
+    };
+
+    let estimate_result = state.runtime.block_on(async {
+        state.client.estimate_gas(&tx).await
+    });
+
+    match estimate_result {
+        Ok(gas) => {
+            let hex = format!("0x{:x}", gas);
+            write_result_string(hex, result)
+        }
+        Err(e) => {
+            tracing::error!("helios_estimate_gas failed: {}", e);
+            -3
+        }
+    }
+}
+
+/// Send a raw signed transaction through Helios (which routes via Tor).
+///
+/// # Arguments
+/// * `raw_tx` – Hex-encoded signed transaction (0x-prefixed)
+/// * `result` – Out pointer: tx hash. Caller must free with `helios_free_string`
+///
+/// # Returns
+/// * 0 on success
+/// * -1 if not initialized
+/// * -2 if raw_tx is invalid
+/// * -3 if broadcast failed
+#[no_mangle]
+pub extern "C" fn helios_send_raw_transaction(
+    raw_tx: *const c_char,
+    result: *mut *mut c_char,
+) -> c_int {
+    if !IS_RUNNING.load(Ordering::SeqCst) {
+        return -1;
+    }
+
+    let tx_str = match parse_cstr(raw_tx) {
+        Some(s) => s,
+        None => return -2,
+    };
+
+    let stripped = tx_str.strip_prefix("0x").unwrap_or(&tx_str);
+    let tx_bytes = match hex::decode(stripped) {
+        Ok(b) => b,
+        Err(_) => return -2,
+    };
+
+    let state = match HELIOS_STATE.get().and_then(|s| s.lock().ok()) {
+        Some(g) => g,
+        None => return -1,
+    };
+
+    let send_result = state.runtime.block_on(async {
+        state.client.send_raw_transaction(&tx_bytes).await
+    });
+
+    match send_result {
+        Ok(hash) => {
+            let hex = format!("0x{:x}", hash);
+            write_result_string(hex, result)
+        }
+        Err(e) => {
+            tracing::error!("helios_send_raw_transaction failed: {}", e);
+            -3
+        }
+    }
+}
+
+/// Get the gas price from the execution layer, verified via consensus.
+///
+/// # Arguments
+/// * `result` – Out pointer: hex gas price in wei. Caller must free with `helios_free_string`
+///
+/// # Returns
+/// * 0 on success
+/// * -1 if not initialized
+/// * -3 if query failed
+#[no_mangle]
+pub extern "C" fn helios_gas_price(
+    result: *mut *mut c_char,
+) -> c_int {
+    if !IS_RUNNING.load(Ordering::SeqCst) {
+        return -1;
+    }
+
+    let state = match HELIOS_STATE.get().and_then(|s| s.lock().ok()) {
+        Some(g) => g,
+        None => return -1,
+    };
+
+    let gas_result = state.runtime.block_on(async {
+        state.client.get_gas_price().await
+    });
+
+    match gas_result {
+        Ok(price) => {
+            let hex = format!("0x{:x}", price);
+            write_result_string(hex, result)
+        }
+        Err(e) => {
+            tracing::error!("helios_gas_price failed: {}", e);
+            -3
+        }
+    }
+}
+
+/// Get the transaction count for an address at the "pending" tag.
+/// Used for getting the next nonce to use for a new transaction.
+///
+/// # Arguments
+/// * `address` – Hex Ethereum address (0x-prefixed)
+/// * `result` – Out pointer: hex nonce. Caller must free with `helios_free_string`
+///
+/// # Returns
+/// * 0 on success
+/// * -1 if not initialized
+/// * -2 if address invalid
+/// * -3 if query failed
+#[no_mangle]
+pub extern "C" fn helios_get_pending_nonce(
+    address: *const c_char,
+    result: *mut *mut c_char,
+) -> c_int {
+    if !IS_RUNNING.load(Ordering::SeqCst) {
+        return -1;
+    }
+
+    let addr_str = match parse_cstr(address) {
+        Some(s) => s,
+        None => return -2,
+    };
+
+    let addr = match Address::from_str(&addr_str) {
+        Ok(a) => a,
+        Err(_) => return -2,
+    };
+
+    let state = match HELIOS_STATE.get().and_then(|s| s.lock().ok()) {
+        Some(g) => g,
+        None => return -1,
+    };
+
+    let nonce_result = state.runtime.block_on(async {
+        state
+            .client
+            .get_nonce(addr, BlockNumberOrTag::Pending.into())
+            .await
+    });
+
+    match nonce_result {
+        Ok(nonce) => {
+            let hex = format!("0x{:x}", nonce);
+            write_result_string(hex, result)
+        }
+        Err(e) => {
+            tracing::error!("helios_get_pending_nonce failed: {}", e);
+            -3
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // FFI: Status Queries
 // ---------------------------------------------------------------------------
 
