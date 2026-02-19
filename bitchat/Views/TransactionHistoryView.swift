@@ -13,19 +13,28 @@ import SwiftUI
 struct TransactionHistoryView: View {
     @ObservedObject var meshRelay: MeshTransactionRelay
     let balanceService: EthereumBalanceService
+    /// The address to filter transactions for (EOA or PQ account address).
+    /// Only transactions sent from this address are shown.
+    let filterAddress: String
     
     @Environment(\.dismiss) private var dismiss
     @State private var selectedTransaction: TransactionItem?
     
     private var allTransactions: [TransactionItem] {
         var items: [TransactionItem] = []
+        let normalizedFilter = filterAddress.lowercased()
         
         // Add pending transactions (queued for mesh relay due to network issues)
         for relay in meshRelay.pendingRelays {
+            // Filter: only show if this tx was sent from the active account
+            if let from = relay.payload.fromAddress, from.lowercased() != normalizedFilter {
+                continue
+            }
             items.append(TransactionItem(
                 id: relay.id,
                 status: mapStatus(relay.status),
                 toAddress: relay.payload.toAddress,
+                fromAddress: relay.payload.fromAddress,
                 amount: relay.payload.amount,
                 currency: relay.payload.currency ?? "ETH",
                 chainId: relay.payload.chainId,
@@ -37,10 +46,14 @@ struct TransactionHistoryView: View {
         
         // Add confirmed transactions
         for confirmed in meshRelay.confirmedTransactions {
+            if let from = confirmed.fromAddress, from.lowercased() != normalizedFilter {
+                continue
+            }
             items.append(TransactionItem(
                 id: confirmed.id,
                 status: .confirmed,
                 toAddress: confirmed.toAddress,
+                fromAddress: confirmed.fromAddress,
                 amount: confirmed.amount,
                 currency: confirmed.currency ?? "ETH",
                 chainId: confirmed.chainId,
@@ -52,10 +65,14 @@ struct TransactionHistoryView: View {
         
         // Add failed transactions (rejected by network)
         for failed in meshRelay.failedTransactions {
+            if let from = failed.fromAddress, from.lowercased() != normalizedFilter {
+                continue
+            }
             items.append(TransactionItem(
                 id: failed.id,
                 status: .failed,
                 toAddress: failed.toAddress,
+                fromAddress: failed.fromAddress,
                 amount: failed.amount,
                 currency: failed.currency ?? "ETH",
                 chainId: failed.chainId,
@@ -140,6 +157,7 @@ struct TransactionItem: Identifiable {
     let id: String
     let status: TransactionStatus
     let toAddress: String
+    let fromAddress: String?
     let amount: UInt64?
     let currency: String
     let chainId: UInt64
@@ -148,10 +166,11 @@ struct TransactionItem: Identifiable {
     let description: String?
     let failureReason: String?
     
-    init(id: String, status: TransactionStatus, toAddress: String, amount: UInt64?, currency: String, chainId: UInt64, txHash: String?, timestamp: Date, description: String?, failureReason: String? = nil) {
+    init(id: String, status: TransactionStatus, toAddress: String, fromAddress: String? = nil, amount: UInt64?, currency: String, chainId: UInt64, txHash: String?, timestamp: Date, description: String?, failureReason: String? = nil) {
         self.id = id
         self.status = status
         self.toAddress = toAddress
+        self.fromAddress = fromAddress
         self.amount = amount
         self.currency = currency
         self.chainId = chainId
@@ -441,6 +460,7 @@ struct TransactionDetailView: View {
 #Preview {
     TransactionHistoryView(
         meshRelay: MeshTransactionRelay(keychain: PreviewKeychainManager()),
-        balanceService: EthereumBalanceService()
+        balanceService: EthereumBalanceService(),
+        filterAddress: "0x0000000000000000000000000000000000000000"
     )
 }

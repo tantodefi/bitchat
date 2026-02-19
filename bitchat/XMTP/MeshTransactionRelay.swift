@@ -91,6 +91,7 @@ final class MeshTransactionRelay: ObservableObject {
         let txHash: String
         let chainId: UInt64
         let toAddress: String
+        let fromAddress: String?
         let amount: UInt64?
         let currency: String?
         let confirmedAt: Date
@@ -102,6 +103,7 @@ final class MeshTransactionRelay: ObservableObject {
         let id: String
         let chainId: UInt64
         let toAddress: String
+        let fromAddress: String?
         let amount: UInt64?
         let currency: String?
         let failedAt: Date
@@ -259,6 +261,7 @@ final class MeshTransactionRelay: ObservableObject {
                 txHash: confirm.txHash,
                 chainId: relay.payload.chainId,
                 toAddress: relay.payload.toAddress,
+                fromAddress: relay.payload.fromAddress,
                 amount: relay.payload.amount,
                 currency: relay.payload.currency,
                 confirmedAt: Date(),
@@ -382,6 +385,7 @@ final class MeshTransactionRelay: ObservableObject {
                 txHash: txHash,
                 chainId: relay.payload.chainId,
                 toAddress: relay.payload.toAddress,
+                fromAddress: relay.payload.fromAddress,
                 amount: relay.payload.amount,
                 currency: relay.payload.currency,
                 confirmedAt: Date(),
@@ -652,6 +656,7 @@ final class MeshTransactionRelay: ObservableObject {
             id: relay.id,
             chainId: relay.payload.chainId,
             toAddress: relay.payload.toAddress,
+            fromAddress: relay.payload.fromAddress,
             amount: relay.payload.amount,
             currency: relay.payload.currency,
             failedAt: Date(),

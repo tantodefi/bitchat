@@ -852,10 +852,16 @@ extension LocationChannelsSheet {
     
     private func resolveENSNameIfNeeded(forTruncated truncated: String) {
         guard resolvedENSNames[truncated] == nil else { return }
-        // Try to find the full inbox ID from the map
-        guard let fullId = xmtpContainer.clientService.inboxIdMap[truncated] else { return }
         Task {
-            if let name = await xmtpContainer.clientService.resolveDstealthName(for: fullId) {
+            // Try cached map first, then scan DMs to resolve full inbox ID
+            let fullId: String?
+            if let cached = xmtpContainer.clientService.inboxIdMap[truncated] {
+                fullId = cached
+            } else {
+                fullId = await xmtpContainer.clientService.resolveFullInboxId(truncated: truncated)
+            }
+            guard let resolvedId = fullId else { return }
+            if let name = await xmtpContainer.clientService.resolveDstealthName(for: resolvedId) {
                 await MainActor.run {
                     resolvedENSNames[truncated] = name
                 }

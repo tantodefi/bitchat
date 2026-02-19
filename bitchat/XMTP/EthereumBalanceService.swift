@@ -165,6 +165,12 @@ final class EthereumBalanceService: ObservableObject {
     
     // MARK: - Public Methods
     
+    /// Clear all cached balances (e.g. when switching between EOA and PQ account)
+    func clearBalances() {
+        balances.removeAll()
+        lastError = nil
+    }
+    
     /// Fetches balance for the given address on all supported networks
     func fetchBalances(for address: String) async {
         guard isValidAddress(address) else {
@@ -258,12 +264,6 @@ final class EthereumBalanceService: ObservableObject {
             lastError = "Failed to connect to \(network.rawValue) RPC"
         }
         return nil
-    }
-    
-    /// Clears all cached balances
-    func clearBalances() {
-        balances.removeAll()
-        lastError = nil
     }
     
     // MARK: - Private Helpers

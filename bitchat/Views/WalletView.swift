@@ -157,6 +157,14 @@ struct WalletView: View {
             // Auto-refresh balances periodically
             await autoRefreshBalances()
         }
+        .onChange(of: activeAccountMode) { _ in
+            // Clear stale balances and re-fetch for the new address
+            balanceService.clearBalances()
+            Task {
+                guard !displayAddress.isEmpty else { return }
+                await balanceService.fetchBalances(for: displayAddress)
+            }
+        }
         .onAppear {
             // Show beta warning once
             if !betaWarningAccepted {
@@ -193,7 +201,8 @@ struct WalletView: View {
         .sheet(isPresented: $showHistorySheet) {
             TransactionHistoryView(
                 meshRelay: xmtpContainer.meshTransactionRelay,
-                balanceService: balanceService
+                balanceService: balanceService,
+                filterAddress: displayAddress
             )
         }
         .sheet(isPresented: $showStealthSheet) {
@@ -446,7 +455,15 @@ struct WalletView: View {
             }
             
             // Show active networks based on mainnet/testnet mode
-            let networks = balanceService.useTestnet ? EthereumBalanceService.Network.testnets : EthereumBalanceService.Network.mainnets
+            // For PQ accounts, only show chains where the account is deployed
+            let allNetworks = balanceService.useTestnet ? EthereumBalanceService.Network.testnets : EthereumBalanceService.Network.mainnets
+            let networks: [EthereumBalanceService.Network] = {
+                if activeAccountMode == .pqAccount {
+                    let deployedChainIds = Set(pqViewModel.chainStatuses.filter(\.isDeployed).map { $0.chain.chainId })
+                    return allNetworks.filter { deployedChainIds.contains(UInt64($0.chainId)) }
+                }
+                return allNetworks
+            }()
             ForEach(networks, id: \.self) { network in
                 balanceRow(for: network)
             }

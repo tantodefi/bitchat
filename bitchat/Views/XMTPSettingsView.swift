@@ -17,6 +17,10 @@ struct XMTPSettingsView: View {
     // Read receipts setting
     @AppStorage("enableReadReceipts") private var enableReadReceipts = true
     
+    // Disappearing messages default
+    @AppStorage("defaultDisappearingMessages") private var defaultDisappearingMessages = false
+    @AppStorage("defaultDisappearingDurationNs") private var defaultDisappearingDurationNs: Int = 3_600_000_000_000
+    
     var body: some View {
         List {
             // MARK: - Connection Status
@@ -74,6 +78,35 @@ struct XMTPSettingsView: View {
                 Text("Message Settings")
             } footer: {
                 Text("When enabled, conversation partners can see when you've read their messages.")
+            }
+            
+            // MARK: - Disappearing Messages Default
+            Section {
+                Toggle(isOn: $defaultDisappearingMessages) {
+                    Label {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Disappearing Messages")
+                            Text(defaultDisappearingMessages ? "New conversations will auto-delete messages" : "Messages are kept indefinitely by default")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    } icon: {
+                        Image(systemName: defaultDisappearingMessages ? "timer" : "timer.circle")
+                    }
+                }
+                
+                if defaultDisappearingMessages {
+                    Picker("Default Duration", selection: $defaultDisappearingDurationNs) {
+                        Text("1 hour").tag(3_600_000_000_000)
+                        Text("6 hours").tag(21_600_000_000_000)
+                        Text("24 hours").tag(86_400_000_000_000)
+                        Text("7 days").tag(604_800_000_000_000)
+                    }
+                }
+            } header: {
+                Text("Disappearing Messages")
+            } footer: {
+                Text("Sets the default disappearing message duration for new conversations. You can override this per-chat in the contact info sheet.")
             }
             
             // MARK: - Privacy Info

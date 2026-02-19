@@ -5,6 +5,7 @@
 // group members, consent management, and stream controls.
 
 import SwiftUI
+import CoreImage.CIFilterBuiltins
 import XMTP
 
 struct XMTPPeerInfoSheet: View {
@@ -23,6 +24,7 @@ struct XMTPPeerInfoSheet: View {
     @State private var isEditingNickname = false
     @State private var editedNickname = ""
     @State private var resolvedWalletAddress: String?
+    @State private var showWalletQR = false
     
     // Conversation details
     @State private var conversationType: ConversationType = .unknown
@@ -39,6 +41,12 @@ struct XMTPPeerInfoSheet: View {
     // Consent
     @State private var isTogglingConsent = false
     @State private var consentActionResult: String?
+    
+    // Disappearing messages
+    @State private var disappearingEnabled = false
+    @State private var disappearingDuration: Int64 = 3600_000_000_000 // 1 hour default (ns)
+    @State private var isUpdatingDisappearing = false
+    @State private var disappearingResult: String?
     
     enum ConversationType {
         case dm
@@ -101,21 +109,29 @@ struct XMTPPeerInfoSheet: View {
     
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(spacing: 20) {
-                    headerSection
-                    conversationTypeSection
-                    if conversationType == .group {
-                        groupMembersSection
+            ZStack {
+                ScrollView {
+                    VStack(spacing: 20) {
+                        headerSection
+                        conversationTypeSection
+                        if conversationType == .group {
+                            groupMembersSection
+                        }
+                        infoCardsSection
+                        streamControlsSection
+                        consentSection
+                        disappearingMessagesSection
+                        saveSection
                     }
-                    infoCardsSection
-                    streamControlsSection
-                    consentSection
-                    saveSection
+                    .padding(.bottom, 24)
                 }
-                .padding(.bottom, 24)
+                .background(backgroundColor)
+                
+                // QR code overlay
+                if showWalletQR, let addr = resolvedWalletAddress {
+                    walletQROverlay(address: addr)
+                }
             }
-            .background(backgroundColor)
             .navigationTitle("Contact Info")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -406,13 +422,7 @@ struct XMTPPeerInfoSheet: View {
             
             if conversationType == .dm {
                 if let walletAddress = resolvedWalletAddress {
-                    infoCard(
-                        title: "Wallet Address",
-                        value: walletAddress,
-                        icon: "wallet.bifold.fill",
-                        copyable: true,
-                        fullText: true
-                    )
+                    walletAddressCard(address: walletAddress)
                 } else {
                     HStack(spacing: 12) {
                         Image(systemName: "wallet.bifold.fill")
@@ -640,6 +650,107 @@ struct XMTPPeerInfoSheet: View {
         }
     }
     
+    // MARK: - Disappearing Messages Section
+    
+    private var disappearingMessagesSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "timer")
+                    .font(.bitchatSystem(size: 14))
+                    .foregroundColor(xmtpOrange)
+                Text("Disappearing Messages")
+                    .font(.bitchatSystem(size: 12, weight: .semibold, design: .monospaced))
+                    .foregroundColor(textColor)
+                Spacer()
+            }
+            
+            Toggle(isOn: $disappearingEnabled) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Auto-delete messages")
+                        .font(.bitchatSystem(size: 13))
+                        .foregroundColor(textColor)
+                    Text(disappearingEnabled ? "Messages will disappear after \(disappearingDurationLabel)" : "Messages are kept indefinitely")
+                        .font(.bitchatSystem(size: 10))
+                        .foregroundColor(.secondary)
+                }
+            }
+            .tint(xmtpOrange)
+            
+            if disappearingEnabled {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Duration")
+                        .font(.bitchatSystem(size: 10, weight: .medium))
+                        .foregroundColor(.secondary)
+                    
+                    HStack(spacing: 8) {
+                        ForEach(disappearingDurationOptions, id: \.ns) { option in
+                            Button(action: { disappearingDuration = option.ns }) {
+                                Text(option.label)
+                                    .font(.bitchatSystem(size: 11, weight: disappearingDuration == option.ns ? .semibold : .regular))
+                                    .foregroundColor(disappearingDuration == option.ns ? .white : textColor)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(disappearingDuration == option.ns ? xmtpOrange : (colorScheme == .dark ? Color.white.opacity(0.1) : Color.black.opacity(0.08)))
+                                    .cornerRadius(6)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+            
+            Button(action: { updateDisappearingMessages() }) {
+                HStack(spacing: 6) {
+                    if isUpdatingDisappearing {
+                        ProgressView()
+                            .scaleEffect(0.6)
+                    }
+                    Text(disappearingEnabled ? "Apply" : "Clear")
+                        .font(.bitchatSystem(size: 12, weight: .medium))
+                }
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+                .background(isUpdatingDisappearing ? Color.gray : xmtpOrange)
+                .cornerRadius(8)
+            }
+            .buttonStyle(.plain)
+            .disabled(isUpdatingDisappearing)
+            
+            if let result = disappearingResult {
+                Text(result)
+                    .font(.bitchatSystem(size: 10))
+                    .foregroundColor(result.hasPrefix("Failed") ? .red : .green)
+            }
+        }
+        .padding(12)
+        .background(colorScheme == .dark ? Color.white.opacity(0.05) : Color.black.opacity(0.05))
+        .cornerRadius(8)
+        .padding(.horizontal, 16)
+    }
+    
+    private var disappearingDurationLabel: String {
+        let ns = disappearingDuration
+        let seconds = ns / 1_000_000_000
+        if seconds < 3600 { return "\(seconds / 60) min" }
+        if seconds < 86400 { return "\(seconds / 3600) hr" }
+        return "\(seconds / 86400) day\(seconds / 86400 == 1 ? "" : "s")"
+    }
+    
+    private struct DurationOption {
+        let label: String
+        let ns: Int64
+    }
+    
+    private var disappearingDurationOptions: [DurationOption] {
+        [
+            DurationOption(label: "1h", ns: 3_600_000_000_000),
+            DurationOption(label: "6h", ns: 21_600_000_000_000),
+            DurationOption(label: "24h", ns: 86_400_000_000_000),
+            DurationOption(label: "7d", ns: 604_800_000_000_000),
+        ]
+    }
+    
     // MARK: - Save Section
     
     private var saveSection: some View {
@@ -705,6 +816,46 @@ struct XMTPPeerInfoSheet: View {
             }
             try? await Task.sleep(nanoseconds: 3_000_000_000)
             await MainActor.run { consentActionResult = nil }
+        }
+    }
+    
+    private func updateDisappearingMessages() {
+        guard let inboxId = fullInboxId else { return }
+        isUpdatingDisappearing = true
+        disappearingResult = nil
+        
+        Task {
+            do {
+                guard let conversation = try await xmtpContainer.clientService.getConversationDetails(for: inboxId) else {
+                    await MainActor.run {
+                        disappearingResult = "Failed: conversation not found"
+                        isUpdatingDisappearing = false
+                    }
+                    return
+                }
+                
+                if disappearingEnabled {
+                    let settings = DisappearingMessageSettings(
+                        disappearStartingAtNs: Int64(Date().timeIntervalSince1970 * 1_000_000_000),
+                        retentionDurationInNs: disappearingDuration
+                    )
+                    try await conversation.updateDisappearingMessageSettings(settings)
+                } else {
+                    try await conversation.clearDisappearingMessageSettings()
+                }
+                
+                await MainActor.run {
+                    disappearingResult = disappearingEnabled ? "Disappearing messages enabled" : "Disappearing messages cleared"
+                    isUpdatingDisappearing = false
+                }
+            } catch {
+                await MainActor.run {
+                    disappearingResult = "Failed: \(error.localizedDescription)"
+                    isUpdatingDisappearing = false
+                }
+            }
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            await MainActor.run { disappearingResult = nil }
         }
     }
     
@@ -800,6 +951,17 @@ struct XMTPPeerInfoSheet: View {
                 
                 let state = (try? conversation.consentState())?.rawValue ?? "unknown"
                 
+                // Load disappearing messages state
+                let isDisappearing = (try? conversation.isDisappearingMessagesEnabled()) ?? false
+                let dmSettings = conversation.disappearingMessageSettings
+                
+                await MainActor.run {
+                    disappearingEnabled = isDisappearing
+                    if let settings = dmSettings {
+                        disappearingDuration = settings.retentionDurationInNs
+                    }
+                }
+                
                 switch conversation {
                 case .dm:
                     await MainActor.run {
@@ -877,6 +1039,132 @@ struct XMTPPeerInfoSheet: View {
                 }
             }
         }
+    }
+    
+    // MARK: - Wallet Address Card (with QR button)
+    
+    private func walletAddressCard(address: String) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: "wallet.bifold.fill")
+                .font(.bitchatSystem(size: 16))
+                .foregroundColor(xmtpOrange)
+                .frame(width: 24)
+            
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Wallet Address")
+                    .font(.bitchatSystem(size: 10, weight: .medium))
+                    .foregroundColor(.secondary)
+                
+                Text(address)
+                    .font(.bitchatSystem(size: 12, design: .monospaced))
+                    .foregroundColor(textColor)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            
+            Spacer()
+            
+            Button(action: { showWalletQR = true }) {
+                Image(systemName: "qrcode")
+                    .font(.bitchatSystem(size: 16))
+                    .foregroundColor(xmtpOrange)
+            }
+            .buttonStyle(.plain)
+            
+            Button(action: { copyToClipboard(address, field: "Wallet Address") }) {
+                Image(systemName: copiedField == "Wallet Address" ? "checkmark" : "doc.on.doc")
+                    .font(.bitchatSystem(size: 12))
+                    .foregroundColor(copiedField == "Wallet Address" ? .green : .secondary)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(12)
+        .background(colorScheme == .dark ? Color.white.opacity(0.05) : Color.black.opacity(0.05))
+        .cornerRadius(8)
+    }
+    
+    // MARK: - Wallet QR Overlay
+    
+    private func walletQROverlay(address: String) -> some View {
+        ZStack {
+            Color.black.opacity(0.6)
+                .ignoresSafeArea()
+                .onTapGesture { showWalletQR = false }
+            
+            VStack(spacing: 16) {
+                HStack {
+                    Spacer()
+                    Button(action: { showWalletQR = false }) {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 28))
+                            .foregroundColor(.green)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.trailing, 4)
+                
+                Text("Wallet Address")
+                    .font(.bitchatSystem(size: 16, weight: .semibold))
+                    .foregroundColor(.primary)
+                
+                if let qrImage = generateQRCode(from: address) {
+                    Image(uiImage: qrImage)
+                        .interpolation(.none)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 200, height: 200)
+                        .cornerRadius(8)
+                } else {
+                    Image(systemName: "qrcode")
+                        .font(.system(size: 100))
+                        .foregroundColor(.secondary)
+                }
+                
+                Text(address)
+                    .font(.bitchatSystem(size: 11, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 8)
+                
+                Button(action: { copyToClipboard(address, field: "Wallet Address") }) {
+                    HStack(spacing: 6) {
+                        Image(systemName: copiedField == "Wallet Address" ? "checkmark" : "doc.on.doc")
+                        Text(copiedField == "Wallet Address" ? "Copied!" : "Copy Address")
+                            .font(.bitchatSystem(size: 13, weight: .medium))
+                    }
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 10)
+                    .background(xmtpOrange)
+                    .cornerRadius(8)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(20)
+            .background(
+                RoundedRectangle(cornerRadius: 16)
+                    .fill(colorScheme == .dark ? Color(.systemGray6) : Color.white)
+            )
+            .padding(.horizontal, 40)
+        }
+        .transition(.opacity)
+        .animation(.easeInOut(duration: 0.2), value: showWalletQR)
+    }
+    
+    // MARK: - QR Code Generator
+    
+    private func generateQRCode(from string: String) -> UIImage? {
+        let context = CIContext()
+        guard let filter = CIFilter(name: "CIQRCodeGenerator") else { return nil }
+        filter.setValue(Data(string.utf8), forKey: "inputMessage")
+        filter.setValue("M", forKey: "inputCorrectionLevel")
+        
+        guard let outputImage = filter.outputImage else { return nil }
+        let scale = 200.0 / outputImage.extent.width
+        let scaledImage = outputImage.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        
+        guard let cgImage = context.createCGImage(scaledImage, from: scaledImage.extent) else { return nil }
+        return UIImage(cgImage: cgImage)
     }
     
     // MARK: - Info Card Helper

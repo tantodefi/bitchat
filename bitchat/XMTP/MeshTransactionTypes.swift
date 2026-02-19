@@ -84,6 +84,9 @@ struct TxSignedPayload: Codable {
     /// Destination address
     let toAddress: String
     
+    /// Sender address (EOA or PQ account that initiated the transaction)
+    let fromAddress: String?
+    
     /// PeerID to send confirmation back to
     let replyToPeerId: String
     
@@ -96,6 +99,7 @@ struct TxSignedPayload: Codable {
         maxPriorityFee: UInt64,
         toAddress: String,
         replyToPeerId: String,
+        fromAddress: String? = nil,
         description: String? = nil,
         transactionType: String? = nil,
         currency: String? = nil,
@@ -111,6 +115,7 @@ struct TxSignedPayload: Codable {
         self.maxPriorityFee = maxPriorityFee
         self.signedAt = Date()
         self.toAddress = toAddress
+        self.fromAddress = fromAddress
         self.replyToPeerId = replyToPeerId
         self.description = description
         self.transactionType = transactionType
