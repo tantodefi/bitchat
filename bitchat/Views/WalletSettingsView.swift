@@ -94,6 +94,30 @@ struct WalletSettingsView: View {
                 }
                 .tint(.orange)
                 
+                // Proof verification toggle (Phase 1 Helios)
+                Toggle(isOn: $balanceService.proofVerificationEnabled) {
+                    Label {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Merkle Proof Verification")
+                            Text(balanceService.proofVerificationEnabled
+                                 ? "Balances verified via eth_getProof"
+                                 : "Trusting RPC responses (unverified)")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            if balanceService.proofStats.totalQueries > 0 {
+                                let stats = balanceService.proofStats
+                                Text("✓ \(stats.proofVerified)/\(stats.totalQueries) verified" +
+                                     (stats.mismatchDetected > 0 ? " • ⚠️ \(stats.mismatchDetected) mismatches!" : ""))
+                                    .font(.caption2)
+                                    .foregroundColor(stats.mismatchDetected > 0 ? .red : .green)
+                            }
+                        }
+                    } icon: {
+                        Image(systemName: balanceService.proofVerificationEnabled ? "checkmark.shield.fill" : "shield.slash")
+                    }
+                }
+                .tint(.green)
+                
                 NavigationLink {
                     WalletView(wallet: wallet)
                 } label: {

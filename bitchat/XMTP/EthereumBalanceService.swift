@@ -117,6 +117,15 @@ final class EthereumBalanceService: ObservableObject {
         let network: Network
         let wei: BigUInt
         let lastUpdated: Date
+        /// Whether this balance was cryptographically verified via Merkle proof (Phase 1 Helios)
+        let isProofVerified: Bool
+        
+        init(network: Network, wei: BigUInt, lastUpdated: Date, isProofVerified: Bool = false) {
+            self.network = network
+            self.wei = wei
+            self.lastUpdated = lastUpdated
+            self.isProofVerified = isProofVerified
+        }
         
         var eth: Double {
             let divisor = BigUInt(10).power(18)
@@ -161,6 +170,13 @@ final class EthereumBalanceService: ObservableObject {
         } else {
             self.useTestnet = true
         }
+        
+        // Load proof verification preference (default to enabled)
+        if UserDefaults.standard.object(forKey: "wallet-proof-verification") != nil {
+            self.proofVerificationEnabled = UserDefaults.standard.bool(forKey: "wallet-proof-verification")
+        } else {
+            self.proofVerificationEnabled = true
+        }
     }
     
     // MARK: - Public Methods
@@ -200,10 +216,132 @@ final class EthereumBalanceService: ObservableObject {
         isLoading = false
     }
     
-    /// Fetches balance for a specific network
+    /// Whether proof verification is enabled (Phase 1 of Helios integration).
+    /// When true, balances are fetched via eth_getProof and verified against
+    /// the block's state root using Merkle-Patricia trie proofs.
+    @Published var proofVerificationEnabled: Bool = true {
+        didSet {
+            UserDefaults.standard.set(proofVerificationEnabled, forKey: "wallet-proof-verification")
+        }
+    }
+    
+    /// Statistics on proof verification (visible in Wallet Settings)
+    @Published private(set) var proofStats = ProofStats()
+    
+    struct ProofStats {
+        var totalQueries: Int = 0
+        var proofVerified: Int = 0
+        var proofFailed: Int = 0
+        var fallbackUsed: Int = 0
+        var mismatchDetected: Int = 0
+        
+        var verificationRate: Double {
+            guard totalQueries > 0 else { return 0 }
+            return Double(proofVerified) / Double(totalQueries)
+        }
+    }
+    
+    // MARK: - Balance Fetching
+    
+    /// Fetches balance for a specific network.
+    /// Tries proof-verified balance first (eth_getProof), falls back to eth_getBalance.
     func fetchBalance(for address: String, network: Network) async -> Balance? {
-        // Use regular URLSession for testnets (Tor can be slow/unreliable for testnet RPCs)
-        // Use Tor for mainnets for privacy
+        // Try proof-verified balance first (Phase 1 Helios)
+        if proofVerificationEnabled {
+            if let balance = await fetchBalanceWithProof(for: address, network: network) {
+                return balance
+            }
+            // Proof verification failed — fall through to unverified
+            SecureLogger.warning(
+                "EthereumBalanceService: Proof verification failed for \(network.rawValue), falling back to eth_getBalance",
+                category: .network
+            )
+            await MainActor.run { proofStats.fallbackUsed += 1 }
+        }
+        
+        // Fallback: unverified eth_getBalance (legacy path)
+        return await fetchBalanceUnverified(for: address, network: network)
+    }
+    
+    /// Fetch balance with Merkle proof verification via eth_getProof.
+    /// Returns nil if proof verification fails (caller should fall back).
+    private func fetchBalanceWithProof(for address: String, network: Network) async -> Balance? {
+        let session = network.isTestnet ? URLSession.shared : TorURLSession.shared.session
+        let allRPCs = [network.rpcURL] + network.fallbackRPCs
+        
+        for rpcURL in allRPCs {
+            do {
+                // Step 1: Get the latest block header (for state root)
+                let blockHeader = try await fetchBlockHeader(
+                    session: session,
+                    rpcURL: rpcURL,
+                    blockTag: "latest"
+                )
+                
+                guard let stateRoot = Data(hexString: blockHeader.stateRoot) else {
+                    SecureLogger.warning("EthereumBalanceService: Invalid stateRoot hex from \(rpcURL.host ?? "?")", category: .network)
+                    continue
+                }
+                
+                // Step 2: Get the account proof
+                let proofResponse = try await fetchGetProof(
+                    session: session,
+                    rpcURL: rpcURL,
+                    address: address,
+                    blockTag: blockHeader.numberHex
+                )
+                
+                // Step 3: Verify the proof against the state root
+                let result = try MerklePatriciaProof.verifyBalance(
+                    proofResponse: proofResponse,
+                    stateRoot: stateRoot,
+                    blockNumber: blockHeader.number
+                )
+                
+                await MainActor.run {
+                    proofStats.totalQueries += 1
+                    proofStats.proofVerified += 1
+                    if !result.balanceConsistent {
+                        proofStats.mismatchDetected += 1
+                    }
+                }
+                
+                if !result.balanceConsistent {
+                    // RPC lied about the balance! Use the proven balance instead.
+                    SecureLogger.error(
+                        "EthereumBalanceService: ⚠️ RPC BALANCE MISMATCH on \(network.rawValue)! Using Merkle-proven balance.",
+                        category: .network
+                    )
+                }
+                
+                SecureLogger.info(
+                    "EthereumBalanceService: ✓ Proof-verified balance on \(network.rawValue) = \(result.account.balance) wei (block \(blockHeader.number), via \(rpcURL.host ?? "?"))",
+                    category: .network
+                )
+                
+                return Balance(
+                    network: network,
+                    wei: result.account.balance,
+                    lastUpdated: Date(),
+                    isProofVerified: true
+                )
+                
+            } catch {
+                SecureLogger.warning(
+                    "EthereumBalanceService: Proof verification failed via \(rpcURL.host ?? "?"): \(error)",
+                    category: .network
+                )
+                await MainActor.run { proofStats.proofFailed += 1 }
+                continue // Try next RPC
+            }
+        }
+        
+        return nil // All RPCs failed proof verification
+    }
+    
+    /// Legacy unverified balance fetch via eth_getBalance.
+    /// Trusts the RPC provider to return honest data.
+    private func fetchBalanceUnverified(for address: String, network: Network) async -> Balance? {
         let session = network.isTestnet ? URLSession.shared : TorURLSession.shared.session
         
         let payload: [String: Any] = [
@@ -218,7 +356,6 @@ final class EthereumBalanceService: ObservableObject {
             return nil
         }
         
-        // Try primary RPC first, then fallbacks
         let allRPCs = [network.rpcURL] + network.fallbackRPCs
         
         for rpcURL in allRPCs {
@@ -226,7 +363,7 @@ final class EthereumBalanceService: ObservableObject {
             request.httpMethod = "POST"
             request.httpBody = jsonData
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.timeoutInterval = 15 // Shorter timeout for faster fallback
+            request.timeoutInterval = 15
             
             do {
                 let (data, response) = try await session.data(for: request)
@@ -234,36 +371,137 @@ final class EthereumBalanceService: ObservableObject {
                 guard let httpResponse = response as? HTTPURLResponse,
                       httpResponse.statusCode == 200 else {
                     SecureLogger.warning("EthereumBalanceService: Bad response from \(rpcURL.host ?? "unknown") for \(network.rawValue)", category: .network)
-                    continue // Try next RPC
+                    continue
                 }
                 
                 guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                       let resultHex = json["result"] as? String else {
                     SecureLogger.warning("EthereumBalanceService: Invalid JSON from \(rpcURL.host ?? "unknown") for \(network.rawValue)", category: .network)
-                    continue // Try next RPC
+                    continue
                 }
                 
-                // Parse hex balance
                 guard let wei = BigUInt(hexString: resultHex) else {
                     SecureLogger.warning("EthereumBalanceService: Failed to parse balance hex", category: .network)
-                    continue // Try next RPC
+                    continue
                 }
                 
-                SecureLogger.debug("EthereumBalanceService: \(network.rawValue) balance = \(wei) (via \(rpcURL.host ?? "unknown"))", category: .network)
+                SecureLogger.debug("EthereumBalanceService: \(network.rawValue) balance = \(wei) [unverified] (via \(rpcURL.host ?? "unknown"))", category: .network)
                 
-                return Balance(network: network, wei: wei, lastUpdated: Date())
+                await MainActor.run { proofStats.totalQueries += 1 }
+                
+                return Balance(network: network, wei: wei, lastUpdated: Date(), isProofVerified: false)
             } catch {
                 SecureLogger.warning("EthereumBalanceService: \(rpcURL.host ?? "unknown") failed: \(error.localizedDescription)", category: .network)
-                continue // Try next RPC
+                continue
             }
         }
         
-        // All RPCs failed
         SecureLogger.error("EthereumBalanceService: All RPCs failed for \(network.rawValue)", category: .network)
         await MainActor.run {
             lastError = "Failed to connect to \(network.rawValue) RPC"
         }
         return nil
+    }
+    
+    // MARK: - RPC Helpers (eth_getProof, eth_getBlockByNumber)
+    
+    /// Minimal block header fields needed for proof verification.
+    struct BlockHeader {
+        let number: UInt64
+        let numberHex: String
+        let stateRoot: String
+    }
+    
+    /// Fetch the block header to obtain the state root.
+    private func fetchBlockHeader(
+        session: URLSession,
+        rpcURL: URL,
+        blockTag: String
+    ) async throws -> BlockHeader {
+        let payload: [String: Any] = [
+            "jsonrpc": "2.0",
+            "method": "eth_getBlockByNumber",
+            "params": [blockTag, false],
+            "id": 2
+        ]
+        
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: payload) else {
+            throw ProofVerificationError.invalidProof("Failed to encode block request")
+        }
+        
+        var request = URLRequest(url: rpcURL)
+        request.httpMethod = "POST"
+        request.httpBody = jsonData
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 15
+        
+        let (data, response) = try await session.data(for: request)
+        
+        guard let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 200 else {
+            throw ProofVerificationError.invalidProof("Block header request failed")
+        }
+        
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let result = json["result"] as? [String: Any],
+              let stateRoot = result["stateRoot"] as? String,
+              let numberHex = result["number"] as? String else {
+            throw ProofVerificationError.invalidProof("Invalid block header response")
+        }
+        
+        // Parse block number from hex
+        let numStr = numberHex.hasPrefix("0x") ? String(numberHex.dropFirst(2)) : numberHex
+        let blockNumber = UInt64(numStr, radix: 16) ?? 0
+        
+        return BlockHeader(number: blockNumber, numberHex: numberHex, stateRoot: stateRoot)
+    }
+    
+    /// Fetch eth_getProof for an address (no storage keys needed for balance).
+    private func fetchGetProof(
+        session: URLSession,
+        rpcURL: URL,
+        address: String,
+        blockTag: String
+    ) async throws -> EthGetProofResponse {
+        let payload: [String: Any] = [
+            "jsonrpc": "2.0",
+            "method": "eth_getProof",
+            "params": [address, [] as [String], blockTag],
+            "id": 3
+        ]
+        
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: payload) else {
+            throw ProofVerificationError.invalidProof("Failed to encode proof request")
+        }
+        
+        var request = URLRequest(url: rpcURL)
+        request.httpMethod = "POST"
+        request.httpBody = jsonData
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 20 // Proofs are larger, allow more time
+        
+        let (data, response) = try await session.data(for: request)
+        
+        guard let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 200 else {
+            throw ProofVerificationError.invalidProof("eth_getProof request failed")
+        }
+        
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw ProofVerificationError.invalidProof("Invalid JSON in eth_getProof response")
+        }
+        
+        // Check for JSON-RPC error
+        if let error = json["error"] as? [String: Any] {
+            let message = error["message"] as? String ?? "Unknown"
+            throw ProofVerificationError.invalidProof("RPC error: \(message)")
+        }
+        
+        guard let result = json["result"] as? [String: Any] else {
+            throw ProofVerificationError.invalidProof("Missing result in eth_getProof response")
+        }
+        
+        return try EthGetProofResponse.parse(from: result)
     }
     
     // MARK: - Private Helpers

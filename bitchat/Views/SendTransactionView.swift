@@ -66,6 +66,12 @@ struct SendTransactionView: View {
     @ObservedObject var meshRelay: MeshTransactionRelay
     var onSuccess: (() -> Void)? = nil
     
+    /// PQ account support: when set, sends go through the PQ smart account
+    var accountMode: AccountMode = .eoa
+    var pqViewModel: PQAccountViewModel? = nil
+    /// The address whose balance to display (EOA or PQ smart contract wallet)
+    var senderAddress: String? = nil
+    
     @State private var recipientAddress = ""
     @State private var amount = ""
     @State private var isLoading = false
@@ -123,8 +129,18 @@ struct SendTransactionView: View {
         isValidAddress && amountInWei != nil && (amountInWei ?? 0) > 0 && submittedTxId == nil && !isResolvingENS
     }
     
+    /// Whether this view is sending from a PQ smart contract account
+    private var isPQMode: Bool {
+        accountMode == .pqAccount && pqViewModel != nil
+    }
+    
     /// Get current network's balance
     private var currentBalance: EthereumBalanceService.Balance? {
+        if isPQMode {
+            // PQ accounts are only on testnets for now — check Sepolia and Arbitrum Sepolia
+            if let b = balanceService.balances[.sepolia], !b.wei.isZero { return b }
+            return balanceService.balances[.arbitrumSepolia]
+        }
         let network = balanceService.useTestnet ? EthereumBalanceService.Network.sepolia : EthereumBalanceService.Network.ethereum
         return balanceService.balances[network]
     }
@@ -164,6 +180,10 @@ struct SendTransactionView: View {
     private var exceedsBalance: Bool {
         guard let balance = currentBalance,
               let sendWei = amountInWei else { return false }
+        if isPQMode {
+            // PQ mode: bundler handles gas, just check send amount fits
+            return !(balance.wei >= BigUInt(sendWei))
+        }
         let gasLimit: UInt64 = 21000
         let maxCostWei = gasLimit * maxFeeWei
         let totalWei = BigUInt(sendWei) + BigUInt(maxCostWei)
@@ -259,14 +279,29 @@ struct SendTransactionView: View {
                 } header: {
                     Text("Amount")
                 } footer: {
-                    HStack {
-                        Text("Network:")
-                        Text(balanceService.useTestnet ? "Sepolia Testnet" : "Ethereum Mainnet")
-                            .foregroundColor(balanceService.useTestnet ? .orange : .primary)
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text("Network:")
+                            Text(balanceService.useTestnet ? "Sepolia Testnet" : "Ethereum Mainnet")
+                                .foregroundColor(balanceService.useTestnet ? .orange : .primary)
+                        }
+                        .font(.caption)
+                        
+                        if isPQMode {
+                            HStack(spacing: 4) {
+                                Image(systemName: "shield.checkered")
+                                    .foregroundColor(.green)
+                                Text("Sending from PQ smart account via ERC-4337 UserOperation")
+                                    .foregroundColor(.green)
+                            }
+                            .font(.caption)
+                        }
                     }
-                    .font(.caption)
                 }
                 
+                // Gas settings — only for EOA mode.
+                // PQ account gas is estimated by the Pimlico bundler.
+                if !isPQMode {
                 Section {
                     // Gas speed picker
                     VStack(alignment: .leading, spacing: 12) {
@@ -351,6 +386,7 @@ struct SendTransactionView: View {
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
+                } // end if !isPQMode (gas settings)
                 
                 if let error = errorMessage {
                     Section {
@@ -433,8 +469,13 @@ struct SendTransactionView: View {
                                 ProgressView()
                                     .padding(.trailing, 8)
                             }
-                            Text(isLoading ? "Signing..." : (isOnline ? "Sign & Send" : "Sign & Queue"))
-                                .fontWeight(.semibold)
+                            if isPQMode {
+                                Text(isLoading ? "Submitting UserOp..." : "Send via PQ Account")
+                                    .fontWeight(.semibold)
+                            } else {
+                                Text(isLoading ? "Signing..." : (isOnline ? "Sign & Send" : "Sign & Queue"))
+                                    .fontWeight(.semibold)
+                            }
                             Spacer()
                         }
                     }
@@ -447,7 +488,7 @@ struct SendTransactionView: View {
                     }
                 }
             }
-            .navigationTitle("Send ETH")
+            .navigationTitle(isPQMode ? "Send ETH (PQ Account)" : "Send ETH")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -456,6 +497,12 @@ struct SendTransactionView: View {
             }
             .task {
                 await checkConnectivity()
+            }
+            .task {
+                // Refresh balances for the sender address when the sheet opens
+                if let addr = senderAddress, !addr.isEmpty {
+                    await balanceService.fetchBalances(for: addr)
+                }
             }
             .confirmationDialog("Confirm Transaction", isPresented: $showingConfirmation) {
                 Button(isOnline ? "Sign & Send" : "Sign & Queue") {
@@ -480,27 +527,44 @@ struct SendTransactionView: View {
         errorMessage = nil
         
         do {
-            // Create a TransactionSigner instance
-            let signer = TransactionSigner(
-                wallet: wallet,
-                meshRelay: meshRelay,
-                balanceService: balanceService
-            )
-            
-            // For testing, we use our own address as reply-to
-            let myAddress = try await wallet.getAddress()
-            
-            let requestId = try await signer.signAndQueueTransfer(
-                to: effectiveRecipientAddress,
-                amountWei: wei,
-                maxPriorityFeePerGas: priorityFeeWei,
-                maxFeePerGas: maxFeeWei,
-                replyToPeerId: myAddress, // Self for testing
-                description: "Send \(amount) ETH"
-            )
-            
-            submittedTxId = requestId
-            // Note: Actual broadcast status will be tracked via meshRelay.pendingRelays observation
+            if isPQMode, let pqVM = pqViewModel {
+                // PQ mode: send via ERC-4337 UserOperation through the smart account
+                let txHash = await pqVM.executeTransaction(
+                    to: effectiveRecipientAddress,
+                    value: wei
+                )
+                
+                if let hash = txHash {
+                    submittedTxId = hash
+                    // Auto-dismiss after showing success
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                        onSuccess?()
+                        dismiss()
+                    }
+                } else {
+                    errorMessage = pqVM.lastError ?? "PQ transaction failed"
+                }
+            } else {
+                // EOA mode: sign raw transaction and queue for mesh relay
+                let signer = TransactionSigner(
+                    wallet: wallet,
+                    meshRelay: meshRelay,
+                    balanceService: balanceService
+                )
+                
+                let myAddress = try await wallet.getAddress()
+                
+                let requestId = try await signer.signAndQueueTransfer(
+                    to: effectiveRecipientAddress,
+                    amountWei: wei,
+                    maxPriorityFeePerGas: priorityFeeWei,
+                    maxFeePerGas: maxFeeWei,
+                    replyToPeerId: myAddress,
+                    description: "Send \(amount) ETH"
+                )
+                
+                submittedTxId = requestId
+            }
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -511,6 +575,15 @@ struct SendTransactionView: View {
     /// Set amount to max (balance minus estimated gas)
     private func setMaxAmount() {
         guard let balance = currentBalance else { return }
+        
+        if isPQMode {
+            // PQ mode: bundler handles gas, so use full balance
+            // (bundler deducts gas from account separately via paymaster or prefund)
+            let maxSendEth = balance.wei.toDouble() / 1e18
+            amount = String(format: "%.6f", maxSendEth)
+            return
+        }
+        
         let gasLimit: UInt64 = 21000
         let maxGasCostWei = BigUInt(gasLimit) * BigUInt(maxFeeWei)
         
@@ -620,7 +693,8 @@ struct SendTransactionView: View {
     SendTransactionView(
         wallet: EmbeddedWallet(keychain: PreviewKeychainManager()),
         balanceService: EthereumBalanceService(),
-        meshRelay: MeshTransactionRelay(keychain: PreviewKeychainManager())
+        meshRelay: MeshTransactionRelay(keychain: PreviewKeychainManager()),
+        senderAddress: "0x0000000000000000000000000000000000000001"
     )
 }
 
