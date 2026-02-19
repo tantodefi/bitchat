@@ -379,26 +379,46 @@ final class MeshTransactionRelay: ObservableObject {
         do {
             let txHash = try await broadcastToRPC(relay.payload)
             
-            // Add to confirmed
-            let confirmed = ConfirmedTransaction(
-                id: relay.id,
-                txHash: txHash,
-                chainId: relay.payload.chainId,
-                toAddress: relay.payload.toAddress,
-                fromAddress: relay.payload.fromAddress,
-                amount: relay.payload.amount,
-                currency: relay.payload.currency,
-                confirmedAt: Date(),
-                blockNumber: nil
-            )
-            confirmedTransactions.append(confirmed)
-            saveConfirmedTransactions()
+            SecureLogger.info("📡 Broadcast accepted, polling receipt: \(txHash.prefix(16))…", category: .session)
+            updateRelayStatus(relay.id, status: .awaitingConfirmation, relayedVia: nil)
             
-            // Remove from pending
-            pendingRelays.removeAll { $0.id == relay.id }
-            savePendingRelays()
+            // Poll for receipt to verify the tx actually succeeded on-chain.
+            // A tx accepted into the mempool can still revert (e.g. out-of-gas
+            // when sending to a smart contract wallet like a PQ account).
+            let receipt = await pollForReceipt(txHash: txHash, chainId: relay.payload.chainId)
             
-            SecureLogger.info("✅ Direct broadcast tx: \(txHash.prefix(16))…", category: .session)
+            if let receipt = receipt, !receipt.succeeded {
+                // Transaction was mined but REVERTED on-chain
+                let reason = receipt.revertReason ?? "Transaction reverted on-chain (status: 0x0)"
+                moveToFailedHistory(relay, reason: reason)
+                SecureLogger.error("❌ Transaction reverted on-chain: \(reason)", category: .session)
+            } else {
+                // Receipt shows success, or we couldn't get receipt (treat as confirmed)
+                let blockNum = receipt?.blockNumber
+                let confirmed = ConfirmedTransaction(
+                    id: relay.id,
+                    txHash: txHash,
+                    chainId: relay.payload.chainId,
+                    toAddress: relay.payload.toAddress,
+                    fromAddress: relay.payload.fromAddress,
+                    amount: relay.payload.amount,
+                    currency: relay.payload.currency,
+                    confirmedAt: Date(),
+                    blockNumber: blockNum
+                )
+                confirmedTransactions.append(confirmed)
+                saveConfirmedTransactions()
+                
+                // Remove from pending
+                pendingRelays.removeAll { $0.id == relay.id }
+                savePendingRelays()
+                
+                if receipt != nil {
+                    SecureLogger.info("✅ Transaction confirmed on-chain: \(txHash.prefix(16))… block=\(blockNum.map { String($0) } ?? "?")", category: .session)
+                } else {
+                    SecureLogger.info("✅ Direct broadcast tx (receipt pending): \(txHash.prefix(16))…", category: .session)
+                }
+            }
         } catch let error as TransactionError {
             // Check if it's a real transaction error vs network error
             switch error {
@@ -418,6 +438,109 @@ final class MeshTransactionRelay: ObservableObject {
             SecureLogger.warning("📶 Broadcast failed (will retry): \(error.localizedDescription)", category: .session)
             scheduleRetry()
         }
+    }
+    
+    // MARK: - Receipt Polling
+    
+    /// Result of polling for a transaction receipt
+    struct TxReceiptResult {
+        let succeeded: Bool
+        let blockNumber: UInt64?
+        let revertReason: String?
+    }
+    
+    /// Poll for a transaction receipt to verify on-chain success/failure.
+    ///
+    /// After `eth_sendRawTransaction` returns a tx hash, the transaction is in the
+    /// mempool but may still revert on-chain (e.g. out-of-gas when sending to a
+    /// smart contract wallet). This method polls `eth_getTransactionReceipt` to
+    /// check the actual on-chain outcome.
+    ///
+    /// - Returns: Receipt result, or nil if receipt not available after timeout.
+    private func pollForReceipt(txHash: String, chainId: UInt64, maxAttempts: Int = 15, intervalSeconds: UInt64 = 4) async -> TxReceiptResult? {
+        guard let primaryRPC = rpcEndpoints[chainId] else { return nil }
+        
+        var rpcsToTry = [primaryRPC]
+        if let fallbacks = fallbackRPCs[chainId] {
+            rpcsToTry.append(contentsOf: fallbacks)
+        }
+        
+        let requestBody: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_getTransactionReceipt",
+            "params": [txHash]
+        ]
+        
+        for attempt in 0..<maxAttempts {
+            if attempt > 0 {
+                try? await Task.sleep(nanoseconds: intervalSeconds * 1_000_000_000)
+            }
+            
+            for rpcURL in rpcsToTry {
+                guard let url = URL(string: rpcURL) else { continue }
+                
+                do {
+                    var request = URLRequest(url: url)
+                    request.httpMethod = "POST"
+                    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
+                    request.timeoutInterval = 10
+                    
+                    let (data, response) = try await URLSession.shared.data(for: request)
+                    
+                    guard let httpResponse = response as? HTTPURLResponse,
+                          httpResponse.statusCode == 200 else {
+                        continue
+                    }
+                    
+                    guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                        continue
+                    }
+                    
+                    // result is null when tx is still pending
+                    guard let result = json["result"] as? [String: Any] else {
+                        break // Not yet mined, wait and retry
+                    }
+                    
+                    // Parse status: "0x1" = success, "0x0" = reverted
+                    let statusHex = result["status"] as? String ?? "0x1"
+                    let succeeded = statusHex != "0x0"
+                    
+                    // Parse block number
+                    var blockNumber: UInt64?
+                    if let blockHex = result["blockNumber"] as? String {
+                        let hex = blockHex.hasPrefix("0x") ? String(blockHex.dropFirst(2)) : blockHex
+                        blockNumber = UInt64(hex, radix: 16)
+                    }
+                    
+                    // Try to extract revert reason if failed
+                    var revertReason: String?
+                    if !succeeded {
+                        // Check gasUsed vs gasLimit for out-of-gas detection
+                        if let gasUsedHex = result["gasUsed"] as? String,
+                           let gasUsed = UInt64(gasUsedHex.hasPrefix("0x") ? String(gasUsedHex.dropFirst(2)) : gasUsedHex, radix: 16) {
+                            revertReason = "Transaction reverted (gas used: \(gasUsed)). The recipient may be a smart contract wallet requiring more gas."
+                        } else {
+                            revertReason = "Transaction reverted on-chain (status: 0x0)"
+                        }
+                    }
+                    
+                    return TxReceiptResult(
+                        succeeded: succeeded,
+                        blockNumber: blockNumber,
+                        revertReason: revertReason
+                    )
+                    
+                } catch {
+                    continue
+                }
+            }
+        }
+        
+        // Couldn't get receipt after all attempts — treat as indeterminate
+        SecureLogger.warning("⏱ Receipt polling timed out for \(txHash.prefix(16))…", category: .session)
+        return nil
     }
     
     // MARK: - Response Sending

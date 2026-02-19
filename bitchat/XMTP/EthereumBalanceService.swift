@@ -113,18 +113,45 @@ final class EthereumBalanceService: ObservableObject {
         }
     }
     
+    /// The trust level of a balance result.
+    enum VerificationLevel: String, Equatable {
+        /// Trustlessly verified via Helios consensus light client.
+        /// State root attested by Ethereum's sync committee (BLS signatures).
+        case heliosVerified
+        
+        /// Merkle proof is internally consistent, but the state root
+        /// came from the same untrusted RPC (Phase 1 — not fully trustless).
+        case proofConsistent
+        
+        /// No proof verification performed; RPC response trusted as-is.
+        case unverified
+    }
+    
     struct Balance: Equatable {
         let network: Network
         let wei: BigUInt
         let lastUpdated: Date
-        /// Whether this balance was cryptographically verified via Merkle proof (Phase 1 Helios)
-        let isProofVerified: Bool
+        /// How this balance was verified
+        let verificationLevel: VerificationLevel
         
-        init(network: Network, wei: BigUInt, lastUpdated: Date, isProofVerified: Bool = false) {
+        /// Backwards-compatible convenience: true if any form of proof was checked
+        var isProofVerified: Bool {
+            verificationLevel == .heliosVerified || verificationLevel == .proofConsistent
+        }
+        
+        init(network: Network, wei: BigUInt, lastUpdated: Date, verificationLevel: VerificationLevel = .unverified) {
             self.network = network
             self.wei = wei
             self.lastUpdated = lastUpdated
-            self.isProofVerified = isProofVerified
+            self.verificationLevel = verificationLevel
+        }
+        
+        /// Legacy initializer for backwards compat
+        init(network: Network, wei: BigUInt, lastUpdated: Date, isProofVerified: Bool) {
+            self.network = network
+            self.wei = wei
+            self.lastUpdated = lastUpdated
+            self.verificationLevel = isProofVerified ? .proofConsistent : .unverified
         }
         
         var eth: Double {
@@ -234,19 +261,37 @@ final class EthereumBalanceService: ObservableObject {
         var proofFailed: Int = 0
         var fallbackUsed: Int = 0
         var mismatchDetected: Int = 0
+        var heliosVerified: Int = 0
+        var heliosFailed: Int = 0
         
         var verificationRate: Double {
             guard totalQueries > 0 else { return 0 }
-            return Double(proofVerified) / Double(totalQueries)
+            return Double(proofVerified + heliosVerified) / Double(totalQueries)
         }
     }
     
     // MARK: - Balance Fetching
     
     /// Fetches balance for a specific network.
-    /// Tries proof-verified balance first (eth_getProof), falls back to eth_getBalance.
+    ///
+    /// Verification hierarchy (best to worst):
+    /// 1. **Helios** — Trustlessly verified against consensus-attested state root
+    /// 2. **Phase 1 proof** — Merkle proof checked, but state root from same RPC
+    /// 3. **Unverified** — Raw eth_getBalance, trusting RPC
     func fetchBalance(for address: String, network: Network) async -> Balance? {
-        // Try proof-verified balance first (Phase 1 Helios)
+        // Tier 1: Try Helios trustless verification (Ethereum mainnet only for now)
+        if await heliosAvailableForNetwork(network) {
+            if let balance = await fetchBalanceViaHelios(for: address, network: network) {
+                return balance
+            }
+            // Helios failed — fall through to Phase 1 proof
+            SecureLogger.warning(
+                "EthereumBalanceService: Helios verification failed for \(network.rawValue), trying proof fallback",
+                category: .network
+            )
+        }
+        
+        // Tier 2: Try Phase 1 proof-consistent verification (eth_getProof)
         if proofVerificationEnabled {
             if let balance = await fetchBalanceWithProof(for: address, network: network) {
                 return balance
@@ -259,8 +304,61 @@ final class EthereumBalanceService: ObservableObject {
             await MainActor.run { proofStats.fallbackUsed += 1 }
         }
         
-        // Fallback: unverified eth_getBalance (legacy path)
+        // Tier 3: Unverified eth_getBalance (legacy path, trusts RPC)
         return await fetchBalanceUnverified(for: address, network: network)
+    }
+    
+    /// Check if Helios is available for a given network.
+    /// Currently Helios supports Ethereum mainnet and Sepolia.
+    private func heliosAvailableForNetwork(_ network: Network) async -> Bool {
+        // Only use Helios for networks it supports
+        switch network {
+        case .ethereum, .sepolia:
+            return await HeliosManager.shared.isRunning
+        case .base, .arbitrum, .arbitrumSepolia:
+            // Phase 2: Add Base (OP Stack) support
+            return false
+        }
+    }
+    
+    /// Fetch balance via Helios trustless light client.
+    /// Returns `.heliosVerified` balance or nil on failure.
+    private func fetchBalanceViaHelios(for address: String, network: Network) async -> Balance? {
+        do {
+            let balanceHex = try await HeliosManager.shared.getBalance(address: address)
+            
+            guard let wei = BigUInt(hexString: balanceHex) else {
+                SecureLogger.warning(
+                    "EthereumBalanceService: Failed to parse Helios balance hex: \(balanceHex)",
+                    category: .network
+                )
+                return nil
+            }
+            
+            await MainActor.run {
+                proofStats.totalQueries += 1
+                proofStats.heliosVerified += 1
+            }
+            
+            SecureLogger.info(
+                "EthereumBalanceService: ✓✓ Helios-verified balance on \(network.rawValue) = \(wei) wei",
+                category: .network
+            )
+            
+            return Balance(
+                network: network,
+                wei: wei,
+                lastUpdated: Date(),
+                verificationLevel: .heliosVerified
+            )
+        } catch {
+            SecureLogger.warning(
+                "EthereumBalanceService: Helios query failed for \(network.rawValue): \(error)",
+                category: .network
+            )
+            await MainActor.run { proofStats.heliosFailed += 1 }
+            return nil
+        }
     }
     
     /// Fetch balance with Merkle proof verification via eth_getProof.
@@ -323,7 +421,7 @@ final class EthereumBalanceService: ObservableObject {
                     network: network,
                     wei: result.account.balance,
                     lastUpdated: Date(),
-                    isProofVerified: true
+                    verificationLevel: .proofConsistent
                 )
                 
             } catch {
@@ -389,7 +487,7 @@ final class EthereumBalanceService: ObservableObject {
                 
                 await MainActor.run { proofStats.totalQueries += 1 }
                 
-                return Balance(network: network, wei: wei, lastUpdated: Date(), isProofVerified: false)
+                return Balance(network: network, wei: wei, lastUpdated: Date(), verificationLevel: .unverified)
             } catch {
                 SecureLogger.warning("EthereumBalanceService: \(rpcURL.host ?? "unknown") failed: \(error.localizedDescription)", category: .network)
                 continue

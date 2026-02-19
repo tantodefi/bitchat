@@ -64,9 +64,23 @@ final class TransactionSigner {
         SecureLogger.debug("📍 Using nonce: \(txNonce) for chain: \(chainId)", category: .session)
         
         // Gas parameters (EIP-1559) - use provided values or defaults
-        let gasLimit: UInt64 = 21000 // Standard ETH transfer
         let priorityFee = maxPriorityFeePerGas ?? 1_500_000_000 // Default: 1.5 gwei
         let maxFee = maxFeePerGas ?? 30_000_000_000 // Default: 30 gwei
+        
+        // Estimate gas dynamically — contract wallets (PQ accounts) need more than 21000
+        let gasLimit: UInt64
+        do {
+            let estimated = try await estimateGas(
+                from: address, to: to, value: amountWei, chainId: chainId
+            )
+            // Add 20% buffer for safety
+            gasLimit = max(estimated * 120 / 100, 21000)
+            SecureLogger.debug("📍 Gas estimate: \(estimated) → using \(gasLimit) (with 20% buffer)", category: .session)
+        } catch {
+            // Fallback to standard ETH transfer gas if estimation fails
+            gasLimit = 21000
+            SecureLogger.warning("Gas estimation failed, using fallback 21000: \(error.localizedDescription)", category: .session)
+        }
         
         // Sign the transaction
         let signedTx = try await wallet.signTransaction(
@@ -252,6 +266,88 @@ final class TransactionSigner {
         } else {
             return "\(wei) wei"
         }
+    }
+    
+    /// Estimate gas for a transaction via eth_estimateGas RPC.
+    ///
+    /// For simple EOA→EOA ETH transfers this returns 21000.
+    /// For transfers to smart contract wallets (e.g. PQ accounts), this returns
+    /// a higher value because the contract's receive/fallback function executes code.
+    private func estimateGas(from: String, to: String, value: UInt64, data: Data = Data(), chainId: UInt64) async throws -> UInt64 {
+        let rpcURLs: [String]
+        switch chainId {
+        case 1:
+            rpcURLs = ["https://rpc.flashbots.net", "https://eth.llamarpc.com"]
+        case 11155111:
+            rpcURLs = ["https://sepolia.drpc.org", "https://rpc2.sepolia.org", "https://1rpc.io/sepolia"]
+        case 8453:
+            rpcURLs = ["https://mainnet.base.org", "https://base.llamarpc.com"]
+        default:
+            throw TransactionError.unsupportedChain
+        }
+        
+        var txObject: [String: String] = [
+            "from": from,
+            "to": to,
+            "value": String(format: "0x%llx", value),
+        ]
+        if !data.isEmpty {
+            txObject["data"] = "0x" + data.map { String(format: "%02x", $0) }.joined()
+        }
+        
+        let requestBody: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_estimateGas",
+            "params": [txObject]
+        ]
+        
+        var lastError: Error = TransactionError.rpcFailed
+        
+        for rpcURL in rpcURLs {
+            guard let url = URL(string: rpcURL) else { continue }
+            
+            do {
+                var request = URLRequest(url: url)
+                request.httpMethod = "POST"
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
+                request.timeoutInterval = 10
+                
+                let (responseData, _) = try await URLSession.shared.data(for: request)
+                
+                guard let json = try JSONSerialization.jsonObject(with: responseData) as? [String: Any] else {
+                    continue
+                }
+                
+                // If the RPC returned an error (e.g. execution reverted), throw it
+                if let error = json["error"] as? [String: Any],
+                   let message = error["message"] as? String {
+                    throw TransactionError.rpcError(message)
+                }
+                
+                guard let result = json["result"] as? String else {
+                    continue
+                }
+                
+                let hex = result.hasPrefix("0x") ? String(result.dropFirst(2)) : result
+                guard let gas = UInt64(hex, radix: 16) else {
+                    continue
+                }
+                
+                SecureLogger.debug("Gas estimate from \(url.host ?? "unknown"): \(gas)", category: .session)
+                return gas
+                
+            } catch let error as TransactionError {
+                throw error
+            } catch {
+                SecureLogger.debug("Gas estimation failed from \(url.host ?? "unknown"): \(error.localizedDescription)", category: .session)
+                lastError = error
+                continue
+            }
+        }
+        
+        throw lastError
     }
 }
 

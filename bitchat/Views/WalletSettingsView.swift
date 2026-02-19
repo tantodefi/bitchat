@@ -94,29 +94,32 @@ struct WalletSettingsView: View {
                 }
                 .tint(.orange)
                 
-                // Proof verification toggle (Phase 1 Helios)
+                // Proof verification toggle (Phase 1 — proof-consistent, not fully trustless)
                 Toggle(isOn: $balanceService.proofVerificationEnabled) {
                     Label {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("Merkle Proof Verification")
+                            Text("Merkle Proof Checking")
                             Text(balanceService.proofVerificationEnabled
-                                 ? "Balances verified via eth_getProof"
+                                 ? "Proofs checked via eth_getProof (state root still from RPC)"
                                  : "Trusting RPC responses (unverified)")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                             if balanceService.proofStats.totalQueries > 0 {
                                 let stats = balanceService.proofStats
-                                Text("✓ \(stats.proofVerified)/\(stats.totalQueries) verified" +
+                                Text("✓ \(stats.proofVerified)/\(stats.totalQueries) proof-consistent" +
                                      (stats.mismatchDetected > 0 ? " • ⚠️ \(stats.mismatchDetected) mismatches!" : ""))
                                     .font(.caption2)
                                     .foregroundColor(stats.mismatchDetected > 0 ? .red : .green)
                             }
                         }
                     } icon: {
-                        Image(systemName: balanceService.proofVerificationEnabled ? "checkmark.shield.fill" : "shield.slash")
+                        Image(systemName: balanceService.proofVerificationEnabled ? "shield.lefthalf.filled" : "shield.slash")
                     }
                 }
-                .tint(.green)
+                .tint(.yellow)
+                
+                // Helios Light Client status
+                heliosStatusRow
                 
                 NavigationLink {
                     WalletView(wallet: wallet)
@@ -570,6 +573,55 @@ struct WalletSettingsView: View {
         if status.isDeployed { return .green }
         if status.error != nil { return .red }
         return .secondary
+    }
+    
+    // MARK: - Helios Status Row
+    
+    @ViewBuilder
+    private var heliosStatusRow: some View {
+        let helios = HeliosManager.shared
+        Label {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Helios Light Client")
+                    .font(.body)
+                
+                if helios.isRunning {
+                    switch helios.syncStatus {
+                    case .synced(let block):
+                        Text("Synced to block \(block)")
+                            .font(.caption)
+                            .foregroundColor(.green)
+                    case .syncing(let progress):
+                        Text("Syncing... \(Int(progress * 100))%")
+                            .font(.caption)
+                            .foregroundColor(.orange)
+                    default:
+                        Text("Running")
+                            .font(.caption)
+                            .foregroundColor(.green)
+                    }
+                } else if helios.isFFIAvailable {
+                    Text("Available — tap to start")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                } else {
+                    Text("Not built — run build-ios.sh in localPackages/HeliosBridge/")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                
+                // Show Helios stats from balance service
+                let stats = balanceService.proofStats
+                if stats.heliosVerified > 0 {
+                    Text("✓✓ \(stats.heliosVerified) Helios-verified queries")
+                        .font(.caption2)
+                        .foregroundColor(.green)
+                }
+            }
+        } icon: {
+            Image(systemName: helios.isRunning ? "checkmark.shield.fill" : "shield.righthalf.inset.filled")
+                .foregroundColor(helios.isRunning ? .green : .secondary)
+        }
     }
 }
 

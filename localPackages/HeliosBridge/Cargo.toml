@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["helios-ios"]
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

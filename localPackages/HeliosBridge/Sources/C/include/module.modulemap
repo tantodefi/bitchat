@@ -1,0 +1,4 @@
+module HeliosC {
+    header "helios.h"
+    export *
+}

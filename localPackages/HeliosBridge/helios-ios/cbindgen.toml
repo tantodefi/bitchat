@@ -1,0 +1,21 @@
+language = "C"
+include_guard = "HELIOS_H"
+no_includes = true
+sys_includes = ["stdint.h", "stdbool.h"]
+
+[export]
+include = [
+    "helios_init",
+    "helios_get_balance",
+    "helios_get_logs",
+    "helios_eth_call",
+    "helios_finalized_block",
+    "helios_free_string",
+    "helios_shutdown",
+]
+
+[fn]
+args = "Auto"
+
+[parse]
+parse_deps = false

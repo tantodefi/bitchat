@@ -105,6 +105,12 @@ struct SendTransactionView: View {
         return meshRelay.confirmedTransactions.contains { $0.id == txId }
     }
     
+    /// Check if transaction was rejected/reverted on-chain
+    private var isFailed: Bool {
+        guard let txId = submittedTxId else { return false }
+        return meshRelay.failedTransactions.contains { $0.id == txId }
+    }
+    
     private var amountInWei: UInt64? {
         guard let ethAmount = Double(amount) else { return nil }
         return UInt64(ethAmount * 1_000_000_000_000_000_000) // 1e18
@@ -170,8 +176,10 @@ struct SendTransactionView: View {
     }
     
     /// Estimated transaction cost in ETH
+    /// Uses 65000 as a conservative upper bound that covers both EOA (21k)
+    /// and smart contract wallet (PQ account) receive functions.
     private var estimatedCostEth: Double {
-        let gasLimit: UInt64 = 21000
+        let gasLimit: UInt64 = 65000
         let maxCostWei = gasLimit * maxFeeWei
         return Double(maxCostWei) / 1e18
     }
@@ -184,7 +192,8 @@ struct SendTransactionView: View {
             // PQ mode: bundler handles gas, just check send amount fits
             return !(balance.wei >= BigUInt(sendWei))
         }
-        let gasLimit: UInt64 = 21000
+        // Use conservative estimate: contract wallets (PQ accounts) need ~60k gas
+        let gasLimit: UInt64 = 65000
         let maxCostWei = gasLimit * maxFeeWei
         let totalWei = BigUInt(sendWei) + BigUInt(maxCostWei)
         // Use >= with NOT: totalWei > balance.wei  ≡  !(balance.wei >= totalWei)
@@ -399,10 +408,25 @@ struct SendTransactionView: View {
                 if let txId = submittedTxId {
                     Section {
                         VStack(alignment: .leading, spacing: 8) {
-                            if isConfirmed {
-                                // Transaction was broadcast successfully
+                            if isFailed {
+                                // Transaction was broadcast but REVERTED on-chain
+                                if let failed = meshRelay.failedTransactions.first(where: { $0.id == txId }) {
+                                    Label("Transaction Failed", systemImage: "xmark.circle.fill")
+                                        .foregroundColor(.red)
+                                    Text(failed.reason)
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                    Text("The transaction was accepted by the network but reverted on-chain. This can happen when sending to a smart contract wallet with insufficient gas.")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                } else {
+                                    Label("Transaction Failed", systemImage: "xmark.circle.fill")
+                                        .foregroundColor(.red)
+                                }
+                            } else if isConfirmed {
+                                // Transaction was broadcast and confirmed on-chain
                                 if let confirmed = meshRelay.confirmedTransactions.first(where: { $0.id == txId }) {
-                                    Label("Transaction Broadcast", systemImage: "checkmark.circle.fill")
+                                    Label("Transaction Confirmed", systemImage: "checkmark.circle.fill")
                                         .foregroundColor(.green)
                                     
                                     Text("TX Hash: \(confirmed.txHash.prefix(20))...")
@@ -434,8 +458,13 @@ struct SendTransactionView: View {
                                     ProgressView()
                                         .scaleEffect(0.8)
                                 case .awaitingConfirmation:
-                                    Label("Awaiting Confirmation", systemImage: "hourglass")
+                                    Label("Verifying on-chain...", systemImage: "hourglass")
                                         .foregroundColor(.blue)
+                                    ProgressView()
+                                        .scaleEffect(0.8)
+                                    Text("Checking transaction receipt...")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
                                 case .confirmed:
                                     Label("Confirmed", systemImage: "checkmark.circle.fill")
                                         .foregroundColor(.green)
@@ -584,7 +613,8 @@ struct SendTransactionView: View {
             return
         }
         
-        let gasLimit: UInt64 = 21000
+        // Conservative gas estimate: covers both EOA (21k) and contract wallets (PQ accounts)
+        let gasLimit: UInt64 = 65000
         let maxGasCostWei = BigUInt(gasLimit) * BigUInt(maxFeeWei)
         
         // Subtract gas from balance, ensure non-negative

@@ -140,10 +140,14 @@ struct WalletView: View {
         .navigationBarTitleDisplayMode(.inline)
         #endif
         .task {
+            // Single coordinated startup flow:
+            // 1. Load EOA address
+            // 2. Init PQ if configured
+            // 3. Fetch balances for the correct address
+            // 4. Start auto-refresh
             await loadWallet()
-        }
-        .task {
-            // Configure PQ VM
+            
+            // Initialize PQ account (if configured)
             if XMTPServiceContainer.isConfigured {
                 let container = XMTPServiceContainer.shared
                 pqViewModel.configure(
@@ -153,29 +157,26 @@ struct WalletView: View {
                 await pqViewModel.initializeKeys(from: wallet)
             }
             
-            // After PQ init completes, fetch balances for the correct address.
-            // In PQ mode, displayAddress now returns the smart contract wallet
-            // address (not the EOA), so balances will reflect the PQ account.
-            guard !displayAddress.isEmpty else { return }
+            // Now fetch balances for whichever address is active.
+            // displayAddress returns PQ address if in PQ mode and PQ init
+            // succeeded, otherwise the EOA address.
+            let targetAddress = displayAddress
+            guard !targetAddress.isEmpty else {
+                isLoading = false
+                return
+            }
             balanceService.clearBalances()
-            await balanceService.fetchBalances(for: displayAddress)
-        }
-        .task {
-            // Fetch balances once the wallet address is loaded (covers EOA-only mode
-            // and the initial load before PQ init finishes).
-            // Wait briefly for loadWallet to set the address.
-            while address.isEmpty && !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
-            }
-            guard !Task.isCancelled, !address.isEmpty else { return }
-            // Only fetch if not in PQ mode (PQ mode is handled above after init)
-            if activeAccountMode == .eoa {
-                await balanceService.fetchBalances(for: address)
-            }
-        }
-        .task {
+            await balanceService.fetchBalances(for: targetAddress)
+            isLoading = false
+            
             // Auto-refresh balances periodically
-            await autoRefreshBalances()
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(refreshInterval))
+                guard !Task.isCancelled else { break }
+                let addr = displayAddress
+                guard !addr.isEmpty else { continue }
+                await balanceService.fetchBalances(for: addr)
+            }
         }
         .onChange(of: activeAccountMode) { _ in
             // Clear stale balances and re-fetch for the new address
@@ -722,13 +723,19 @@ struct WalletView: View {
                             .font(.caption2)
                             .foregroundColor(.secondary)
                         
-                        // Proof verification badge
-                        if balance.isProofVerified {
+                        // Verification level badge
+                        switch balance.verificationLevel {
+                        case .heliosVerified:
                             Image(systemName: "checkmark.shield.fill")
                                 .font(.caption2)
                                 .foregroundColor(.green)
-                                .help("Balance verified via Merkle proof")
-                        } else {
+                                .help("Trustlessly verified via Helios light client")
+                        case .proofConsistent:
+                            Image(systemName: "shield.lefthalf.filled")
+                                .font(.caption2)
+                                .foregroundColor(.yellow)
+                                .help("Proof-consistent (state root from RPC, not independently verified)")
+                        case .unverified:
                             Image(systemName: "shield.slash")
                                 .font(.caption2)
                                 .foregroundColor(.orange)
@@ -861,27 +868,11 @@ struct WalletView: View {
         do {
             let addr = try await wallet.getAddress()
             address = addr
-            // Don't fetch balances here — the PQ init task runs concurrently
-            // and displayAddress may still point to EOA even in PQ mode.
-            // Balances are fetched after PQ init completes (or immediately
-            // if EOA mode) via the dedicated balance-fetch task below.
         } catch {
             loadError = error.localizedDescription
         }
         
-        isLoading = false
-    }
-    
-    private func autoRefreshBalances() async {
-        // Keep refreshing while view is active
-        while !Task.isCancelled {
-            try? await Task.sleep(for: .seconds(refreshInterval))
-            
-            guard !Task.isCancelled, !displayAddress.isEmpty else { break }
-            
-            // Silently refresh balances in background
-            await balanceService.fetchBalances(for: displayAddress)
-        }
+        // isLoading is cleared by the caller after balance fetch completes
     }
     
     private func copyAddress() {

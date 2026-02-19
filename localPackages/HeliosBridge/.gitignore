@@ -1,0 +1,5 @@
+# Rust build artifacts (2.2GB+ cache)
+target/
+
+# SPM workspace state
+.swiftpm/
