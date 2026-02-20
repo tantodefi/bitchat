@@ -226,6 +226,78 @@ final class StealthAddressStore: ObservableObject {
         }
     }
     
+    // MARK: - Bulk Balance Scanning
+    
+    /// Scan all non-swept addresses for balances using EthereumBalanceService.
+    ///
+    /// Routes through the Helios → Merkle proof → RPC pipeline with Tor for
+    /// privacy. Updates cached balances and persists to disk.
+    ///
+    /// - Parameters:
+    ///   - balanceService: The balance service to use for fetching
+    ///   - chainId: Optional chain ID filter (scans all chains if nil)
+    /// - Returns: Number of addresses with non-zero balance
+    @discardableResult
+    func scanAllBalances(
+        balanceService: EthereumBalanceService,
+        chainId: UInt64? = nil
+    ) async -> Int {
+        let targets = addresses.enumerated().filter { _, addr in
+            !addr.isSwept && (chainId == nil || addr.chainId == chainId)
+        }
+        
+        guard !targets.isEmpty else { return 0 }
+        
+        setScanningState(isScanning: true, progress: 0)
+        var fundedCount = 0
+        
+        for (offset, (index, address)) in targets.enumerated() {
+            let network = networkForChainId(address.chainId)
+            
+            if let balance = await balanceService.fetchSingleAddressBalance(
+                address: address.address,
+                network: network
+            ) {
+                let hexBalance = balance.wei.hexString
+                addresses[index].cachedBalance = hexBalance
+                addresses[index].balanceCheckedAt = Date()
+                
+                if !balance.wei.isZero {
+                    fundedCount += 1
+                    SecureLogger.debug(
+                        "🥷 Found balance \(hexBalance) at stealth \(address.address.prefix(10))... [\(balance.verificationLevel.rawValue)]",
+                        category: .session
+                    )
+                }
+            }
+            
+            // Update progress
+            let progress = Double(offset + 1) / Double(targets.count)
+            setScanningState(isScanning: true, progress: progress)
+        }
+        
+        saveToDisk()
+        setScanningState(isScanning: false, progress: 1.0)
+        
+        SecureLogger.info(
+            "🥷 Bulk scan complete: \(fundedCount)/\(targets.count) addresses funded",
+            category: .session
+        )
+        return fundedCount
+    }
+    
+    /// Map chain ID to EthereumBalanceService.Network
+    private func networkForChainId(_ chainId: UInt64) -> EthereumBalanceService.Network {
+        switch chainId {
+        case 1: return .ethereum
+        case 8453: return .base
+        case 42161: return .arbitrum
+        case 11155111: return .sepolia
+        case 421614: return .arbitrumSepolia
+        default: return .ethereum
+        }
+    }
+    
     // MARK: - Scan State
     
     /// Update the last scanned block for a chain

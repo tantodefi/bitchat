@@ -516,7 +516,7 @@ final class PQAccountViewModel: ObservableObject {
             isProcessingTransaction = false
 
             // Persist to TransactionStore so it appears in history after restart
-            if let address = accountAddress, let hash {
+            if let address = accountAddress {
                 TransactionStore.shared.record(
                     CachedTransaction(
                         id: hash,
@@ -647,5 +647,67 @@ final class PQAccountViewModel: ObservableObject {
         var current = loadDeployedChainIds()
         current.insert(chainId)
         UserDefaults.standard.set(current.map { Int($0) }, forKey: deployedChainsKey)
+    }
+    
+    // MARK: - Stealth PQ Account Integration
+    
+    /// The stealth PQ account manager, created after keys are ready.
+    private var stealthPQManager: StealthPQAccountManager?
+    
+    /// The stealth PQ account view model for SwiftUI binding.
+    @Published private(set) var stealthPQViewModel: StealthPQAccountViewModel?
+    
+    /// Initialize stealth PQ account management after main PQ setup.
+    /// Call after `initializeKeys` succeeds and user has an ENS username.
+    ///
+    /// - Parameters:
+    ///   - wallet: The embedded wallet (for stealth key derivation)
+    ///   - stealthAddressManager: The existing stealth address manager (reuses HMAC derivation)
+    ///   - ensUsername: The user's dstealth.eth username (e.g., "alice")
+    ///   - balanceService: The balance service for Helios/proof/RPC balance scanning
+    func initializeStealthPQ(
+        wallet: EmbeddedWallet,
+        stealthAddressManager: StealthAddressManager,
+        ensUsername: String,
+        balanceService: EthereumBalanceService
+    ) async {
+        guard let pqKeyManager else {
+            SecureLogger.warning("Cannot init stealth PQ: no PQKeyManager", category: .session)
+            return
+        }
+        
+        // Use Arbitrum Sepolia for gas efficiency
+        let targetChain = StealthPQAccountManager.defaultChain
+        guard let serviceSet = chainServices[targetChain.chainId] else {
+            SecureLogger.warning("Cannot init stealth PQ: no services for \(targetChain.name)", category: .session)
+            return
+        }
+        
+        let manager = StealthPQAccountManager(
+            wallet: wallet,
+            stealthAddressManager: stealthAddressManager,
+            pqKeyManager: pqKeyManager,
+            deployer: serviceSet.deployer,
+            balanceService: balanceService
+        )
+        
+        // Load previously persisted accounts
+        await manager.loadPersistedAccounts()
+        
+        self.stealthPQManager = manager
+        
+        let viewModel = StealthPQAccountViewModel(
+            manager: manager,
+            signer: serviceSet.signer,
+            ensUsername: ensUsername
+        )
+        
+        self.stealthPQViewModel = viewModel
+        
+        // Load persisted accounts + register ENS
+        await viewModel.loadAccounts()
+        await viewModel.registerENS()
+        
+        SecureLogger.info("Stealth PQ account initialized for \(ensUsername).pq.dstealth.eth", category: .session)
     }
 }

@@ -39,13 +39,21 @@ struct WalletView: View {
     @State private var showHistorySheet: Bool = false
     @State private var showStealthSheet: Bool = false
     @State private var showCrossChainSheet: Bool = false
+    @State private var showPQStealthSheet: Bool = false
+    @State private var showPQSettingsSheet: Bool = false
     
     // Account mode toggle
     @AppStorage("active-account-mode") private var activeAccountMode: AccountMode = .eoa
     @StateObject private var pqViewModel = PQAccountViewModel()
     
+    // Stealth PQ account support (lazily initialised after container is ready)
+    @State private var stealthPQViewModel: StealthPQAccountViewModel?
+    
     // Track the address we're fetching balances for to avoid race conditions
     @State private var currentFetchAddress: String = ""
+    
+    // Cancellable task for mode-switch fetches — cancelled on re-toggle
+    @State private var balanceFetchTask: Task<Void, Never>?
     
     // Stealth address support
     @StateObject private var stealthStore = StealthAddressStore()
@@ -131,6 +139,16 @@ struct WalletView: View {
                     stealthSection
                 }
                 
+                // MARK: - Stealth PQ Accounts (PQ mode)
+                if activeAccountMode == .pqAccount && pqViewModel.state.isDeployed && !isLoading {
+                    pqStealthSection
+                }
+                
+                // MARK: - PQ Account Settings (PQ mode)
+                if activeAccountMode == .pqAccount && !isLoading {
+                    pqSettingsSection
+                }
+                
                 // MARK: - Cross-Chain Swaps (EOA only)
                 if activeAccountMode == .eoa && !address.isEmpty && !isLoading {
                     crossChainSection
@@ -160,6 +178,27 @@ struct WalletView: View {
                 await pqViewModel.initializeKeys(from: wallet)
             }
             
+            // Create the stealth PQ view model once container services are available
+            if stealthPQViewModel == nil, XMTPServiceContainer.isConfigured {
+                let container = XMTPServiceContainer.shared
+                // Use the Arbitrum Sepolia chain service set (default chain for stealth PQ)
+                let arbSepolia = StealthPQAccountManager.defaultChain.chainId
+                if let chainSet = container.pqChainServices[arbSepolia] {
+                    let manager = StealthPQAccountManager(
+                        wallet: wallet,
+                        stealthAddressManager: stealthManager,
+                        pqKeyManager: container.pqKeyManager,
+                        deployer: chainSet.deployer,
+                        balanceService: balanceService
+                    )
+                    stealthPQViewModel = StealthPQAccountViewModel(
+                        manager: manager,
+                        signer: chainSet.signer,
+                        ensUsername: ensSubdomain
+                    )
+                }
+            }
+            
             // Now fetch balances for whichever address is active.
             // displayAddress returns PQ address if in PQ mode and PQ init
             // succeeded, otherwise the EOA address.
@@ -181,17 +220,26 @@ struct WalletView: View {
                 // Skip if address changed (user switched modes)
                 guard addr == currentFetchAddress && !addr.isEmpty else { continue }
                 await balanceService.fetchBalances(for: addr)
+                // Re-verify after fetch: if the user toggled during the await,
+                // clearBalances()+fetchGeneration already discarded stale results,
+                // but double-check we don't leave isLoading in a bad state.
+                guard addr == currentFetchAddress else { continue }
             }
         }
         .onChange(of: activeAccountMode) { _ in
-            // Clear stale balances and re-fetch for the new address
+            // Cancel any in-flight fetch from a previous toggle
+            balanceFetchTask?.cancel()
+            balanceFetchTask = nil
+            
             let newAddress = displayAddress
             guard !newAddress.isEmpty else { return }
             currentFetchAddress = newAddress
+            // clearBalances() also bumps the fetch generation, which makes
+            // any still-running fetchBalances() discard its remaining results.
             balanceService.clearBalances()
-            Task {
-                // Double-check address hasn't changed again
-                guard displayAddress == newAddress else { return }
+            balanceFetchTask = Task {
+                // Re-check after potential suspension
+                guard !Task.isCancelled, displayAddress == newAddress else { return }
                 await balanceService.fetchBalances(for: newAddress)
             }
         }
@@ -254,6 +302,36 @@ struct WalletView: View {
                 eilManager: eilManager,
                 balanceService: balanceService
             )
+        }
+        .sheet(isPresented: $showPQStealthSheet) {
+            NavigationStack {
+                if let vm = stealthPQViewModel {
+                    StealthPQAccountListView(viewModel: vm)
+                } else {
+                    VStack(spacing: 16) {
+                        Image(systemName: "exclamationmark.triangle")
+                            .font(.largeTitle)
+                            .foregroundColor(.orange)
+                        Text("PQ services not available")
+                            .font(.headline)
+                        Text("Ensure a Pimlico API key is configured and the PQ account is deployed.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
+                    .padding()
+                    .navigationTitle("Stealth PQ Accounts")
+                }
+            }
+        }
+        .sheet(isPresented: $showPQSettingsSheet) {
+            NavigationStack {
+                WalletSettingsView(
+                    meshTransactionRelay: xmtpContainer.meshTransactionRelay,
+                    balanceService: balanceService,
+                    wallet: wallet
+                )
+            }
         }
     }
     
@@ -680,6 +758,253 @@ struct WalletView: View {
         }
     }
     
+    // MARK: - PQ Stealth Section
+    
+    private var pqStealthSection: some View {
+        VStack(spacing: 12) {
+            HStack {
+                Text("Private Receiving (PQ)")
+                    .font(.headline)
+                
+                Spacer()
+                
+                if let vm = stealthPQViewModel, !vm.fundedAccounts.isEmpty {
+                    Text("\(vm.fundedAccounts.count) funded")
+                        .font(.caption)
+                        .foregroundColor(.green)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.green.opacity(0.15))
+                        .cornerRadius(8)
+                }
+            }
+            
+            Button {
+                showPQStealthSheet = true
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: "shield.lefthalf.filled.badge.checkmark")
+                        .font(.title2)
+                        .foregroundColor(.purple)
+                    
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Stealth PQ Accounts")
+                            .font(.subheadline)
+                            .fontWeight(.medium)
+                        
+                        HStack(spacing: 4) {
+                            Image(systemName: "diamond.fill")
+                                .font(.system(size: 8))
+                                .foregroundColor(.cyan)
+                            Text("Arbitrum Sepolia")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    
+                    Spacer()
+                    
+                    HStack(spacing: 4) {
+                        if let vm = stealthPQViewModel, !vm.accounts.isEmpty {
+                            Text("\(vm.accounts.count)")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        Image(systemName: "chevron.right")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .padding()
+                .background(Color.purple.opacity(0.1))
+                .cornerRadius(12)
+            }
+            .buttonStyle(.plain)
+            
+            Text("Each payment uses a unique PQ Account address derived from your stealth keys. Funds are swept to your main account.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            
+            HStack(spacing: 4) {
+                Image(systemName: "info.circle")
+                    .font(.caption2)
+                Text("L2 only — PQ account deployment requires ~5-15M gas, viable only on Arbitrum.")
+                    .font(.caption2)
+            }
+            .foregroundColor(.secondary.opacity(0.8))
+        }
+    }
+    
+    // MARK: - PQ Account Settings Section
+    
+    private var pqSettingsSection: some View {
+        VStack(spacing: 12) {
+            HStack {
+                Text("PQ Account Settings")
+                    .font(.headline)
+                
+                Spacer()
+            }
+            
+            // Deployment status row
+            Button {
+                showPQSettingsSheet = true
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: "gearshape.fill")
+                        .font(.title2)
+                        .foregroundColor(.orange)
+                    
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Deployment & Keys")
+                            .font(.subheadline)
+                            .fontWeight(.medium)
+                        
+                        if pqViewModel.state.isDeployed {
+                            let deployedCount = pqViewModel.chainStatuses.filter(\.isDeployed).count
+                            let totalCount = pqViewModel.chainStatuses.count
+                            Text("Deployed on \(deployedCount)/\(totalCount) chains")
+                                .font(.caption)
+                                .foregroundColor(.green)
+                        } else {
+                            Text(pqViewModel.state.displayStatus)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    
+                    Spacer()
+                    
+                    Image(systemName: "chevron.right")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                .padding()
+                .background(Color.orange.opacity(0.1))
+                .cornerRadius(12)
+            }
+            .buttonStyle(.plain)
+            
+            // ENS name row (if configured)
+            if let ensName = ensSubdomain {
+                let ensLabel = ensName
+                    .replacingOccurrences(of: ".pq.dstealth.eth", with: "")
+                    .replacingOccurrences(of: ".dstealth.eth", with: "")
+                
+                VStack(spacing: 8) {
+                    // EOA ENS identity row
+                    HStack(spacing: 12) {
+                        Image(systemName: "globe")
+                            .font(.title2)
+                            .foregroundColor(.accentColor)
+                        
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("EOA Identity")
+                                .font(.subheadline)
+                                .fontWeight(.medium)
+                            
+                            Text("\(ensLabel).dstealth.eth")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        
+                        Spacer()
+                        
+                        NavigationLink {
+                            ENSSettingsView(
+                                currentName: "\(ensLabel).dstealth.eth",
+                                walletAddress: address,
+                                xmtpInboxId: xmtpContainer.clientService.inboxId,
+                                onNameChanged: { newName in
+                                    ensSubdomain = newName
+                                }
+                            )
+                        } label: {
+                            Image(systemName: "pencil.circle.fill")
+                                .font(.title3)
+                                .foregroundColor(.accentColor)
+                        }
+                        .buttonStyle(.borderless)
+                    }
+                    .padding()
+                    .background(Color.accentColor.opacity(0.08))
+                    .cornerRadius(12)
+                    
+                    // PQ ENS identity row
+                    if let pqName = stealthPQViewModel?.pqENSName {
+                        HStack(spacing: 12) {
+                            Image(systemName: "shield.lefthalf.filled")
+                                .font(.title2)
+                                .foregroundColor(.purple)
+                            
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("PQ Stealth Identity")
+                                    .font(.subheadline)
+                                    .fontWeight(.medium)
+                                
+                                Text(pqName)
+                                    .font(.caption)
+                                    .foregroundColor(.purple)
+                            }
+                            
+                            Spacer()
+                            
+                            if let vm = stealthPQViewModel {
+                                NavigationLink {
+                                    PQENSSettingsView(
+                                        currentPQName: pqName,
+                                        pqAccountAddress: vm.currentAccount?.pqAccountAddress ?? address,
+                                        stealthIndex: UInt32(vm.accounts.count),
+                                        viewModel: vm
+                                    )
+                                } label: {
+                                    Image(systemName: "pencil.circle.fill")
+                                        .font(.title3)
+                                        .foregroundColor(.purple)
+                                }
+                                .buttonStyle(.borderless)
+                            }
+                        }
+                        .padding()
+                        .background(Color.purple.opacity(0.08))
+                        .cornerRadius(12)
+                    }
+                }
+            }
+            
+            // Seed export shortcut
+            if pqViewModel.state != .notInitialized {
+                HStack(spacing: 12) {
+                    Image(systemName: "key.fill")
+                        .font(.title2)
+                        .foregroundColor(.secondary)
+                    
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("PQ Seed Backup")
+                            .font(.subheadline)
+                            .fontWeight(.medium)
+                        
+                        Text("Export ML-DSA-44 seed phrase")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    
+                    Spacer()
+                    
+                    Image(systemName: "chevron.right")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                .padding()
+                .background(Color(.systemGray).opacity(0.1))
+                .cornerRadius(12)
+                .onTapGesture {
+                    showPQSettingsSheet = true
+                }
+            }
+        }
+    }
+    
     private var crossChainSection: some View {
         VStack(spacing: 12) {
             HStack {
@@ -755,6 +1080,10 @@ struct WalletView: View {
                                 .font(.caption2)
                                 .foregroundColor(.orange)
                                 .help("Unverified — RPC trusted")
+                        case .pending:
+                            ProgressView()
+                                .scaleEffect(0.6)
+                                .help("Balance fetch in progress")
                         }
                     }
                 }
@@ -888,22 +1217,6 @@ struct WalletView: View {
         }
         
         // isLoading is cleared by the caller after balance fetch completes
-    }
-    
-    private func copyAddress() {
-        #if os(iOS)
-        UIPasteboard.general.string = address
-        #else
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(address, forType: .string)
-        #endif
-        
-        copiedText = "Address copied!"
-        showCopiedToast = true
-        
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-            showCopiedToast = false
-        }
     }
     
     private func copyDisplayAddress() {

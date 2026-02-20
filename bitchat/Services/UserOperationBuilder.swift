@@ -264,6 +264,40 @@ struct UserOperationBuilder {
         return initCode
     }
     
+    /// Create a hybrid signature using an arbitrary stealth ECDSA key + master PQ key.
+    /// Used for stealth PQ account sweeps where the ECDSA key differs from the main wallet.
+    ///
+    /// - Parameters:
+    ///   - userOpHash: The 32-byte UserOperation hash to sign
+    ///   - stealthPrivateKey: The 32-byte stealth ECDSA private key
+    ///   - pqKeyManager: The PQ key manager for ML-DSA-44 signing (shared master key)
+    /// - Returns: ABI-encoded hybrid signature
+    static func signHybridWithStealthKey(
+        userOpHash: Data,
+        stealthPrivateKey: Data,
+        pqKeyManager: PQKeyManager
+    ) async throws -> Data {
+        // 1. ECDSA sign with stealth key
+        guard userOpHash.count == 32, stealthPrivateKey.count == 32 else {
+            throw UserOpError.invalidSignatureInput
+        }
+        let privKey = try P256K.Recovery.PrivateKey(dataRepresentation: stealthPrivateKey, format: .uncompressed)
+        let digest = HashDigest(Array(userOpHash))
+        let recoverySignature = try privKey.signature(for: digest)
+        let compact = try recoverySignature.compactRepresentation
+        var ecdsaSig = compact.signature // 64 bytes
+        ecdsaSig.append(UInt8(compact.recoveryId))
+        
+        // 2. ML-DSA-44 sign with master PQ key (shared across all stealth accounts)
+        let mldsaSig = try await pqKeyManager.sign(message: userOpHash)
+        
+        // 3. ABI-encode as hybrid
+        return ABIEncoder.encodeHybridSignature(
+            preQuantumSig: ecdsaSig,
+            postQuantumSig: mldsaSig
+        )
+    }
+    
     // MARK: - Helpers
     
     private static func keccak256(_ data: Data) -> Data {

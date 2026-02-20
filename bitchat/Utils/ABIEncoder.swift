@@ -297,4 +297,36 @@ struct ABIEncoder {
         let hex = data.map { String(format: "%02x", $0) }.joined()
         return prefixed ? "0x" + hex : hex
     }
+    
+    // MARK: - Keccak-256
+    
+    /// Keccak-256 hash (convenience wrapper for CryptoSwift)
+    static func keccak256(_ data: Data) -> Data {
+        Data(Array(data).sha3(.keccak256))
+    }
+    
+    // MARK: - CREATE2 Address Prediction
+    
+    /// Predict a contract address deployed via CREATE2.
+    /// `address = keccak256(0xff ++ deployer ++ salt ++ keccak256(initCode))[12:]`
+    ///
+    /// - Parameters:
+    ///   - deployer: Factory contract address (20 bytes hex with 0x prefix)
+    ///   - salt: 32-byte CREATE2 salt
+    ///   - initCodeHash: keccak256 of the full init code (creation code + constructor args)
+    /// - Returns: Predicted address as 0x-prefixed hex string
+    static func predictCREATE2Address(
+        deployer: String,
+        salt: Data,
+        initCodeHash: Data
+    ) -> String {
+        let deployerBytes = hexToData(deployer)
+        var packed = Data([0xff])
+        packed.append(deployerBytes)
+        packed.append(padLeft(salt, to: 32))
+        packed.append(initCodeHash)
+        let hash = keccak256(packed)
+        let addressBytes = hash.suffix(20)
+        return "0x" + addressBytes.map { String(format: "%02x", $0) }.joined()
+    }
 }

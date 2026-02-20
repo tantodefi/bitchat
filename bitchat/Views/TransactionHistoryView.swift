@@ -131,6 +131,17 @@ struct TransactionHistoryView: View {
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 6)
                 .background(Color.orange.opacity(0.1))
+            case .pending:
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .scaleEffect(0.7)
+                    Text("Fetching…")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 6)
+                .background(Color.gray.opacity(0.1))
             }
         }
     }
@@ -722,6 +733,14 @@ struct OnChainTransactionDetailView: View {
                 Text("Unverified")
                     .font(.caption2)
                     .foregroundColor(.orange)
+            }
+        case .pending:
+            VStack(spacing: 2) {
+                ProgressView()
+                    .font(.title3)
+                Text("Pending")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
             }
         }
     }

@@ -125,6 +125,9 @@ final class EthereumBalanceService: ObservableObject {
         
         /// No proof verification performed; RPC response trusted as-is.
         case unverified
+        
+        /// Balance has not been fetched yet.
+        case pending
     }
     
     struct Balance: Equatable {
@@ -174,6 +177,11 @@ final class EthereumBalanceService: ObservableObject {
     @Published private(set) var balances: [Network: Balance] = [:]
     @Published private(set) var isLoading: Bool = false
     @Published private(set) var lastError: String?
+    
+    /// Monotonically increasing counter used to discard stale fetch results.
+    /// Incremented by `clearBalances()` so that any in-flight `fetchBalances`
+    /// stops writing into `balances` after a mode switch.
+    private var fetchGeneration: Int = 0
     @Published var useTestnet: Bool = true {
         didSet {
             UserDefaults.standard.set(useTestnet, forKey: "wallet-use-testnet")
@@ -208,19 +216,28 @@ final class EthereumBalanceService: ObservableObject {
     
     // MARK: - Public Methods
     
-    /// Clear all cached balances (e.g. when switching between EOA and PQ account)
+    /// Clear all cached balances (e.g. when switching between EOA and PQ account).
+    /// Also invalidates any in-flight `fetchBalances` calls so their stale results
+    /// are discarded instead of being written back into `balances`.
     func clearBalances() {
+        fetchGeneration += 1
         balances.removeAll()
         lastError = nil
     }
     
-    /// Fetches balance for the given address on all supported networks
+    /// Fetches balance for the given address on all supported networks.
+    ///
+    /// Uses `fetchGeneration` to detect if `clearBalances()` was called while
+    /// results were still arriving. If the generation has advanced, remaining
+    /// results are discarded so that balances from a previous address never
+    /// leak into the current view.
     func fetchBalances(for address: String) async {
         guard isValidAddress(address) else {
             lastError = "Invalid Ethereum address"
             return
         }
         
+        let myGeneration = fetchGeneration
         isLoading = true
         lastError = nil
         
@@ -234,13 +251,22 @@ final class EthereumBalanceService: ObservableObject {
             }
             
             for await (network, balance) in group {
+                // If clearBalances() was called (e.g. user toggled account mode),
+                // the generation will have advanced — discard all remaining results.
+                guard myGeneration == fetchGeneration else {
+                    group.cancelAll()
+                    break
+                }
                 if let balance = balance {
                     balances[network] = balance
                 }
             }
         }
         
-        isLoading = false
+        // Only clear loading state if we're still the active fetch
+        if myGeneration == fetchGeneration {
+            isLoading = false
+        }
     }
     
     /// Whether proof verification is enabled (Phase 1 of Helios integration).
@@ -505,6 +531,20 @@ final class EthereumBalanceService: ObservableObject {
             lastError = "Failed to connect to \(network.rawValue) RPC"
         }
         return nil
+    }
+    
+    // MARK: - Single Address Balance Fetch (for external callers)
+    
+    /// Fetch the verified balance for a single address on a specific network.
+    /// This is the public entry point for other actors (e.g. StealthPQAccountManager)
+    /// that need to fetch a balance with the full Helios → proof → RPC verification hierarchy.
+    ///
+    /// Routes through Tor for mainnet, direct for testnet — matching the existing privacy policy.
+    func fetchSingleAddressBalance(
+        address: String,
+        network: Network
+    ) async -> Balance? {
+        await fetchBalance(for: address, network: network)
     }
     
     // MARK: - RPC Helpers (eth_getProof, eth_getBlockByNumber)

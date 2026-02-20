@@ -26,6 +26,9 @@ actor NamestoneService {
     private let baseURL = "https://namestone.com/api/public_v1"
     private let domain = "dstealth.eth"
     
+    /// The pq.dstealth.eth domain for stealth PQ Account addresses
+    private let pqDomain = "pq.dstealth.eth"
+    
     /// API key from secure configuration
     private var apiKey: String { SecureConfig.namestoneAPIKey }
     
@@ -177,13 +180,42 @@ actor NamestoneService {
         return records.first(where: { $0.fullName.caseInsensitiveCompare(normalized) == .orderedSame })
     }
     
-    /// Check if a name is available for registration
+    /// Check if a name is available for registration on dstealth.eth
     /// - Parameter name: Name to check
     /// - Returns: True if available
     func isNameAvailable(_ name: String) async throws -> Bool {
         let normalizedName = name.lowercased().trimmingCharacters(in: .whitespaces)
         let results = try await searchName(name: normalizedName, exactMatch: true)
         return results.isEmpty
+    }
+    
+    /// Check if a name is available for registration on pq.dstealth.eth
+    /// - Parameter name: Name label to check (e.g., "alice")
+    /// - Returns: True if available
+    func isPQNameAvailable(_ name: String) async throws -> Bool {
+        let normalizedName = name.lowercased().trimmingCharacters(in: .whitespaces)
+        let results = try await searchName(name: normalizedName, domain: pqDomain, exactMatch: true)
+        return results.isEmpty
+    }
+    
+    /// Update an existing pq.dstealth.eth name to a new label.
+    /// Deletes the old name and sets the new one with the same address.
+    func updatePQName(
+        oldName: String,
+        newName: String,
+        pqAccountAddress: String,
+        stealthIndex: UInt32
+    ) async throws -> Bool {
+        // Delete old PQ name
+        let normalizedOld = oldName.lowercased().trimmingCharacters(in: .whitespaces)
+        _ = try? await deleteStealthPQName(name: normalizedOld)
+        
+        // Set new PQ name
+        return try await setStealthPQAccountName(
+            name: newName.lowercased(),
+            pqAccountAddress: pqAccountAddress,
+            stealthIndex: stealthIndex
+        )
     }
     
     /// Delete a subdomain
@@ -196,6 +228,105 @@ actor NamestoneService {
         
         let body: [String: Any] = [
             "domain": domain,
+            "name": name.lowercased()
+        ]
+        
+        let response: NamestoneSuccessResponse = try await post(
+            endpoint: "delete-name",
+            body: body
+        )
+        
+        return response.success
+    }
+    
+    // MARK: - Stealth PQ Account Subdomain (pq.dstealth.eth)
+    
+    /// Register or rotate the stealth PQ account address for a user.
+    /// Sets `alice.pq.dstealth.eth` → current stealth PQ Account address.
+    ///
+    /// - Parameters:
+    ///   - name: The subdomain label (e.g., "alice" for alice.pq.dstealth.eth)
+    ///   - pqAccountAddress: The current stealth PQ Account address (0x...)
+    ///   - stealthIndex: Derivation index stored in text record for recovery
+    /// - Returns: True if registration succeeded
+    func setStealthPQAccountName(
+        name: String,
+        pqAccountAddress: String,
+        stealthIndex: UInt32
+    ) async throws -> Bool {
+        guard isConfigured else {
+            throw NamestoneError.notConfigured
+        }
+        
+        let normalizedName = try validateAndNormalizeName(name)
+        
+        let body: [String: Any] = [
+            "domain": pqDomain,
+            "name": normalizedName,
+            "address": pqAccountAddress,
+            "text_records": [
+                "com.bitchat.stealth-index": String(stealthIndex),
+                "com.bitchat.account-type": "pq-stealth"
+            ]
+        ]
+        
+        let response: NamestoneSuccessResponse = try await post(
+            endpoint: "set-name",
+            body: body
+        )
+        
+        return response.success
+    }
+    
+    /// Rotate the stealth PQ address for a user (delete old → set new).
+    /// Called after sweeping a stealth account to advance to the next address.
+    ///
+    /// - Parameters:
+    ///   - name: The subdomain label (e.g., "alice")
+    ///   - newPQAccountAddress: The new stealth PQ Account address
+    ///   - newStealthIndex: New derivation index
+    /// - Returns: True if rotation succeeded
+    func rotateStealthPQAddress(
+        name: String,
+        newPQAccountAddress: String,
+        newStealthIndex: UInt32
+    ) async throws -> Bool {
+        // Delete old registration first (idempotent)
+        let normalizedName = name.lowercased().trimmingCharacters(in: .whitespaces)
+        _ = try? await deleteStealthPQName(name: normalizedName)
+        
+        // Set new address
+        return try await setStealthPQAccountName(
+            name: normalizedName,
+            pqAccountAddress: newPQAccountAddress,
+            stealthIndex: newStealthIndex
+        )
+    }
+    
+    /// Get the stealth derivation index stored in a pq.dstealth.eth record.
+    /// Useful for recovery: if we know the index we can re-derive the stealth key.
+    func getStealthIndex(name: String) async throws -> UInt32? {
+        let records = try await searchName(
+            name: name.lowercased(),
+            domain: pqDomain,
+            exactMatch: true
+        )
+        guard let record = records.first,
+              let indexStr = record.textRecords?["com.bitchat.stealth-index"],
+              let index = UInt32(indexStr) else {
+            return nil
+        }
+        return index
+    }
+    
+    /// Delete a stealth PQ subdomain
+    func deleteStealthPQName(name: String) async throws -> Bool {
+        guard isConfigured else {
+            throw NamestoneError.notConfigured
+        }
+        
+        let body: [String: Any] = [
+            "domain": pqDomain,
             "name": name.lowercased()
         ]
         

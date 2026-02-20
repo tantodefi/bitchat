@@ -12,6 +12,7 @@
 import BitLogger
 import CryptoSwift
 import Foundation
+import Tor
 
 // MARK: - PQ Account Deployer
 
@@ -57,11 +58,17 @@ actor PQAccountDeployer {
     }
     
     private let chain: Chain
-    private let session: URLSession
+    private let useTor: Bool
     
-    init(chain: Chain = .sepolia, session: URLSession = .shared) {
+    /// Session that routes RPC calls through Tor for IP privacy.
+    /// Falls back to URLSession.shared if Tor routing is disabled.
+    private var session: URLSession {
+        useTor ? TorURLSession.shared.session : URLSession.shared
+    }
+    
+    init(chain: Chain = .sepolia, useTor: Bool = true) {
         self.chain = chain
-        self.session = session
+        self.useTor = useTor
     }
     
     // MARK: - Counterfactual Address
@@ -106,6 +113,77 @@ actor PQAccountDeployer {
         )
     }
     
+    // MARK: - Local CREATE2 Address Prediction (Offline)
+    
+    /// Predict the PQ Account address locally via CREATE2 — no RPC call needed.
+    ///
+    /// This enables offline stealth address generation. The address is:
+    /// `keccak256(0xff ++ factory ++ salt ++ keccak256(initCode))[12:]`
+    ///
+    /// The salt and initCode construction must match what the factory does internally.
+    /// The ZKNOX factory uses: `salt = keccak256(abi.encode(preQ, postQ, 0))`
+    /// and `initCode = accountCreationCode + abi.encode(entryPoint, preQ, postQ)`.
+    ///
+    /// - Parameters:
+    ///   - preQuantumPubKey: The 20-byte EOA address of the stealth signer
+    ///   - postQuantumPubKey: The expanded ML-DSA-44 public key (~22KB)
+    ///   - accountCreationCode: The factory's account creation bytecode (extract once from chain)
+    /// - Returns: Predicted smart account address (0x-prefixed, checksummed)
+    static func predictAddressLocally(
+        preQuantumPubKey: Data,
+        postQuantumPubKey: Data,
+        accountCreationCode: Data
+    ) -> String {
+        // Salt = keccak256(abi.encodePacked(preQuantumPubKey, postQuantumPubKey, uint256(0)))
+        let saltInput = ABIEncoder.encode(
+            types: [.bytes, .bytes, .uint256],
+            values: [.bytes(preQuantumPubKey), .bytes(postQuantumPubKey), .uint256(0)]
+        )
+        let salt = ABIEncoder.keccak256(saltInput)
+        
+        // initCode = creationCode + abi.encode(entryPoint, preQ, postQ)
+        let constructorArgs = ABIEncoder.encode(
+            types: [.address, .bytes, .bytes],
+            values: [
+                .address(UserOperationBuilder.entryPointAddress),
+                .bytes(preQuantumPubKey),
+                .bytes(postQuantumPubKey)
+            ]
+        )
+        let initCode = accountCreationCode + constructorArgs
+        let initCodeHash = ABIEncoder.keccak256(initCode)
+        
+        return ABIEncoder.predictCREATE2Address(
+            deployer: factoryAddress,
+            salt: salt,
+            initCodeHash: initCodeHash
+        )
+    }
+    
+    /// Get the ETH balance for an address (wei as hex string).
+    ///
+    /// Tier 1: Helios verified balance (Sepolia only — Helios doesn't support Arb Sepolia).
+    /// Tier 2: RPC over Tor (or direct for testnets).
+    func getBalance(address: String) async throws -> String {
+        // Tier 1: Helios for Sepolia
+        if chain.chainId == 11_155_111, await HeliosManager.shared.isRunning {
+            do {
+                let hex = try await HeliosManager.shared.getBalance(address: address)
+                SecureLogger.debug("PQAccountDeployer: Helios-verified balance for \(address.prefix(10))…", category: .network)
+                return hex
+            } catch {
+                SecureLogger.warning("PQAccountDeployer: Helios getBalance failed, falling back to RPC: \(error)", category: .network)
+            }
+        }
+
+        // Tier 2: RPC
+        let result = try await rpcCall(method: "eth_getBalance", params: [address, "latest"])
+        guard let hexStr = result as? String else {
+            throw DeployerError.invalidResponse("eth_getBalance returned non-string")
+        }
+        return hexStr
+    }
+    
     // MARK: - Deployment Check
     
     /// Check if a PQ account is already deployed at the given address.
@@ -132,7 +210,22 @@ actor PQAccountDeployer {
     // MARK: - Gas Estimation
     
     /// Fetch the current gas price from the network.
+    ///
+    /// Tier 1: Helios verified gas price (Sepolia).
+    /// Tier 2: RPC.
     func getGasPrice() async throws -> UInt64 {
+        // Tier 1: Helios for Sepolia
+        if chain.chainId == 11_155_111, await HeliosManager.shared.isRunning {
+            do {
+                let price = try await HeliosManager.shared.getGasPrice()
+                SecureLogger.debug("PQAccountDeployer: Helios-verified gas price: \(price)", category: .network)
+                return price
+            } catch {
+                SecureLogger.warning("PQAccountDeployer: Helios getGasPrice failed, falling back to RPC: \(error)", category: .network)
+            }
+        }
+
+        // Tier 2: RPC
         let result = try await rpcCall(method: "eth_gasPrice", params: [])
         guard let hexStr = result as? String else {
             throw DeployerError.invalidResponse("eth_gasPrice returned non-string")
@@ -142,8 +235,26 @@ actor PQAccountDeployer {
     }
     
     /// Estimate gas for a transaction via eth_estimateGas.
+    ///
+    /// Tier 1: Helios verified estimate (Sepolia).
+    /// Tier 2: RPC.
     func estimateGas(to: String, data: Data, from: String) async throws -> UInt64 {
         let dataHex = "0x" + data.map { String(format: "%02x", $0) }.joined()
+
+        // Tier 1: Helios for Sepolia
+        if chain.chainId == 11_155_111, await HeliosManager.shared.isRunning {
+            do {
+                let callObj: [String: String] = ["from": from, "to": to, "data": dataHex]
+                let callJSON = try String(data: JSONSerialization.data(withJSONObject: callObj), encoding: .utf8) ?? "{}"
+                let gas = try await HeliosManager.shared.estimateGas(callJSON: callJSON)
+                SecureLogger.debug("PQAccountDeployer: Helios-verified gas estimate: \(gas)", category: .network)
+                return gas
+            } catch {
+                SecureLogger.warning("PQAccountDeployer: Helios estimateGas failed, falling back to RPC: \(error)", category: .network)
+            }
+        }
+
+        // Tier 2: RPC
         let callObj: [String: String] = [
             "from": from,
             "to": to,
@@ -221,10 +332,25 @@ actor PQAccountDeployer {
         )
     }
     
-    /// Send a raw signed transaction via eth_sendRawTransaction
+    /// Send a raw signed transaction via eth_sendRawTransaction.
+    ///
+    /// Tier 1: Helios broadcast (Sepolia — routed via Tor internally by Helios).
+    /// Tier 2: RPC over Tor.
     func sendRawTransaction(_ signedTx: Data) async throws -> String {
         let hexTx = "0x" + signedTx.map { String(format: "%02x", $0) }.joined()
-        
+
+        // Tier 1: Helios for Sepolia
+        if chain.chainId == 11_155_111, await HeliosManager.shared.isRunning {
+            do {
+                let txHash = try await HeliosManager.shared.sendRawTransaction(rawTxHex: hexTx)
+                SecureLogger.info("PQAccountDeployer: Broadcast via Helios: \(txHash.prefix(16))…", category: .network)
+                return txHash
+            } catch {
+                SecureLogger.warning("PQAccountDeployer: Helios broadcast failed, falling back to RPC: \(error)", category: .network)
+            }
+        }
+
+        // Tier 2: RPC
         let result = try await rpcCall(
             method: "eth_sendRawTransaction",
             params: [hexTx]
@@ -237,8 +363,23 @@ actor PQAccountDeployer {
         return txHash
     }
     
-    /// Get the current nonce for an address
+    /// Get the current nonce for an address.
+    ///
+    /// Tier 1: Helios verified nonce (Sepolia).
+    /// Tier 2: RPC.
     func getNonce(address: String) async throws -> UInt64 {
+        // Tier 1: Helios for Sepolia
+        if chain.chainId == 11_155_111, await HeliosManager.shared.isRunning {
+            do {
+                let nonce = try await HeliosManager.shared.getNonce(address: address)
+                SecureLogger.debug("PQAccountDeployer: Helios-verified nonce \(nonce) for \(address.prefix(10))…", category: .network)
+                return nonce
+            } catch {
+                SecureLogger.warning("PQAccountDeployer: Helios getNonce failed, falling back to RPC: \(error)", category: .network)
+            }
+        }
+
+        // Tier 2: RPC
         let result = try await rpcCall(
             method: "eth_getTransactionCount",
             params: [address, "latest"]
@@ -256,7 +397,22 @@ actor PQAccountDeployer {
     
     private func ethCall(to: String, data: Data) async throws -> Data {
         let dataHex = "0x" + data.map { String(format: "%02x", $0) }.joined()
-        
+
+        // Tier 1: Helios verified ethCall for Sepolia
+        if chain.chainId == 11_155_111, await HeliosManager.shared.isRunning {
+            do {
+                let callObj: [String: String] = ["to": to, "data": dataHex]
+                let callJSON = try String(data: JSONSerialization.data(withJSONObject: callObj), encoding: .utf8) ?? "{}"
+                let hexResult = try await HeliosManager.shared.ethCall(callJSON)
+                let hex = hexResult.hasPrefix("0x") ? String(hexResult.dropFirst(2)) : hexResult
+                SecureLogger.debug("PQAccountDeployer: Helios-verified ethCall to \(to.prefix(10))…", category: .network)
+                return ABIEncoder.hexToData(hex)
+            } catch {
+                SecureLogger.warning("PQAccountDeployer: Helios ethCall failed, falling back to RPC: \(error)", category: .network)
+            }
+        }
+
+        // Tier 2: RPC
         let callObj: [String: String] = [
             "to": to,
             "data": dataHex

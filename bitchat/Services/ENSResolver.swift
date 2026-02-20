@@ -45,9 +45,12 @@ actor ENSResolver {
         }
         
         // Route based on domain
+        // IMPORTANT: Check .pq.dstealth.eth BEFORE .dstealth.eth (longer suffix first)
         let resolution: ENSResolution
 
-        if name.hasSuffix(".dstealth.eth") {
+        if name.hasSuffix(".pq.dstealth.eth") {
+            resolution = try await resolveViaNamestonePQ(name)
+        } else if name.hasSuffix(".dstealth.eth") {
             resolution = try await resolveViaNamestone(name)
         } else if name.hasSuffix(".base.eth") {
             resolution = try await resolveViaAnyETH(name, includeBasenameProvider: true)
@@ -71,7 +74,8 @@ actor ENSResolver {
     /// Check if a name can be resolved (for validation)
     func canResolve(_ ensName: String) -> Bool {
         let name = ensName.lowercased()
-        return name.hasSuffix(".dstealth.eth") ||
+        return name.hasSuffix(".pq.dstealth.eth") ||
+               name.hasSuffix(".dstealth.eth") ||
                name.hasSuffix(".base.eth") ||
                name.hasSuffix(".eth")
     }
@@ -169,6 +173,29 @@ actor ENSResolver {
         )
     }
     
+    // MARK: - PQ Stealth Resolution (.pq.dstealth.eth)
+    
+    /// Resolve alice.pq.dstealth.eth → current stealth PQ Account address
+    private func resolveViaNamestonePQ(_ name: String) async throws -> ENSResolution {
+        let subdomain = name.replacingOccurrences(of: ".pq.dstealth.eth", with: "")
+        
+        let records = try await NamestoneService.shared.searchName(
+            name: subdomain,
+            domain: "pq.dstealth.eth",
+            exactMatch: true
+        )
+        
+        guard let record = records.first else {
+            throw ENSError.notFound
+        }
+        
+        return ENSResolution(
+            address: record.address,
+            xmtpInboxId: record.xmtpInboxId,
+            fullName: record.fullName
+        )
+    }
+    
     // MARK: - Basename Resolution (.base.eth)
     
     private func resolveViaBasename(_ name: String) async throws -> ENSResolution {
@@ -211,13 +238,6 @@ actor ENSResolver {
             xmtpInboxId: result.textRecords?["com.xmtp.inbox"],
             fullName: name
         )
-    }
-    
-    // MARK: - Standard ENS Resolution (.eth)
-    
-    private func resolveViaENS(_ name: String) async throws -> ENSResolution {
-        // Maintained for compatibility with older call sites.
-        return try await resolveViaAnyETH(name, includeBasenameProvider: false)
     }
     
     // MARK: - Resolution Providers
@@ -297,138 +317,6 @@ actor ENSResolver {
         throw ENSError.notFound
     }
     
-    /// Resolve via Cloudflare ENS gateway (using eth.limo)
-    private func resolveViaCloudflare(_ name: String) async throws -> ENSResolution {
-        // Use eth.limo for CCIP-read resolution
-        // Format: https://name.eth.limo/.well-known/walletconnect.txt or similar
-        
-        let encodedName = name.replacingOccurrences(of: ".eth", with: "")
-            .addingPercentEncoding(withAllowedCharacters: .urlHostAllowed) ?? name
-        
-        guard let url = URL(string: "https://\(encodedName).eth.limo/") else {
-            throw ENSError.invalidRequest
-        }
-        
-        var request = URLRequest(url: url)
-        request.httpMethod = "HEAD" // Just check if it resolves
-        request.timeoutInterval = 5
-        
-        let (_, response) = try await TorURLSession.shared.session.data(for: request)
-        
-        // If we get a response, the name exists - but eth.limo doesn't give us the address
-        // So this is mostly a validation step
-        guard (response as? HTTPURLResponse)?.statusCode != 404 else {
-            throw ENSError.notFound
-        }
-        
-        // Fall back to other method for actual address
-        throw ENSError.networkError
-    }
-    
-    /// Resolve via 1RPC (Ethereum RPC with ENS support)
-    private func resolveVia1RPC(_ name: String) async throws -> ENSResolution {
-        // Using 1RPC which supports ENS resolution
-        guard let url = URL(string: "https://1rpc.io/eth") else {
-            throw ENSError.invalidRequest
-        }
-        
-        // Prepare ENS resolver call
-        // This uses eth_call to the ENS resolver contract
-        let resolverData = encodeENSResolve(name: name)
-        
-        let body: [String: Any] = [
-            "jsonrpc": "2.0",
-            "method": "eth_call",
-            "params": [
-                [
-                    "to": "0x4976fb03C32e5B8cfe2b6cCB31c09Ba78EBaBa41", // ENS Public Resolver 2
-                    "data": resolverData
-                ],
-                "latest"
-            ],
-            "id": 1
-        ]
-        
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.addValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        request.timeoutInterval = 10
-        
-        let (data, response) = try await TorURLSession.shared.session.data(for: request)
-        
-        guard let httpResponse = response as? HTTPURLResponse,
-              httpResponse.statusCode == 200 else {
-            throw ENSError.networkError
-        }
-        
-        let result = try JSONDecoder().decode(RPCResponse.self, from: data)
-        
-        guard let hexResult = result.result,
-              hexResult.count >= 42 else {
-            throw ENSError.notFound
-        }
-        
-        // Extract address from result (last 40 hex chars + 0x prefix)
-        let address = "0x" + hexResult.suffix(40)
-        
-        // Validate address
-        guard address.count == 42 else {
-            throw ENSError.notFound
-        }
-        
-        return ENSResolution(
-            address: address,
-            xmtpInboxId: nil,
-            fullName: name
-        )
-    }
-    
-    /// Encode ENS name for resolver lookup
-    private func encodeENSResolve(name: String) -> String {
-        // Simplified: For production, use proper ENS namehash encoding
-        // This returns the addr(bytes32) function signature + namehash
-        // Function selector for addr(bytes32): 0x3b3b57de
-        
-        let namehash = computeNamehash(name)
-        return "0x3b3b57de" + namehash
-    }
-    
-    /// Compute ENS namehash (simplified)
-    private func computeNamehash(_ name: String) -> String {
-        // ENS namehash algorithm
-        var node = Data(repeating: 0, count: 32)
-        
-        let labels = name.split(separator: ".").reversed()
-        for label in labels {
-            let labelHash = sha3Keccak256(String(label).lowercased())
-            var combined = Data()
-            combined.append(node)
-            combined.append(labelHash)
-            node = sha3Keccak256(combined)
-        }
-        
-        return node.hexString
-    }
-    
-    /// SHA3 Keccak-256 hash (simplified implementation)
-    private func sha3Keccak256(_ input: String) -> Data {
-        sha3Keccak256(Data(input.utf8))
-    }
-    
-    private func sha3Keccak256(_ input: Data) -> Data {
-        // Use CommonCrypto or CryptoKit for actual implementation
-        // For now, this is a placeholder that should be replaced with proper Keccak
-        // In production, use a proper keccak256 implementation
-        
-        // Placeholder: Return SHA256 (NOT correct for ENS, but compiles)
-        // TODO: Replace with actual Keccak-256
-        var hash = [UInt8](repeating: 0, count: 32)
-        input.withUnsafeBytes { ptr in
-            _ = CC_SHA256(ptr.baseAddress, CC_LONG(input.count), &hash)
-        }
-        return Data(hash)
-    }
 }
 
 // MARK: - Resolution Result
@@ -478,18 +366,6 @@ private struct ENSIdeasResponse: Codable {
     let avatar: String?
 }
 
-private struct RPCResponse: Codable {
-    let jsonrpc: String?
-    let id: Int?
-    let result: String?
-    let error: RPCError?
-}
-
-private struct RPCError: Codable {
-    let code: Int?
-    let message: String?
-}
-
 private struct Web3BioProfile: Codable {
     let address: String
     let identity: String
@@ -520,14 +396,4 @@ enum ENSError: Error, LocalizedError {
     }
 }
 
-// MARK: - Data Extensions
 
-private extension Data {
-    var hexString: String {
-        map { String(format: "%02x", $0) }.joined()
-    }
-}
-
-// MARK: - CommonCrypto Import
-
-import CommonCrypto

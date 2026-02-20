@@ -242,7 +242,130 @@ actor PQTransactionSigner {
         return txHash
     }
     
+    // MARK: - Stealth Account Sweep
+    
+    /// Sweep a stealth PQ account by deploying it (if needed) and transferring its
+    /// balance to the user's main PQ account in a single ERC-4337 UserOp.
+    ///
+    /// The stealth private key is used for ECDSA signing (it owns the stealth signer EOA),
+    /// while the master ML-DSA-44 key is used for PQ signing (shared across all accounts).
+    ///
+    /// - Parameters:
+    ///   - stealthAccount: The stealth PQ account to sweep
+    ///   - stealthPrivateKey: The 32-byte ECDSA private key for this stealth signer
+    ///   - destinationAddress: Where to send the funds (usually main PQ account)
+    ///   - sweepAmountWei: Amount to sweep (leave some for gas if needed)
+    /// - Returns: UserOp hash for tracking
+    func sweepStealthAccount(
+        stealthAccount: StealthPQAccount,
+        stealthPrivateKey: Data,
+        destinationAddress: String,
+        sweepAmountWei: UInt64
+    ) async throws -> String {
+        let sender = stealthAccount.pqAccountAddress
+        
+        // Build execute calldata: transfer ETH to destination
+        let executeCalldata = ABIEncoder.encodeExecute(
+            dest: destinationAddress,
+            value: sweepAmountWei,
+            funcData: Data()
+        )
+        
+        // Check if the stealth PQ account is deployed
+        let deployed = stealthAccount.isDeployed
+        
+        // Build initCode if not deployed (deploy-on-sweep pattern)
+        var initCode = Data()
+        if !deployed {
+            // Use stealth signer address as preQ key, master PQ key as postQ
+            let stealthSignerHex = stealthAccount.stealthSignerAddress
+            let hex = stealthSignerHex.hasPrefix("0x") ? String(stealthSignerHex.dropFirst(2)) : stealthSignerHex
+            let preQKey = ABIEncoder.hexToData(hex)
+            let postQKey = try await getPostQuantumKeyForFactory()
+            
+            initCode = UserOperationBuilder.buildInitCode(
+                factoryAddress: PQAccountDeployer.factoryAddress,
+                preQuantumPubKey: preQKey,
+                postQuantumPubKey: postQKey
+            )
+        }
+        
+        // Nonce is 0 for first tx on a fresh stealth account
+        let nonce: UInt64 = deployed ? try await getEntryPointNonce(sender: sender) : 0
+        
+        // Fetch gas prices
+        let baseGasPrice = try await deployer.getGasPrice()
+        let priorityFee = max(baseGasPrice / 10, 100_000_000)
+        let maxFee = baseGasPrice * 3 / 2 + priorityFee
+        
+        SecureLogger.info(
+            "Stealth sweep UserOp: sender=\(sender.prefix(10))..., dest=\(destinationAddress.prefix(10))..., amount=\(sweepAmountWei)wei",
+            category: .session
+        )
+        
+        // Build UserOp
+        var userOp = PackedUserOperation(
+            sender: ABIEncoder.hexToData(String(sender.dropFirst(2))),
+            nonce: nonce,
+            initCode: initCode,
+            callData: executeCalldata,
+            accountGasLimits: UserOperationBuilder.packAccountGasLimits(
+                verificationGasLimit: UInt64(600_000), // Higher for deploy+sweep
+                callGasLimit: UInt64(200_000)
+            ),
+            preVerificationGas: UInt64(150_000),
+            gasFees: UserOperationBuilder.packGasFees(
+                maxPriorityFeePerGas: priorityFee,
+                maxFeePerGas: maxFee
+            ),
+            paymasterAndData: Data(),
+            signature: Data()
+        )
+        
+        // Sign with stealth private key (ECDSA) + master PQ key (ML-DSA-44)
+        let dummySig = try await signStealthUserOp(&userOp, stealthPrivateKey: stealthPrivateKey)
+        userOp.signature = dummySig
+        
+        // Estimate gas
+        let gasEstimate = try await bundler.estimateUserOperationGas(userOp: userOp)
+        
+        // Update gas values
+        userOp.accountGasLimits = UserOperationBuilder.packAccountGasLimits(
+            verificationGasLimit: gasEstimate.verificationGasLimit,
+            callGasLimit: gasEstimate.callGasLimit
+        )
+        userOp.preVerificationGas = PackedUserOperation.uint256Data(gasEstimate.preVerificationGas)
+        
+        // Re-sign with correct gas values
+        let finalSig = try await signStealthUserOp(&userOp, stealthPrivateKey: stealthPrivateKey)
+        userOp.signature = finalSig
+        
+        // Submit
+        let userOpHash = try await bundler.sendUserOperation(userOp: userOp)
+        SecureLogger.info("Stealth sweep UserOp submitted: \(userOpHash)", category: .session)
+        
+        return userOpHash
+    }
+    
     // MARK: - Signing
+    
+    /// Sign a UserOp with the stealth ECDSA key + master ML-DSA-44 key.
+    private func signStealthUserOp(
+        _ userOp: inout PackedUserOperation,
+        stealthPrivateKey: Data
+    ) async throws -> Data {
+        let hash = UserOperationBuilder.getUserOpHash(
+            userOp: userOp,
+            entryPoint: UserOperationBuilder.entryPointAddress,
+            chainId: chainId
+        )
+        
+        return try await UserOperationBuilder.signHybridWithStealthKey(
+            userOpHash: hash,
+            stealthPrivateKey: stealthPrivateKey,
+            pqKeyManager: pqKeyManager
+        )
+    }
     
     private func signUserOp(_ userOp: inout PackedUserOperation) async throws -> Data {
         let hash = UserOperationBuilder.getUserOpHash(
@@ -285,14 +408,29 @@ actor PQTransactionSigner {
         return nonceValue
     }
     
-    /// Generic eth_call to the EntryPoint via the deployer's RPC.
+    /// Generic eth_call to the EntryPoint via Helios (Sepolia) or the deployer's RPC.
+    ///
+    /// Tier 1: Helios verified ethCall (Sepolia only — Helios doesn't support Arb Sepolia).
+    /// Tier 2: RPC over Tor (mainnet/Base) or direct (testnet).
     private func entryPointCall(data calldata: Data) async throws -> Data {
         let entryPoint = UserOperationBuilder.entryPointAddress
         let dataHex = "0x" + calldata.map { String(format: "%02x", $0) }.joined()
-        
-        // Reuse the deployer's RPC by calling its ethCall indirectly.
-        // We do a lightweight JSON-RPC call here, using the chain's RPC URL
-        // from the deployer via a static lookup based on chainId.
+
+        // Tier 1: Helios for Sepolia
+        if chainId == 11_155_111, await HeliosManager.shared.isRunning {
+            do {
+                let callObj: [String: String] = ["to": entryPoint, "data": dataHex]
+                let callJSON = try String(data: JSONSerialization.data(withJSONObject: callObj), encoding: .utf8) ?? "{}"
+                let hexResult = try await HeliosManager.shared.ethCall(callJSON)
+                let hex = hexResult.hasPrefix("0x") ? String(hexResult.dropFirst(2)) : hexResult
+                SecureLogger.debug("PQTransactionSigner: Helios-verified EntryPoint call", category: .network)
+                return ABIEncoder.hexToData(hex)
+            } catch {
+                SecureLogger.warning("PQTransactionSigner: Helios ethCall failed, falling back to RPC: \(error)", category: .network)
+            }
+        }
+
+        // Tier 2: RPC fallback
         let chain: PQAccountDeployer.Chain
         switch chainId {
         case 11_155_111:
