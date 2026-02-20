@@ -20,6 +20,14 @@ final class TransactionSigner {
     private let meshRelay: MeshTransactionRelay
     private let balanceService: EthereumBalanceService
     
+    /// Persistent nonce cache key prefix (App Group)
+    private static let nonceCacheKey = "wallet-nonce-cache"
+    
+    /// App Group UserDefaults for persistence
+    private var appGroupDefaults: UserDefaults {
+        UserDefaults(suiteName: BitchatApp.groupID) ?? .standard
+    }
+    
     init(wallet: EmbeddedWallet, meshRelay: MeshTransactionRelay, balanceService: EthereumBalanceService) {
         self.wallet = wallet
         self.meshRelay = meshRelay
@@ -208,6 +216,7 @@ final class TransactionSigner {
                 do {
                     let nonce = try await HeliosManager.shared.getNonce(address: address, pending: true)
                     SecureLogger.debug("Got Helios-verified nonce \(nonce) for \(address.prefix(10))…", category: .session)
+                    saveNonceToCache(nonce, for: address, chainId: chainId)
                     return nonce
                 } catch {
                     SecureLogger.warning("Helios nonce fetch failed, falling back to RPC: \(error)", category: .session)
@@ -225,6 +234,14 @@ final class TransactionSigner {
         case 8453:
             rpcURLs = ["https://mainnet.base.org", "https://base.llamarpc.com"]
         default:
+            // Even for unsupported chains, check cache before throwing
+            if let cachedNonce = loadNonceFromCache(for: address, chainId: chainId) {
+                let queuedOnChain = meshRelay.pendingRelays.filter {
+                    $0.payload.fromAddress?.lowercased() == address.lowercased() &&
+                    $0.payload.chainId == chainId
+                }.count
+                return cachedNonce + UInt64(queuedOnChain)
+            }
             throw TransactionError.unsupportedChain
         }
         
@@ -264,6 +281,7 @@ final class TransactionSigner {
                 }
                 
                 SecureLogger.debug("Got nonce \(nonce) from \(url.host ?? "unknown")", category: .session)
+                saveNonceToCache(nonce, for: address, chainId: chainId)
                 return nonce
                 
             } catch {
@@ -273,7 +291,44 @@ final class TransactionSigner {
             }
         }
         
+        // Tier 3: Offline fallback — use cached nonce + count of queued txs on same chain
+        if let cachedNonce = loadNonceFromCache(for: address, chainId: chainId) {
+            let queuedOnChain = meshRelay.pendingRelays.filter {
+                $0.payload.fromAddress?.lowercased() == address.lowercased() &&
+                $0.payload.chainId == chainId
+            }.count
+            let offlineNonce = cachedNonce + UInt64(queuedOnChain)
+            SecureLogger.warning("📴 Using offline cached nonce \(cachedNonce) + \(queuedOnChain) queued = \(offlineNonce)", category: .session)
+            return offlineNonce
+        }
+        
         throw lastError
+    }
+    
+    // MARK: - Nonce Cache
+    
+    private func saveNonceToCache(_ nonce: UInt64, for address: String, chainId: UInt64) {
+        let key = "\(Self.nonceCacheKey)-\(address.lowercased())-\(chainId)"
+        appGroupDefaults.set(Int(nonce), forKey: key)
+        appGroupDefaults.set(Date().timeIntervalSince1970, forKey: key + "-ts")
+    }
+    
+    private func loadNonceFromCache(for address: String, chainId: UInt64) -> UInt64? {
+        let key = "\(Self.nonceCacheKey)-\(address.lowercased())-\(chainId)"
+        guard appGroupDefaults.object(forKey: key) != nil else { return nil }
+        let nonce = UInt64(appGroupDefaults.integer(forKey: key))
+        
+        // Check staleness — only trust nonce cache up to 24 hours
+        let ts = appGroupDefaults.double(forKey: key + "-ts")
+        if ts > 0 {
+            let age = Date().timeIntervalSince1970 - ts
+            if age > 24 * 60 * 60 {
+                SecureLogger.warning("Nonce cache too old (\(Int(age))s), discarding", category: .session)
+                return nil
+            }
+        }
+        
+        return nonce
     }
     
     private func formatEth(_ wei: UInt64) -> String {

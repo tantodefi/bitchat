@@ -196,6 +196,17 @@ final class EthereumBalanceService: ObservableObject {
         useTestnet ? Network.testnets : Network.mainnets
     }
     
+    /// Persistent balance cache key prefix
+    private let balanceCacheKey = "wallet-balance-cache"
+    
+    /// App Group UserDefaults for persistence across reinstalls
+    private var appGroupDefaults: UserDefaults {
+        UserDefaults(suiteName: BitchatApp.groupID) ?? .standard
+    }
+    
+    /// Whether the currently displayed balances are from cache (stale)
+    @Published private(set) var isShowingCachedBalances: Bool = false
+    
     // MARK: - Initialization
     
     init() {
@@ -216,13 +227,72 @@ final class EthereumBalanceService: ObservableObject {
     
     // MARK: - Public Methods
     
-    /// Clear all cached balances (e.g. when switching between EOA and PQ account).
+    /// Clear in-memory balances (e.g. when switching between EOA and PQ account).
     /// Also invalidates any in-flight `fetchBalances` calls so their stale results
     /// are discarded instead of being written back into `balances`.
+    /// Persistent cache is NOT cleared — it will be used as offline fallback.
     func clearBalances() {
         fetchGeneration += 1
         balances.removeAll()
+        isShowingCachedBalances = false
         lastError = nil
+    }
+    
+    /// Load cached balances from persistent storage for a given address.
+    /// Returns true if cached balances were loaded, false if no cache exists.
+    @discardableResult
+    func loadCachedBalances(for address: String) -> Bool {
+        let key = "\(balanceCacheKey)-\(address.lowercased())"
+        guard let data = appGroupDefaults.data(forKey: key),
+              let cached = try? JSONDecoder().decode([CachedBalanceEntry].self, from: data) else {
+            return false
+        }
+        
+        var loaded = 0
+        for entry in cached {
+            guard let network = Network.allCases.first(where: { $0.rawValue == entry.networkRaw }) else { continue }
+            // Only load balances for the current network mode (testnet/mainnet)
+            guard activeNetworks.contains(network) else { continue }
+            guard let wei = BigUInt(hexString: entry.weiHex) else { continue }
+            let balance = Balance(
+                network: network,
+                wei: wei,
+                lastUpdated: entry.lastUpdated,
+                verificationLevel: VerificationLevel(rawValue: entry.verificationLevelRaw) ?? .unverified
+            )
+            balances[network] = balance
+            loaded += 1
+        }
+        
+        if loaded > 0 {
+            isShowingCachedBalances = true
+            SecureLogger.info("EthereumBalanceService: Loaded \(loaded) cached balance(s) for \(address.prefix(10))…", category: .network)
+        }
+        return loaded > 0
+    }
+    
+    /// Persist current balances to disk for offline access.
+    private func saveCachedBalances(for address: String) {
+        let entries = balances.map { (network, balance) in
+            CachedBalanceEntry(
+                networkRaw: network.rawValue,
+                weiHex: balance.wei.hexString,
+                lastUpdated: balance.lastUpdated,
+                verificationLevelRaw: balance.verificationLevel.rawValue
+            )
+        }
+        if let data = try? JSONEncoder().encode(entries) {
+            let key = "\(balanceCacheKey)-\(address.lowercased())"
+            appGroupDefaults.set(data, forKey: key)
+        }
+    }
+    
+    /// Codable entry for persisting balances.
+    private struct CachedBalanceEntry: Codable {
+        let networkRaw: String
+        let weiHex: String
+        let lastUpdated: Date
+        let verificationLevelRaw: String
     }
     
     /// Fetches balance for the given address on all supported networks.
@@ -240,6 +310,13 @@ final class EthereumBalanceService: ObservableObject {
         let myGeneration = fetchGeneration
         isLoading = true
         lastError = nil
+        
+        // If we have no in-memory balances, load cached ones first as a placeholder
+        if balances.isEmpty {
+            loadCachedBalances(for: address)
+        }
+        
+        var fetchedAny = false
         
         await withTaskGroup(of: (Network, Balance?).self) { group in
             for network in activeNetworks {
@@ -259,12 +336,20 @@ final class EthereumBalanceService: ObservableObject {
                 }
                 if let balance = balance {
                     balances[network] = balance
+                    fetchedAny = true
                 }
             }
         }
         
         // Only clear loading state if we're still the active fetch
         if myGeneration == fetchGeneration {
+            if fetchedAny {
+                // We got fresh data — persist it and clear stale flag
+                isShowingCachedBalances = false
+                saveCachedBalances(for: address)
+            }
+            // If we didn't fetch anything fresh, cached balances (if loaded) remain visible
+            // with isShowingCachedBalances = true
             isLoading = false
         }
     }

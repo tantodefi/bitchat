@@ -587,6 +587,22 @@ struct WalletView: View {
                     .font(.caption2)
                     .foregroundColor(.secondary)
             }
+            
+            // Offline / stale cache indicator
+            if balanceService.isShowingCachedBalances {
+                HStack(spacing: 6) {
+                    Image(systemName: "wifi.slash")
+                        .font(.caption2)
+                        .foregroundColor(.orange)
+                    Text("Showing cached balances (offline)")
+                        .font(.caption2)
+                        .foregroundColor(.orange)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(Color.orange.opacity(0.1))
+                .cornerRadius(8)
+            }
         }
     }
     

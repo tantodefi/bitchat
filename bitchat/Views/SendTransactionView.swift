@@ -645,7 +645,8 @@ struct SendTransactionView: View {
     }
     
     private func checkConnectivity() async {
-        // Quick connectivity check
+        // Quick connectivity check — try direct URLSession first (faster),
+        // then Tor session as fallback. Avoids false-negative when Tor isn't bootstrapped.
         guard let url = URL(string: "https://sepolia.drpc.org") else {
             isOnline = false
             return
@@ -662,16 +663,19 @@ struct SendTransactionView: View {
         ])
         request.timeoutInterval = 5
         
-        do {
-            let (_, response) = try await TorURLSession.shared.session.data(for: request)
-            if let httpResponse = response as? HTTPURLResponse {
-                isOnline = httpResponse.statusCode == 200
-            } else {
-                isOnline = false
+        // Try direct session first (works even if Tor isn't bootstrapped)
+        for session in [URLSession.shared, TorURLSession.shared.session] {
+            do {
+                let (_, response) = try await session.data(for: request)
+                if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 {
+                    isOnline = true
+                    return
+                }
+            } catch {
+                continue
             }
-        } catch {
-            isOnline = false
         }
+        isOnline = false
     }
     
     // MARK: - ENS Resolution

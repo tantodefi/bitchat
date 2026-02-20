@@ -12,6 +12,7 @@
 import BitLogger
 import Combine
 import Foundation
+import Network
 import Tor
 
 /// Service for relaying signed transactions through BLE mesh
@@ -43,6 +44,10 @@ final class MeshTransactionRelay: ObservableObject {
     private let failedStorageKey = "mesh-tx-failed-history"
     private var retryTask: Task<Void, Never>?
     private var retryScheduled = false
+    
+    /// Network path monitor for detecting connectivity changes
+    private let pathMonitor = NWPathMonitor()
+    private let monitorQueue = DispatchQueue(label: "mesh-tx-network-monitor")
     
     /// App Group UserDefaults for persistence across reinstalls
     private var appGroupDefaults: UserDefaults {
@@ -125,6 +130,27 @@ final class MeshTransactionRelay: ObservableObject {
         if !pendingRelays.isEmpty {
             scheduleRetry()
         }
+        
+        // Monitor network connectivity changes to immediately retry queued txs
+        startNetworkMonitor()
+    }
+    
+    /// Start NWPathMonitor to detect when device regains connectivity.
+    /// Immediately triggers `retryNow()` when the path becomes satisfied.
+    private func startNetworkMonitor() {
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            guard path.status == .satisfied else { return }
+            // Device just got connectivity — immediately retry queued transactions
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                let queued = self.pendingRelays.filter { $0.status == .queued }
+                if !queued.isEmpty {
+                    SecureLogger.info("📶 Network restored — retrying \(queued.count) queued tx(s) immediately", category: .session)
+                    self.retryNow()
+                }
+            }
+        }
+        pathMonitor.start(queue: monitorQueue)
     }
     
     func configure(bleService: BLEService?) {
@@ -665,40 +691,45 @@ final class MeshTransactionRelay: ObservableObject {
     private func findRelayPeer() -> PeerID? {
         guard let bleService = bleService else { return nil }
         let peers = bleService.currentPeerSnapshots()
-        // Return any connected peer (they may have internet)
-        return peers.first(where: { $0.isConnected })?.peerID
+        let connectedPeers = peers.filter { $0.isConnected }
+        guard !connectedPeers.isEmpty else { return nil }
+        // Randomise which peer we relay through to distribute load
+        // and avoid repeatedly hitting a peer that might be offline
+        return connectedPeers.randomElement()?.peerID
     }
     
     private func hasInternetConnectivity() async -> Bool {
         // Quick connectivity check using reliable public endpoints
-        // Use Tor session for privacy on mainnet
-        let session = TorURLSession.shared.session
+        // Try BOTH Tor session and direct URLSession — Tor may not be bootstrapped
+        let sessions: [URLSession] = [URLSession.shared, TorURLSession.shared.session]
         let checkURLs = [
             "https://sepolia.drpc.org",     // Fast, reliable public endpoint
             "https://rpc.flashbots.net"     // Fallback
         ]
         
-        for urlString in checkURLs {
-            guard let url = URL(string: urlString) else { continue }
-            var request = URLRequest(url: url)
-            request.httpMethod = "POST"
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            // Simple eth_chainId request
-            request.httpBody = try? JSONSerialization.data(withJSONObject: [
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "eth_chainId",
-                "params": []
-            ])
-            request.timeoutInterval = 5
-            
-            do {
-                let (_, response) = try await session.data(for: request)
-                if (response as? HTTPURLResponse)?.statusCode == 200 {
-                    return true
+        for session in sessions {
+            for urlString in checkURLs {
+                guard let url = URL(string: urlString) else { continue }
+                var request = URLRequest(url: url)
+                request.httpMethod = "POST"
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                // Simple eth_chainId request
+                request.httpBody = try? JSONSerialization.data(withJSONObject: [
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "eth_chainId",
+                    "params": []
+                ])
+                request.timeoutInterval = 5
+                
+                do {
+                    let (_, response) = try await session.data(for: request)
+                    if (response as? HTTPURLResponse)?.statusCode == 200 {
+                        return true
+                    }
+                } catch {
+                    continue
                 }
-            } catch {
-                continue
             }
         }
         return false
