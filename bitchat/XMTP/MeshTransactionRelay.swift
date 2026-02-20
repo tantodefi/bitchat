@@ -270,6 +270,24 @@ final class MeshTransactionRelay: ObservableObject {
             )
             confirmedTransactions.append(confirmed)
             saveConfirmedTransactions()
+
+            // Persist to TransactionStore for durable history
+            Task { @MainActor in
+                TransactionStore.shared.record(
+                    CachedTransaction(
+                        id: confirmed.txHash,
+                        txHash: confirmed.txHash,
+                        from: (confirmed.fromAddress ?? "").lowercased(),
+                        to: confirmed.toAddress.lowercased(),
+                        value: confirmed.amount.map { String(format: "0x%llx", $0) } ?? "0x0",
+                        timestamp: confirmed.confirmedAt,
+                        blockNumber: confirmed.blockNumber,
+                        chainId: UInt64(confirmed.chainId),
+                        source: .meshRelay
+                    ),
+                    for: (confirmed.fromAddress ?? "").lowercased()
+                )
+            }
             
             // Remove from pending
             pendingRelays.remove(at: idx)
@@ -421,6 +439,24 @@ final class MeshTransactionRelay: ObservableObject {
                 )
                 confirmedTransactions.append(confirmed)
                 saveConfirmedTransactions()
+
+                // Persist to TransactionStore for durable history
+                Task { @MainActor in
+                    TransactionStore.shared.record(
+                        CachedTransaction(
+                            id: confirmed.txHash,
+                            txHash: confirmed.txHash,
+                            from: (confirmed.fromAddress ?? "").lowercased(),
+                            to: confirmed.toAddress.lowercased(),
+                            value: confirmed.amount.map { String(format: "0x%llx", $0) } ?? "0x0",
+                            timestamp: confirmed.confirmedAt,
+                            blockNumber: confirmed.blockNumber,
+                            chainId: UInt64(confirmed.chainId),
+                            source: .meshRelay
+                        ),
+                        for: (confirmed.fromAddress ?? "").lowercased()
+                    )
+                }
                 
                 // Remove from pending
                 pendingRelays.removeAll { $0.id == relay.id }

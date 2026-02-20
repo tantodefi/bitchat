@@ -235,7 +235,8 @@ struct WalletView: View {
             TransactionHistoryView(
                 meshRelay: xmtpContainer.meshTransactionRelay,
                 balanceService: balanceService,
-                filterAddress: displayAddress
+                filterAddress: displayAddress,
+                pqAddress: activeAccountMode == .pqAccount ? pqViewModel.accountAddress : nil
             )
         }
         .sheet(isPresented: $showStealthSheet) {

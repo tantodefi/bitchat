@@ -708,6 +708,20 @@ struct BigUInt: Equatable, CustomStringConvertible {
     var isZero: Bool {
         words.isEmpty || words.allSatisfy { $0 == 0 }
     }
+
+    /// Hex string representation (0x-prefixed, no leading zeros).
+    var hexString: String {
+        if words.isEmpty { return "0x0" }
+        var hex = ""
+        for (i, word) in words.reversed().enumerated() {
+            if i == 0 {
+                hex += String(word, radix: 16)
+            } else {
+                hex += String(format: "%016llx", word)
+            }
+        }
+        return "0x" + hex
+    }
     
     static func + (lhs: BigUInt, rhs: BigUInt) -> BigUInt {
         var result: [UInt64] = []

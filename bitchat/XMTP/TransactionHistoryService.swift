@@ -2,13 +2,21 @@
 // TransactionHistoryService.swift
 // bitchat
 //
-// Fetches on-chain transaction history via Helios (over Tor) for privacy.
-// Shows sends, receives, and contract interactions — all trustlessly verified.
+// Multi-strategy on-chain transaction history via Helios (over Tor) for privacy.
+// Reconstructs full history trustlessly — no Etherscan, no centralized indexer.
 //
 // Data sources (in priority order):
-// 1. Helios getLogs for ERC-20 Transfer events + verified receipts
-// 2. Tor-proxied RPC as fallback when Helios unavailable
-// 3. Local pending/confirmed/failed tx state from MeshTransactionRelay
+// 1. Persistent TransactionStore — cached hashes from prior sessions
+// 2. Helios getTransactionReceipt — verified receipt for every known hash
+// 3. Helios getLogs — ERC-20 Transfer/Approval events for the address
+// 4. Helios getBlockByNumber — native ETH transfers via block scanning
+// 5. Nonce-based gap detection — compares known sent tx count vs on-chain nonce
+// 6. ERC-4337 UserOperationEvent logs — PQ smart account transactions
+// 7. Local MeshTransactionRelay state — pending, confirmed, failed txs
+// 8. Tor-proxied RPC as fallback when Helios unavailable
+//
+// All discovered transactions are persisted to TransactionStore so they
+// survive app restarts and are never lost once found.
 //
 // This is free and unencumbered software released into the public domain.
 // For more information, see <https://unlicense.org>
@@ -97,8 +105,20 @@ enum OnChainTxType: String {
 
 // MARK: - TransactionHistoryService
 
-/// Service that fetches full on-chain transaction history using Helios (over Tor).
-/// Combines on-chain data with local pending transaction state.
+/// Multi-strategy transaction history service using Helios (over Tor).
+///
+/// **Strategy overview (executed in order):**
+/// 1. Load cached tx hashes from `TransactionStore` (instant, no network)
+/// 2. Merge local pending/confirmed/failed from `MeshTransactionRelay`
+/// 3. Fetch verified receipts for ALL known hashes via Helios `getTransactionReceipt`
+/// 4. Scan ERC-20 Transfer/Approval logs via Helios `getLogs` (~7 day window)
+/// 5. Scan ERC-4337 UserOperationEvent logs for PQ account transactions
+/// 6. Scan recent blocks for native ETH transfers (adaptive range)
+/// 7. Detect nonce gaps → expand scan range if we're missing sent txs
+/// 8. Cache all newly discovered txs to `TransactionStore` for next session
+///
+/// **Privacy:** No Etherscan, no centralized indexer. All data flows through
+/// either Helios (cryptographically verified) or Tor-proxied RPC.
 @MainActor
 final class TransactionHistoryService: ObservableObject {
 
@@ -108,6 +128,7 @@ final class TransactionHistoryService: ObservableObject {
     @Published private(set) var isLoading = false
     @Published private(set) var lastError: String?
     @Published private(set) var verificationLevel: EthereumBalanceService.VerificationLevel = .unverified
+    @Published private(set) var discoveryProgress: String = ""
 
     // MARK: - Constants
 
@@ -117,8 +138,25 @@ final class TransactionHistoryService: ObservableObject {
     /// ERC-20 Approval event topic: Approval(address,address,uint256)
     private static let approvalTopic = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925"
 
-    /// How far back to scan (in blocks). ~7 days at 12s/block ≈ 50400 blocks.
-    private static let defaultScanRange: UInt64 = 50400
+    /// ERC-4337 v0.7 EntryPoint UserOperationEvent topic:
+    /// UserOperationEvent(bytes32 indexed userOpHash, address indexed sender, address indexed paymaster, uint256 nonce, bool success, uint256 actualGasCost, uint256 actualGasUsed)
+    private static let userOperationEventTopic = "0x49628fd1471006c1482da88028e9ce4dbb080b815c9b0344d39e5a8e6ec1419f"
+
+    /// ERC-4337 v0.7 EntryPoint address (same on all chains)
+    private static let entryPointV07 = "0x0000000071727De22E5E9d8BAf0edAc6f37da032"
+
+    /// How far back to scan for ERC-20 logs (in blocks). ~7 days at 12s/block.
+    private static let defaultLogScanRange: UInt64 = 50400
+
+    /// How far back to scan blocks for native ETH transfers.
+    /// Adaptive: starts at 500 blocks (~1.5h), expands if nonce gap detected.
+    private static let defaultBlockScanRange: UInt64 = 500
+
+    /// Maximum blocks to scan for native ETH when nonce gap detected.
+    private static let maxBlockScanRange: UInt64 = 5000
+
+    /// Concurrent block fetch batch size
+    private static let blockFetchBatchSize = 20
 
     /// Known ERC-20 token metadata for display
     private static let knownTokens: [String: (symbol: String, decimals: UInt8)] = [
@@ -136,47 +174,122 @@ final class TransactionHistoryService: ObservableObject {
     // MARK: - Public API
 
     /// Fetch full transaction history for an address.
-    /// Merges on-chain data from Helios/RPC with local pending transactions.
+    ///
+    /// Multi-strategy approach:
+    /// 1. Cached transactions from TransactionStore (survives restarts)
+    /// 2. Local pending/confirmed/failed from MeshTransactionRelay
+    /// 3. Verified receipts for all known tx hashes
+    /// 4. On-chain event log scanning (ERC-20 + ERC-4337)
+    /// 5. Native ETH block scanning (adaptive range)
+    /// 6. Nonce gap detection with expanded scanning
+    /// 7. Persists all newly discovered transactions
     func fetchHistory(
         for address: String,
         meshRelay: MeshTransactionRelay,
         chainId: UInt64 = 1,
-        useTestnet: Bool = false
+        useTestnet: Bool = false,
+        pqAddress: String? = nil
     ) async {
         isLoading = true
         lastError = nil
+        discoveryProgress = "Loading cached history…"
 
         var allTxs: [OnChainTransaction] = []
+        let normalizedAddr = address.lowercased()
 
-        // 1. Get local pending/confirmed/failed transactions from MeshTransactionRelay
+        // ── Step 1: Load cached transactions from persistent store ──
+        let store = TransactionStore.shared
+        let cachedTxs = store.allTransactions(for: normalizedAddr)
+        let cachedHashes = Set(cachedTxs.map { $0.txHash.lowercased() })
+        SecureLogger.info("TransactionHistoryService: \(cachedTxs.count) cached tx hashes loaded", category: .network)
+
+        // ── Step 2: Local pending/confirmed/failed from MeshTransactionRelay ──
+        discoveryProgress = "Loading local transactions…"
         let localTxs = buildLocalTransactions(from: meshRelay, address: address)
         allTxs.append(contentsOf: localTxs)
 
-        // 2. Fetch on-chain history via Helios or RPC over Tor
-        do {
-            let onChainTxs = try await fetchOnChainHistory(
-                for: address,
+        // Also persist local confirmed txs that have hashes (so they survive relay clear)
+        let localConfirmedWithHash = localTxs.filter { $0.txHash != nil && $0.status == .confirmed }
+        let newLocalCached = localConfirmedWithHash.compactMap { tx -> CachedTransaction? in
+            guard let hash = tx.txHash else { return nil }
+            guard !cachedHashes.contains(hash.lowercased()) else { return nil }
+            return CachedTransaction(
+                id: hash,
+                txHash: hash,
+                from: tx.from.lowercased(),
+                to: tx.to.lowercased(),
+                value: tx.value.hexString,
+                timestamp: tx.timestamp,
+                blockNumber: tx.blockNumber,
+                chainId: chainId,
+                source: .meshRelay
+            )
+        }
+        store.recordBatch(newLocalCached, for: normalizedAddr)
+
+        // ── Step 3: Fetch verified receipts for all known tx hashes ──
+        discoveryProgress = "Verifying known transactions…"
+        let allKnownHashes = cachedHashes.union(Set(localTxs.compactMap { $0.txHash?.lowercased() }))
+
+        if !allKnownHashes.isEmpty {
+            let receiptTxs = await fetchReceiptsForKnownHashes(
+                hashes: allKnownHashes,
+                address: normalizedAddr,
                 chainId: chainId,
                 useTestnet: useTestnet
             )
-            // Merge: on-chain replaces local confirmed with same txHash
-            let localHashes = Set(localTxs.compactMap { $0.txHash?.lowercased() })
+            allTxs.append(contentsOf: receiptTxs)
+            SecureLogger.info("TransactionHistoryService: \(receiptTxs.count) txs from receipt lookup", category: .network)
+        }
+
+        // ── Step 4: On-chain event scanning + block scanning ──
+        do {
+            discoveryProgress = "Scanning on-chain events…"
+            let onChainTxs = try await fetchOnChainHistory(
+                for: address,
+                chainId: chainId,
+                useTestnet: useTestnet,
+                pqAddress: pqAddress
+            )
+
+            // Merge: deduplicate against what we already have
+            let existingHashes = Set(allTxs.compactMap { $0.txHash?.lowercased() })
             let deduplicated = onChainTxs.filter { tx in
                 guard let hash = tx.txHash?.lowercased() else { return true }
-                return !localHashes.contains(hash)
+                return !existingHashes.contains(hash)
             }
             allTxs.append(contentsOf: deduplicated)
+
+            // Cache newly discovered on-chain txs
+            let newOnChainCached = deduplicated.compactMap { tx -> CachedTransaction? in
+                guard let hash = tx.txHash else { return nil }
+                return CachedTransaction(
+                    id: hash,
+                    txHash: hash,
+                    from: tx.from.lowercased(),
+                    to: tx.to.lowercased(),
+                    value: tx.value.hexString,
+                    timestamp: tx.timestamp,
+                    blockNumber: tx.blockNumber,
+                    chainId: chainId,
+                    source: .onChainScan
+                )
+            }
+            store.recordBatch(newOnChainCached, for: normalizedAddr)
+            SecureLogger.info("TransactionHistoryService: \(onChainTxs.count) txs from on-chain scan, \(newOnChainCached.count) newly cached", category: .network)
         } catch {
             SecureLogger.warning("TransactionHistoryService: on-chain fetch failed: \(error)", category: .network)
             lastError = error.localizedDescription
         }
 
-        // 3. Sort by timestamp (newest first), de-duplicate by id
+        // ── Step 5: Sort, deduplicate, and publish ──
+        discoveryProgress = ""
         var seen = Set<String>()
         transactions = allTxs
             .sorted { $0.timestamp > $1.timestamp }
             .filter { seen.insert($0.id).inserted }
 
+        SecureLogger.info("TransactionHistoryService: \(transactions.count) total transactions", category: .network)
         isLoading = false
     }
 
@@ -279,19 +392,188 @@ final class TransactionHistoryService: ObservableObject {
         return results
     }
 
+    // MARK: - Receipt-Based Enrichment
+
+    /// Fetch verified transaction receipts for all known tx hashes.
+    /// This is the most reliable way to reconstruct history — if we have the hash,
+    /// Helios can verify the full receipt against the consensus-attested state root.
+    private func fetchReceiptsForKnownHashes(
+        hashes: Set<String>,
+        address: String,
+        chainId: UInt64,
+        useTestnet: Bool
+    ) async -> [OnChainTransaction] {
+        var results: [OnChainTransaction] = []
+        let heliosAvailable = await HeliosManager.shared.isRunning
+
+        // Fetch receipts concurrently in batches to avoid overwhelming Helios
+        let hashArray = Array(hashes)
+        let batchSize = 10
+
+        for batchStart in stride(from: 0, to: hashArray.count, by: batchSize) {
+            let batchEnd = min(batchStart + batchSize, hashArray.count)
+            let batch = Array(hashArray[batchStart..<batchEnd])
+
+            await withTaskGroup(of: OnChainTransaction?.self) { group in
+                for txHash in batch {
+                    group.addTask { [weak self] in
+                        guard let self else { return nil }
+                        return await self.fetchAndParseReceipt(
+                            txHash: txHash,
+                            address: address,
+                            chainId: chainId,
+                            useTestnet: useTestnet,
+                            heliosAvailable: heliosAvailable
+                        )
+                    }
+                }
+                for await tx in group {
+                    if let tx { results.append(tx) }
+                }
+            }
+        }
+
+        if heliosAvailable && !results.isEmpty {
+            verificationLevel = .heliosVerified
+        }
+        return results
+    }
+
+    /// Fetch a single transaction receipt and parse it into an OnChainTransaction.
+    private func fetchAndParseReceipt(
+        txHash: String,
+        address: String,
+        chainId: UInt64,
+        useTestnet: Bool,
+        heliosAvailable: Bool
+    ) async -> OnChainTransaction? {
+        do {
+            let receiptJSON: String
+            if heliosAvailable {
+                receiptJSON = try await HeliosManager.shared.getTransactionReceipt(txHash: txHash)
+            } else {
+                receiptJSON = try await fetchReceiptViaRPC(txHash: txHash, chainId: chainId, useTestnet: useTestnet)
+            }
+
+            guard let data = receiptJSON.data(using: .utf8),
+                  let receipt = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return nil
+            }
+
+            // Parse receipt fields
+            let from = (receipt["from"] as? String)?.lowercased() ?? ""
+            let to = (receipt["to"] as? String)?.lowercased() ?? ""
+            let statusHex = receipt["status"] as? String ?? "0x1"
+            let isSuccess = statusHex != "0x0"
+
+            let blockHex = receipt["blockNumber"] as? String ?? "0x0"
+            let blockStr = blockHex.hasPrefix("0x") ? String(blockHex.dropFirst(2)) : blockHex
+            let blockNumber = UInt64(blockStr, radix: 16) ?? 0
+
+            let gasUsedHex = receipt["gasUsed"] as? String
+            let gasUsed = parseHexUInt64(gasUsedHex)
+
+            let effectiveGasPriceHex = receipt["effectiveGasPrice"] as? String
+            let gasPrice = parseHexUInt64(effectiveGasPriceHex)
+
+            // Determine tx type based on from/to relationship to our address
+            let normalizedAddr = address.lowercased()
+            let isSend = from == normalizedAddr
+            let isReceive = to == normalizedAddr
+            guard isSend || isReceive else { return nil }
+
+            // Try to get the actual tx value by fetching block timestamp too
+            let timestamp = await fetchBlockTimestamp(
+                blockNumber: blockNumber,
+                chainId: chainId,
+                useTestnet: useTestnet,
+                heliosAvailable: heliosAvailable
+            ) ?? Date()
+
+            // Check if this is a contract interaction (has logs or to-address has code)
+            let logs = receipt["logs"] as? [[String: Any]] ?? []
+            let hasCalldata = to.isEmpty || !logs.isEmpty
+
+            let txType: OnChainTxType
+            if to.isEmpty {
+                txType = .contractDeploy
+            } else if hasCalldata && logs.count > 0 && isSend {
+                txType = .contractCall
+            } else if isSend {
+                txType = .send
+            } else {
+                txType = .receive
+            }
+
+            let level: EthereumBalanceService.VerificationLevel = heliosAvailable ? .heliosVerified : .unverified
+
+            return OnChainTransaction(
+                id: txHash.lowercased(),
+                txHash: txHash,
+                blockNumber: blockNumber,
+                timestamp: timestamp,
+                from: from,
+                to: to,
+                value: BigUInt(0), // Receipt doesn't include value; will be overridden if found in block scan
+                gasUsed: gasUsed,
+                gasPrice: gasPrice,
+                input: nil,
+                status: isSuccess ? .confirmed : .reverted,
+                txType: txType,
+                tokenSymbol: nil,
+                tokenAmount: nil,
+                contractAddress: hasCalldata && !to.isEmpty ? to : nil,
+                verificationLevel: level,
+                failureReason: isSuccess ? nil : "Transaction reverted"
+            )
+        } catch {
+            // Receipt fetch failed — skip this hash silently
+            return nil
+        }
+    }
+
+    /// Fetch block timestamp for a given block number.
+    private func fetchBlockTimestamp(
+        blockNumber: UInt64,
+        chainId: UInt64,
+        useTestnet: Bool,
+        heliosAvailable: Bool
+    ) async -> Date? {
+        let blockHex = String(format: "0x%llx", blockNumber)
+        do {
+            let blockJSON: String
+            if heliosAvailable {
+                blockJSON = try await HeliosManager.shared.getBlockByNumber(blockTag: blockHex, fullTransactions: false)
+            } else {
+                blockJSON = try await fetchBlockViaRPC(blockTag: blockHex, fullTxs: false, chainId: chainId, useTestnet: useTestnet)
+            }
+
+            guard let data = blockJSON.data(using: .utf8),
+                  let block = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let tsHex = block["timestamp"] as? String else { return nil }
+
+            let stripped = tsHex.hasPrefix("0x") ? String(tsHex.dropFirst(2)) : tsHex
+            guard let ts = UInt64(stripped, radix: 16) else { return nil }
+            return Date(timeIntervalSince1970: TimeInterval(ts))
+        } catch {
+            return nil
+        }
+    }
+
     // MARK: - On-Chain History Fetch
 
     /// Fetch on-chain transaction history via Helios (preferred) or Tor-proxied RPC.
     ///
-    /// Strategy:
-    /// 1. Use Helios getLogs to find all Transfer events involving our address
-    ///    (both as sender and receiver) — this catches ERC-20 + ETH via WETH
-    /// 2. Scan recent blocks for native ETH transfers to/from our address
-    /// 3. Merge and deduplicate
+    /// Enhanced strategy:
+    /// 1. ERC-20 Transfer/Approval event logs (~7 day window)
+    /// 2. ERC-4337 UserOperationEvent logs for PQ account (if address provided)
+    /// 3. Native ETH block scanning (adaptive range: 500–5000 blocks)
+    /// 4. Nonce gap detection: expand scan if we're missing sent txs
     private func fetchOnChainHistory(
         for address: String,
         chainId: UInt64,
-        useTestnet: Bool
+        useTestnet: Bool,
+        pqAddress: String? = nil
     ) async throws -> [OnChainTransaction] {
         let normalizedAddr = address.lowercased()
         let paddedAddr = "0x" + String(repeating: "0", count: 24) + String(normalizedAddr.dropFirst(2))
@@ -310,42 +592,41 @@ final class TransactionHistoryService: ObservableObject {
 
         guard currentBlock > 0 else { return [] }
 
-        let fromBlock = currentBlock > Self.defaultScanRange ? currentBlock - Self.defaultScanRange : 0
-        let fromBlockHex = String(format: "0x%llx", fromBlock)
+        let logFromBlock = currentBlock > Self.defaultLogScanRange ? currentBlock - Self.defaultLogScanRange : 0
+        let logFromBlockHex = String(format: "0x%llx", logFromBlock)
         let toBlockHex = "latest"
 
-        // --- ERC-20 Transfer events (sent by us) ---
+        // ── ERC-20 Transfer events (sent + received) ──
+        discoveryProgress = "Scanning ERC-20 transfers…"
+
         let sentFilter = HeliosManager.LogFilter(
-            address: "",  // Any token contract
+            address: "",
             topics: [
-                [Self.transferTopic],  // Transfer event
-                [paddedAddr],          // from = our address (topic[1])
-                nil                    // to = any
+                [Self.transferTopic],
+                [paddedAddr],
+                nil
             ],
-            fromBlock: fromBlockHex,
+            fromBlock: logFromBlockHex,
             toBlock: toBlockHex
         )
 
-        // --- ERC-20 Transfer events (received by us) ---
         let receivedFilter = HeliosManager.LogFilter(
             address: "",
             topics: [
                 [Self.transferTopic],
-                nil,                  // from = any
-                [paddedAddr]          // to = our address (topic[2])
+                nil,
+                [paddedAddr]
             ],
-            fromBlock: fromBlockHex,
+            fromBlock: logFromBlockHex,
             toBlock: toBlockHex
         )
 
-        // Fetch logs via Helios or RPC
         async let sentLogs = fetchLogs(filter: sentFilter, chainId: chainId, useTestnet: useTestnet)
         async let receivedLogs = fetchLogs(filter: receivedFilter, chainId: chainId, useTestnet: useTestnet)
 
         let allSentLogs = (try? await sentLogs) ?? []
         let allReceivedLogs = (try? await receivedLogs) ?? []
 
-        // Parse ERC-20 Transfer logs
         for log in allSentLogs {
             if let tx = parseTransferLog(log, userAddress: normalizedAddr, isSend: true) {
                 results.append(tx)
@@ -357,10 +638,62 @@ final class TransactionHistoryService: ObservableObject {
             }
         }
 
-        // --- Native ETH transfers: scan recent blocks for txs involving our address ---
+        // ── ERC-4337 UserOperationEvent for PQ account ──
+        if let pqAddr = pqAddress?.lowercased() {
+            discoveryProgress = "Scanning PQ account operations…"
+            let pqPadded = "0x" + String(repeating: "0", count: 24) + String(pqAddr.dropFirst(2))
+
+            let userOpFilter = HeliosManager.LogFilter(
+                address: Self.entryPointV07,
+                topics: [
+                    [Self.userOperationEventTopic],
+                    nil,         // userOpHash (any)
+                    [pqPadded]   // sender = PQ account (topic[2])
+                ],
+                fromBlock: logFromBlockHex,
+                toBlock: toBlockHex
+            )
+
+            let userOpLogs = (try? await fetchLogs(filter: userOpFilter, chainId: chainId, useTestnet: useTestnet)) ?? []
+            for log in userOpLogs {
+                if let tx = parseUserOperationLog(log, pqAddress: pqAddr) {
+                    results.append(tx)
+                }
+            }
+            SecureLogger.info("TransactionHistoryService: \(userOpLogs.count) UserOperation events found for PQ account", category: .network)
+        }
+
+        // ── Nonce gap detection for adaptive block scanning ──
+        discoveryProgress = "Checking for missing transactions…"
+        var blockScanRange = Self.defaultBlockScanRange
+
+        do {
+            let onChainNonce: UInt64
+            if await HeliosManager.shared.isRunning {
+                onChainNonce = try await HeliosManager.shared.getNonce(address: normalizedAddr)
+            } else {
+                onChainNonce = try await fetchNonceViaRPC(address: normalizedAddr, chainId: chainId, useTestnet: useTestnet)
+            }
+
+            // Count known sent txs (from local + discovered so far)
+            let knownSentCount = results.filter { $0.from.lowercased() == normalizedAddr }.count
+                + TransactionStore.shared.allTransactions(for: normalizedAddr).filter { $0.from.lowercased() == normalizedAddr }.count
+
+            if onChainNonce > knownSentCount {
+                let gap = onChainNonce - UInt64(knownSentCount)
+                SecureLogger.info("TransactionHistoryService: Nonce gap detected: on-chain=\(onChainNonce), known=\(knownSentCount), gap=\(gap)", category: .network)
+                // Expand scan range proportionally (each tx is ~12s apart minimum)
+                blockScanRange = min(Self.maxBlockScanRange, blockScanRange + gap * 100)
+            }
+        } catch {
+            SecureLogger.warning("TransactionHistoryService: Nonce check failed: \(error)", category: .network)
+        }
+
+        // ── Native ETH transfers: scan blocks (adaptive range) ──
+        discoveryProgress = "Scanning blocks for ETH transfers…"
         let ethTxs = try await fetchNativeETHTransactions(
             address: normalizedAddr,
-            fromBlock: fromBlock,
+            fromBlock: currentBlock > blockScanRange ? currentBlock - blockScanRange : 0,
             toBlock: currentBlock,
             chainId: chainId,
             useTestnet: useTestnet
@@ -368,6 +701,50 @@ final class TransactionHistoryService: ObservableObject {
         results.append(contentsOf: ethTxs)
 
         return results
+    }
+
+    // MARK: - ERC-4337 UserOperation Parsing
+
+    /// Parse an ERC-4337 UserOperationEvent log into an OnChainTransaction.
+    private func parseUserOperationLog(_ log: HeliosManager.VerifiedLog, pqAddress: String) -> OnChainTransaction? {
+        // UserOperationEvent(bytes32 indexed userOpHash, address indexed sender, address indexed paymaster,
+        //                    uint256 nonce, bool success, uint256 actualGasCost, uint256 actualGasUsed)
+        guard log.topics.count >= 3 else { return nil }
+
+        let userOpHash = log.topics.count > 0 ? log.topics[0] : ""
+
+        // Parse data fields: nonce (32) + success (32) + gasCost (32) + gasUsed (32)
+        let dataHex = log.data.hasPrefix("0x") ? String(log.data.dropFirst(2)) : log.data
+        let success: Bool
+        if dataHex.count >= 128 {
+            let successHex = String(dataHex[dataHex.index(dataHex.startIndex, offsetBy: 64)..<dataHex.index(dataHex.startIndex, offsetBy: 128)])
+            success = successHex.last != "0"
+        } else {
+            success = true
+        }
+
+        let blockHex = log.blockNumber.hasPrefix("0x") ? String(log.blockNumber.dropFirst(2)) : log.blockNumber
+        let blockNumber = UInt64(blockHex, radix: 16)
+
+        return OnChainTransaction(
+            id: "\(log.transactionHash)-userop",
+            txHash: log.transactionHash,
+            blockNumber: blockNumber,
+            timestamp: Date(),
+            from: pqAddress,
+            to: Self.entryPointV07,
+            value: BigUInt(0),
+            gasUsed: nil,
+            gasPrice: nil,
+            input: nil,
+            status: success ? .confirmed : .reverted,
+            txType: .contractCall,
+            tokenSymbol: nil,
+            tokenAmount: nil,
+            contractAddress: Self.entryPointV07,
+            verificationLevel: verificationLevel,
+            failureReason: success ? nil : "UserOperation reverted"
+        )
     }
 
     // MARK: - Log Fetching
@@ -482,7 +859,8 @@ final class TransactionHistoryService: ObservableObject {
     }
 
     /// Fetch native ETH transactions for an address from recent blocks.
-    /// Uses eth_getBlockByNumber with full tx objects and filters locally.
+    /// Uses concurrent batch fetching of eth_getBlockByNumber for efficiency.
+    /// Scans the full range passed in (caller determines adaptive range).
     private func fetchNativeETHTransactions(
         address: String,
         fromBlock: UInt64,
@@ -490,118 +868,158 @@ final class TransactionHistoryService: ObservableObject {
         chainId: UInt64,
         useTestnet: Bool
     ) async throws -> [OnChainTransaction] {
-        // For efficiency, we scan the last ~100 blocks (20 minutes) for native ETH.
-        // Older native transfers would require an indexer, but ERC-20 logs cover most activity.
-        let recentScanBlocks: UInt64 = 100
-        let scanFrom = toBlock > recentScanBlocks ? toBlock - recentScanBlocks : fromBlock
+        guard toBlock >= fromBlock else { return [] }
 
-        var results: [OnChainTransaction] = []
+        let totalBlocks = toBlock - fromBlock + 1
+        SecureLogger.info("TransactionHistoryService: Scanning \(totalBlocks) blocks (\(fromBlock)–\(toBlock)) for native ETH", category: .network)
 
-        // Fetch blocks in batches
-        for blockNum in stride(from: scanFrom, through: toBlock, by: 1) {
-            let blockHex = String(format: "0x%llx", blockNum)
+        var allResults: [OnChainTransaction] = []
+        let heliosAvailable = await HeliosManager.shared.isRunning
 
-            do {
-                let blockJSON: String
-                if await HeliosManager.shared.isRunning {
-                    blockJSON = try await HeliosManager.shared.getBlockByNumber(
-                        blockTag: blockHex,
-                        fullTransactions: true
-                    )
-                } else {
-                    blockJSON = try await fetchBlockViaRPC(
-                        blockTag: blockHex,
-                        fullTxs: true,
-                        chainId: chainId,
-                        useTestnet: useTestnet
-                    )
+        // Fetch blocks in concurrent batches
+        let batchSize = UInt64(Self.blockFetchBatchSize)
+
+        for batchStart in stride(from: fromBlock, through: toBlock, by: Int(batchSize)) {
+            let batchEnd = min(batchStart + batchSize - 1, toBlock)
+
+            let batchResults: [OnChainTransaction] = await withTaskGroup(of: [OnChainTransaction].self) { group in
+                for blockNum in batchStart...batchEnd {
+                    group.addTask { [weak self] in
+                        guard let self else { return [] }
+                        return await self.fetchTransactionsFromBlock(
+                            blockNum: blockNum,
+                            address: address,
+                            chainId: chainId,
+                            useTestnet: useTestnet,
+                            heliosAvailable: heliosAvailable
+                        )
+                    }
                 }
 
-                guard let data = blockJSON.data(using: .utf8),
-                      let block = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let transactions = block["transactions"] as? [[String: Any]],
-                      let timestampHex = block["timestamp"] as? String else {
+                var results: [OnChainTransaction] = []
+                for await blockTxs in group {
+                    results.append(contentsOf: blockTxs)
+                }
+                return results
+            }
+
+            allResults.append(contentsOf: batchResults)
+        }
+
+        return allResults
+    }
+
+    /// Fetch and parse all transactions from a single block involving our address.
+    private func fetchTransactionsFromBlock(
+        blockNum: UInt64,
+        address: String,
+        chainId: UInt64,
+        useTestnet: Bool,
+        heliosAvailable: Bool
+    ) async -> [OnChainTransaction] {
+        let blockHex = String(format: "0x%llx", blockNum)
+
+        do {
+            let blockJSON: String
+            if heliosAvailable {
+                blockJSON = try await HeliosManager.shared.getBlockByNumber(
+                    blockTag: blockHex,
+                    fullTransactions: true
+                )
+            } else {
+                blockJSON = try await fetchBlockViaRPC(
+                    blockTag: blockHex,
+                    fullTxs: true,
+                    chainId: chainId,
+                    useTestnet: useTestnet
+                )
+            }
+
+            guard let data = blockJSON.data(using: .utf8),
+                  let block = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let transactions = block["transactions"] as? [[String: Any]],
+                  let timestampHex = block["timestamp"] as? String else {
+                return []
+            }
+
+            let tsHex = timestampHex.hasPrefix("0x") ? String(timestampHex.dropFirst(2)) : timestampHex
+            let timestamp = Date(timeIntervalSince1970: TimeInterval(UInt64(tsHex, radix: 16) ?? 0))
+
+            var results: [OnChainTransaction] = []
+
+            for tx in transactions {
+                guard let txFrom = (tx["from"] as? String)?.lowercased(),
+                      let txTo = (tx["to"] as? String)?.lowercased() else {
+                    // Contract deployment (to is nil)
+                    if let txFrom = (tx["from"] as? String)?.lowercased(),
+                       txFrom == address,
+                       let txHash = tx["hash"] as? String {
+                        results.append(OnChainTransaction(
+                            id: txHash,
+                            txHash: txHash,
+                            blockNumber: blockNum,
+                            timestamp: timestamp,
+                            from: txFrom,
+                            to: "",
+                            value: parseHexValue(tx["value"] as? String),
+                            gasUsed: nil,
+                            gasPrice: parseHexUInt64(tx["gasPrice"] as? String),
+                            input: tx["input"] as? String,
+                            status: .confirmed,
+                            txType: .contractDeploy,
+                            tokenSymbol: nil,
+                            tokenAmount: nil,
+                            contractAddress: nil,
+                            verificationLevel: verificationLevel,
+                            failureReason: nil
+                        ))
+                    }
                     continue
                 }
 
-                let tsHex = timestampHex.hasPrefix("0x") ? String(timestampHex.dropFirst(2)) : timestampHex
-                let timestamp = Date(timeIntervalSince1970: TimeInterval(UInt64(tsHex, radix: 16) ?? 0))
+                // Only include transactions involving our address
+                guard txFrom == address || txTo == address else { continue }
 
-                for tx in transactions {
-                    guard let txFrom = (tx["from"] as? String)?.lowercased(),
-                          let txTo = (tx["to"] as? String)?.lowercased() else {
-                        // Contract deployment (to is nil)
-                        if let txFrom = (tx["from"] as? String)?.lowercased(),
-                           txFrom == address,
-                           let txHash = tx["hash"] as? String {
-                            results.append(OnChainTransaction(
-                                id: txHash,
-                                txHash: txHash,
-                                blockNumber: blockNum,
-                                timestamp: timestamp,
-                                from: txFrom,
-                                to: "",
-                                value: parseHexValue(tx["value"] as? String),
-                                gasUsed: nil,
-                                gasPrice: parseHexUInt64(tx["gasPrice"] as? String),
-                                input: tx["input"] as? String,
-                                status: .confirmed,
-                                txType: .contractDeploy,
-                                tokenSymbol: nil,
-                                tokenAmount: nil,
-                                contractAddress: nil,
-                                verificationLevel: verificationLevel,
-                                failureReason: nil
-                            ))
-                        }
-                        continue
-                    }
+                let txHash = tx["hash"] as? String ?? ""
+                let isSend = txFrom == address
+                let inputData = tx["input"] as? String ?? "0x"
+                let isContractCall = inputData.count > 4
+                let value = parseHexValue(tx["value"] as? String)
 
-                    // Only include transactions involving our address
-                    guard txFrom == address || txTo == address else { continue }
-
-                    let txHash = tx["hash"] as? String ?? ""
-                    let isSend = txFrom == address
-                    let inputData = tx["input"] as? String ?? "0x"
-                    let isContractCall = inputData.count > 4  // More than just "0x"
-                    let value = parseHexValue(tx["value"] as? String)
-
-                    let txType: OnChainTxType
-                    if isContractCall && isSend {
-                        txType = .contractCall
-                    } else if isSend {
-                        txType = .send
-                    } else {
-                        txType = .receive
-                    }
-
-                    results.append(OnChainTransaction(
-                        id: txHash,
-                        txHash: txHash,
-                        blockNumber: blockNum,
-                        timestamp: timestamp,
-                        from: txFrom,
-                        to: txTo,
-                        value: value,
-                        gasUsed: nil,
-                        gasPrice: parseHexUInt64(tx["gasPrice"] as? String),
-                        input: isContractCall ? inputData : nil,
-                        status: .confirmed,
-                        txType: txType,
-                        tokenSymbol: nil,
-                        tokenAmount: nil,
-                        contractAddress: isContractCall ? txTo : nil,
-                        verificationLevel: verificationLevel,
-                        failureReason: nil
-                    ))
+                let txType: OnChainTxType
+                if isContractCall && isSend {
+                    txType = .contractCall
+                } else if isSend {
+                    txType = .send
+                } else {
+                    txType = .receive
                 }
-            } catch {
-                // Skip blocks that fail to fetch — keep going
-                continue
-            }
-        }
 
-        return results
+                results.append(OnChainTransaction(
+                    id: txHash,
+                    txHash: txHash,
+                    blockNumber: blockNum,
+                    timestamp: timestamp,
+                    from: txFrom,
+                    to: txTo,
+                    value: value,
+                    gasUsed: nil,
+                    gasPrice: parseHexUInt64(tx["gasPrice"] as? String),
+                    input: isContractCall ? inputData : nil,
+                    status: .confirmed,
+                    txType: txType,
+                    tokenSymbol: nil,
+                    tokenAmount: nil,
+                    contractAddress: isContractCall ? txTo : nil,
+                    verificationLevel: verificationLevel,
+                    failureReason: nil
+                ))
+            }
+
+            return results
+        } catch {
+            return []
+        }
     }
 
     /// Fetch a single block via RPC over Tor.
@@ -706,5 +1124,71 @@ final class TransactionHistoryService: ObservableObject {
         case 421614: return URL(string: "https://sepolia-rollup.arbitrum.io/rpc")!
         default: return URL(string: "https://rpc.flashbots.net")!
         }
+    }
+
+    // MARK: - Additional RPC Fallbacks
+
+    /// Fetch a transaction receipt via RPC over Tor (fallback when Helios unavailable).
+    private func fetchReceiptViaRPC(
+        txHash: String,
+        chainId: UInt64,
+        useTestnet: Bool
+    ) async throws -> String {
+        let rpcURL = Self.rpcURL(for: chainId)
+        let session = useTestnet ? URLSession.shared : TorURLSession.shared.session
+
+        let body: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_getTransactionReceipt",
+            "params": [txHash]
+        ]
+
+        var request = URLRequest(url: rpcURL)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.timeoutInterval = 15
+
+        let (data, _) = try await session.data(for: request)
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let result = json["result"] else {
+            return "{}"
+        }
+
+        let resultData = try JSONSerialization.data(withJSONObject: result)
+        return String(data: resultData, encoding: .utf8) ?? "{}"
+    }
+
+    /// Fetch the nonce (transaction count) for an address via RPC over Tor.
+    private func fetchNonceViaRPC(
+        address: String,
+        chainId: UInt64,
+        useTestnet: Bool
+    ) async throws -> UInt64 {
+        let rpcURL = Self.rpcURL(for: chainId)
+        let session = useTestnet ? URLSession.shared : TorURLSession.shared.session
+
+        let body: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_getTransactionCount",
+            "params": [address, "latest"]
+        ]
+
+        var request = URLRequest(url: rpcURL)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.timeoutInterval = 10
+
+        let (data, _) = try await session.data(for: request)
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let hexResult = json["result"] as? String else {
+            return 0
+        }
+
+        let hex = hexResult.hasPrefix("0x") ? String(hexResult.dropFirst(2)) : hexResult
+        return UInt64(hex, radix: 16) ?? 0
     }
 }

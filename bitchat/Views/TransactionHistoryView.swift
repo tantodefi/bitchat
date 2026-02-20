@@ -16,6 +16,8 @@ struct TransactionHistoryView: View {
     let balanceService: EthereumBalanceService
     /// The address to filter transactions for (EOA or PQ account address).
     let filterAddress: String
+    /// Optional PQ smart account address for scanning ERC-4337 UserOp events.
+    var pqAddress: String? = nil
 
     @Environment(\.dismiss) private var dismiss
     @StateObject private var historyService = TransactionHistoryService()
@@ -175,9 +177,16 @@ struct TransactionHistoryView: View {
             Text("Fetching transaction history…")
                 .font(.subheadline)
                 .foregroundColor(.secondary)
-            Text("Scanning blocks via Helios over Tor")
-                .font(.caption)
-                .foregroundColor(.secondary.opacity(0.7))
+            if !historyService.discoveryProgress.isEmpty {
+                Text(historyService.discoveryProgress)
+                    .font(.caption)
+                    .foregroundColor(.secondary.opacity(0.7))
+                    .transition(.opacity)
+            } else {
+                Text("Scanning blocks via Helios over Tor")
+                    .font(.caption)
+                    .foregroundColor(.secondary.opacity(0.7))
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -243,7 +252,8 @@ struct TransactionHistoryView: View {
             for: filterAddress,
             meshRelay: meshRelay,
             chainId: chainId,
-            useTestnet: useTestnet
+            useTestnet: useTestnet,
+            pqAddress: pqAddress
         )
     }
 

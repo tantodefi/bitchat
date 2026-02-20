@@ -424,6 +424,24 @@ final class PQAccountViewModel: ObservableObject {
             if let idx = chainStatuses.firstIndex(where: { $0.chain.chainId == chain.chainId }) {
                 chainStatuses[idx].txHash = txHash
             }
+
+            // Persist deploy tx hash to TransactionStore
+            if let address = accountAddress {
+                TransactionStore.shared.record(
+                    CachedTransaction(
+                        id: txHash,
+                        txHash: txHash,
+                        from: address.lowercased(),
+                        to: "",
+                        value: "0x0",
+                        timestamp: Date(),
+                        blockNumber: nil,
+                        chainId: chain.chainId,
+                        source: .pqDeploy
+                    ),
+                    for: address
+                )
+            }
             
             // Poll for deployment confirmation
             if let address = accountAddress {
@@ -496,6 +514,25 @@ final class PQAccountViewModel: ObservableObject {
             )
             lastTransactionHash = hash
             isProcessingTransaction = false
+
+            // Persist to TransactionStore so it appears in history after restart
+            if let address = accountAddress, let hash {
+                TransactionStore.shared.record(
+                    CachedTransaction(
+                        id: hash,
+                        txHash: hash,
+                        from: address.lowercased(),
+                        to: dest.lowercased(),
+                        value: String(format: "0x%llx", value),
+                        timestamp: Date(),
+                        blockNumber: nil,
+                        chainId: chain.chainId,
+                        source: .pqAccount
+                    ),
+                    for: address
+                )
+            }
+
             return hash
         } catch {
             lastError = error.localizedDescription
@@ -533,6 +570,25 @@ final class PQAccountViewModel: ObservableObject {
             )
             lastTransactionHash = receipt.userOpHash
             isProcessingTransaction = false
+
+            // Persist to TransactionStore so it appears in history after restart
+            if let address = accountAddress {
+                TransactionStore.shared.record(
+                    CachedTransaction(
+                        id: receipt.userOpHash,
+                        txHash: receipt.userOpHash,
+                        from: address.lowercased(),
+                        to: dest.lowercased(),
+                        value: String(format: "0x%llx", value),
+                        timestamp: Date(),
+                        blockNumber: nil,
+                        chainId: chain.chainId,
+                        source: .pqAccount
+                    ),
+                    for: address
+                )
+            }
+
             return receipt.success
         } catch {
             lastError = error.localizedDescription
