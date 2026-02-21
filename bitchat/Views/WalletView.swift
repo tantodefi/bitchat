@@ -119,10 +119,11 @@ struct WalletView: View {
                 }
                 
                 // MARK: - Loading / Error
-                if isLoading {
+                if isLoading && displayAddress.isEmpty {
                     ProgressView("Loading wallet...")
                         .padding()
-                } else if let error = loadError {
+                }
+                if let error = loadError {
                     errorSection(error)
                 }
                 
@@ -132,27 +133,27 @@ struct WalletView: View {
                 }
                 
                 // MARK: - Actions
-                if !displayAddress.isEmpty && !isLoading {
+                if !displayAddress.isEmpty {
                     actionsSection
                 }
                 
                 // MARK: - Stealth Addresses (EOA only)
-                if activeAccountMode == .eoa && !address.isEmpty && !isLoading {
+                if activeAccountMode == .eoa && !address.isEmpty {
                     stealthSection
                 }
                 
                 // MARK: - Stealth PQ Accounts (PQ mode)
-                if activeAccountMode == .pqAccount && pqViewModel.state.isDeployed && !isLoading {
+                if activeAccountMode == .pqAccount && pqViewModel.state.isDeployed {
                     pqStealthSection
                 }
                 
                 // MARK: - PQ Account Settings (PQ mode)
-                if activeAccountMode == .pqAccount && !isLoading {
+                if activeAccountMode == .pqAccount {
                     pqSettingsSection
                 }
                 
                 // MARK: - Cross-Chain Swaps (EOA only)
-                if activeAccountMode == .eoa && !address.isEmpty && !isLoading {
+                if activeAccountMode == .eoa && !address.isEmpty {
                     crossChainSection
                 }
             }
@@ -163,27 +164,54 @@ struct WalletView: View {
         .navigationBarTitleDisplayMode(.inline)
         #endif
         .task {
-            // Single coordinated startup flow:
-            // 1. Load EOA address
-            // 2. Init PQ if configured
-            // 3. Fetch balances for the correct address
-            // 4. Start auto-refresh
+            // Coordinated startup flow — designed to show cached data
+            // immediately so the wallet is usable offline:
+            // 1. Load EOA address (local keychain, instant)
+            // 2. Restore PQ cached state (local, instant)
+            // 3. Load cached balances and stop blocking the UI
+            // 4. Run PQ network init + balance fetches in background
             await loadWallet()
             
-            // Initialize PQ account (if configured)
+            // Configure PQ view model and restore cached state immediately
+            // (before initializeKeys, which may need network)
             if XMTPServiceContainer.isConfigured {
                 let container = XMTPServiceContainer.shared
                 pqViewModel.configure(
                     pqKeyManager: container.pqKeyManager,
                     chainServiceSets: Array(container.pqChainServices.values)
                 )
-                await pqViewModel.initializeKeys(from: wallet)
+                // Restore cached PQ address so displayAddress works immediately
+                // for users in PQ mode even before initializeKeys completes.
+                pqViewModel.restoreCachedAddressIfNeeded()
             }
             
-            // Create the stealth PQ view model once container services are available
+            // Load cached balances immediately so the UI isn't empty
+            let earlyAddress = displayAddress
+            if !earlyAddress.isEmpty {
+                currentFetchAddress = earlyAddress
+                balanceService.loadCachedBalances(for: earlyAddress)
+            }
+            
+            // ── UI is now unblocked — address + cached balances are available ──
+            isLoading = false
+            
+            // ── Background: PQ network initialization ──
+            if XMTPServiceContainer.isConfigured {
+                await pqViewModel.initializeKeys(from: wallet)
+                
+                // After PQ init the displayAddress may change (e.g. PQ address
+                // computed for first time). Re-sync if needed.
+                let postPQAddress = displayAddress
+                if !postPQAddress.isEmpty && postPQAddress != currentFetchAddress {
+                    currentFetchAddress = postPQAddress
+                    balanceService.clearBalances()
+                    balanceService.loadCachedBalances(for: postPQAddress)
+                }
+            }
+            
+            // ── Background: Stealth PQ view model ──
             if stealthPQViewModel == nil, XMTPServiceContainer.isConfigured {
                 let container = XMTPServiceContainer.shared
-                // Use the Arbitrum Sepolia chain service set (default chain for stealth PQ)
                 let arbSepolia = StealthPQAccountManager.defaultChain.chainId
                 if let chainSet = container.pqChainServices[arbSepolia] {
                     let manager = StealthPQAccountManager(
@@ -201,18 +229,11 @@ struct WalletView: View {
                 }
             }
             
-            // Now fetch balances for whichever address is active.
-            // displayAddress returns PQ address if in PQ mode and PQ init
-            // succeeded, otherwise the EOA address.
+            // ── Background: Fetch fresh balances from network ──
             let targetAddress = displayAddress
-            guard !targetAddress.isEmpty else {
-                isLoading = false
-                return
-            }
+            guard !targetAddress.isEmpty else { return }
             currentFetchAddress = targetAddress
-            balanceService.clearBalances()
             await balanceService.fetchBalances(for: targetAddress)
-            isLoading = false
             
             // Auto-refresh balances periodically
             while !Task.isCancelled {
@@ -239,6 +260,9 @@ struct WalletView: View {
             // clearBalances() also bumps the fetch generation, which makes
             // any still-running fetchBalances() discard its remaining results.
             balanceService.clearBalances()
+            // Immediately load cached balances for the new address so the UI
+            // doesn't flash empty while the network fetch runs.
+            balanceService.loadCachedBalances(for: newAddress)
             balanceFetchTask = Task {
                 // Re-check after potential suspension
                 guard !Task.isCancelled, displayAddress == newAddress else { return }

@@ -160,6 +160,21 @@ final class PQAccountViewModel: ObservableObject {
     
     // MARK: - Configuration
     
+    /// Immediately restore cached PQ account address and deployment state
+    /// so that `displayAddress` works for PQ-mode users without network.
+    /// Call after `configure()` but before `initializeKeys()`.
+    func restoreCachedAddressIfNeeded() {
+        guard accountAddress == nil else { return }
+        if let cached = Self.loadPersistedAccountAddress() {
+            accountAddress = cached
+            // If any chain was persisted as deployed, honour that state
+            if chainStatuses.contains(where: { $0.isDeployed }) {
+                state = .deployed(cached)
+            }
+            SecureLogger.info("PQ address restored from cache early (pre-init)", category: .session)
+        }
+    }
+    
     /// Configure with PQ service dependencies.
     /// Call after XMTPServiceContainer initializes PQ services.
     /// Only pqKeyManager is required; per-chain services are optional

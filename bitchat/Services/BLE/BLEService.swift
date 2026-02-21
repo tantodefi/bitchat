@@ -4042,6 +4042,10 @@ extension BLEService {
                 self.delegate?.didConnectToPeer(peerID)
                 // Schedule initial unicast sync to this peer
                 self.gossipSyncManager?.scheduleInitialSyncToPeer(peerID, delaySeconds: 1.0)
+                
+                // Notify MeshTransactionRelay that a BLE peer connected —
+                // triggers immediate retry of any queued transactions.
+                NotificationCenter.default.post(name: MeshTransactionRelay.peerConnectedNotification, object: peerID)
             }
             
             self.requestPeerDataPublish()

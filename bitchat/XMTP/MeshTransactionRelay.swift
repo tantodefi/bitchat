@@ -122,9 +122,20 @@ final class MeshTransactionRelay: ObservableObject {
     
     // MARK: - Initialization
     
+    /// Posted by BLEService when a new BLE mesh peer connects or reconnects.
+    /// MeshTransactionRelay observes this to immediately attempt queued tx relay.
+    static let peerConnectedNotification = Notification.Name("MeshTransactionRelay.peerConnected")
+    
     init(keychain: KeychainManagerProtocol) {
         self.keychain = keychain
-        self.allowMeshRelay = UserDefaults.standard.bool(forKey: "mesh-tx-relay-enabled")
+        // Default to true (enabled) on first launch so mesh relay works out of the box.
+        // UserDefaults.bool(forKey:) returns false for missing keys, so check explicitly.
+        if UserDefaults.standard.object(forKey: "mesh-tx-relay-enabled") != nil {
+            self.allowMeshRelay = UserDefaults.standard.bool(forKey: "mesh-tx-relay-enabled")
+        } else {
+            self.allowMeshRelay = true
+            UserDefaults.standard.set(true, forKey: "mesh-tx-relay-enabled")
+        }
         migrateFromLegacyStorage()
         loadPendingRelays()
         loadConfirmedTransactions()
@@ -137,6 +148,9 @@ final class MeshTransactionRelay: ObservableObject {
         
         // Monitor network connectivity changes to immediately retry queued txs
         startNetworkMonitor()
+        
+        // Monitor BLE peer connections to immediately retry via mesh
+        startBLEPeerObserver()
     }
     
     /// Start NWPathMonitor to detect when device regains connectivity.
@@ -155,6 +169,24 @@ final class MeshTransactionRelay: ObservableObject {
             }
         }
         pathMonitor.start(queue: monitorQueue)
+    }
+    
+    /// Observe BLE peer connections. When a new peer appears on the mesh,
+    /// immediately attempt to relay any queued transactions through them.
+    private var peerObserver: NSObjectProtocol?
+    
+    private func startBLEPeerObserver() {
+        peerObserver = NotificationCenter.default.addObserver(
+            forName: Self.peerConnectedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self = self else { return }
+            let queued = self.pendingRelays.filter { $0.status == .queued }
+            guard !queued.isEmpty else { return }
+            SecureLogger.info("📡 BLE peer connected — retrying \(queued.count) queued tx(s) via mesh", category: .session)
+            self.retryNow()
+        }
     }
     
     func configure(bleService: BLEService?) {
@@ -1030,8 +1062,19 @@ final class MeshTransactionRelay: ObservableObject {
         }
     }
     
-    /// Manually trigger retry (e.g., when network becomes available)
+    /// Track last retry to debounce rapid-fire triggers (peer connect + network restore)
+    private var lastRetryAt: Date = .distantPast
+    private let retryDebounceInterval: TimeInterval = 3 // At most one retry every 3 seconds
+    
+    /// Manually trigger retry (e.g., when network becomes available or BLE peer connects).
+    /// Debounced to avoid concurrent retries from overlapping triggers.
     func retryNow() {
+        let now = Date()
+        guard now.timeIntervalSince(lastRetryAt) >= retryDebounceInterval else {
+            SecureLogger.debug("🔄 Retry debounced (last retry \(String(format: "%.1f", now.timeIntervalSince(lastRetryAt)))s ago)", category: .session)
+            return
+        }
+        lastRetryAt = now
         Task {
             await retryQueuedTransactions()
         }

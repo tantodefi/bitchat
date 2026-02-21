@@ -227,6 +227,15 @@ final class TransactionHistoryService: ObservableObject {
         }
         store.recordBatch(newLocalCached, for: normalizedAddr)
 
+        // Publish cached + local transactions immediately so the UI shows
+        // data right away even when offline. Network steps below will update.
+        do {
+            var seen = Set<String>()
+            transactions = allTxs
+                .sorted { $0.timestamp > $1.timestamp }
+                .filter { seen.insert($0.id).inserted }
+        }
+
         // ── Step 3: Fetch verified receipts for all known tx hashes ──
         discoveryProgress = "Verifying known transactions…"
         let allKnownHashes = cachedHashes.union(Set(localTxs.compactMap { $0.txHash?.lowercased() }))
