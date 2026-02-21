@@ -238,9 +238,9 @@ struct UserOperationBuilder {
         let recoverySignature = try privKey.signature(for: digest)
         let compact = try recoverySignature.compactRepresentation
         
-        // r(32) || s(32) || v(1)
+        // r(32) || s(32) || v(1) where v = recoveryId + 27 for Solidity ecrecover
         var fullSignature = compact.signature  // 64 bytes
-        fullSignature.append(UInt8(compact.recoveryId))
+        fullSignature.append(UInt8(compact.recoveryId) + 27)
         
         return fullSignature  // 65 bytes
     }
@@ -286,7 +286,7 @@ struct UserOperationBuilder {
         let recoverySignature = try privKey.signature(for: digest)
         let compact = try recoverySignature.compactRepresentation
         var ecdsaSig = compact.signature // 64 bytes
-        ecdsaSig.append(UInt8(compact.recoveryId))
+        ecdsaSig.append(UInt8(compact.recoveryId) + 27)
         
         // 2. ML-DSA-44 sign with master PQ key (shared across all stealth accounts)
         let mldsaSig = try await pqKeyManager.sign(message: userOpHash)
