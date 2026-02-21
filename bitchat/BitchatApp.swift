@@ -71,6 +71,11 @@ struct BitchatApp: App {
                     // Initialize network activation policy; will start Tor/Nostr only when allowed
                     NetworkActivationService.shared.start()
                     
+                    // Warm up HeliosManager so its .TorDidBecomeReady observer
+                    // is registered before Tor finishes bootstrapping.
+                    // The actual start happens when the notification fires.
+                    _ = HeliosManager.shared
+                    
                     // Start presence service (will wait for Tor readiness)
                     GeohashPresenceService.shared.start()
                     

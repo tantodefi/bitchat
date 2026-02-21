@@ -196,7 +196,6 @@ public final class HeliosManager: ObservableObject {
                 ]
             case .sepolia:
                 return [
-                    "https://sepolia.beaconstate.info/eth/v1/beacon/headers/finalized",
                     "https://lodestar-sepolia.chainsafe.io/eth/v1/beacon/headers/finalized",
                     "https://ethereum-sepolia-beacon-api.publicnode.com/eth/v1/beacon/headers/finalized",
                 ]
@@ -303,6 +302,10 @@ public final class HeliosManager: ObservableObject {
     /// When Tor becomes ready (SOCKS5 proxy available), Helios will
     /// automatically start with the Tor proxy configured. This ensures
     /// all upstream Helios requests are IP-private from the start.
+    ///
+    /// Also performs a catch-up check: if Tor is already ready by the
+    /// time this singleton is first accessed, the notification was missed
+    /// so we start Helios immediately.
     private func setupTorAutoStart() {
         #if HELIOS_FFI_AVAILABLE
         torReadyObserver = NotificationCenter.default.addObserver(
@@ -312,7 +315,18 @@ public final class HeliosManager: ObservableObject {
         ) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
+                // Reset flag so this notification always triggers a fresh attempt
+                self.autoStartAttempted = false
                 await self.autoStartIfNeeded()
+            }
+        }
+
+        // Catch-up: If Tor is already ready (notification fired before we
+        // registered), start immediately. This handles the race where the
+        // singleton is first accessed after Tor has already bootstrapped.
+        if TorManager.shared.isReady {
+            Task { @MainActor [weak self] in
+                await self?.autoStartIfNeeded()
             }
         }
         #endif
@@ -323,12 +337,24 @@ public final class HeliosManager: ObservableObject {
     /// When Tor becomes ready, attempts to start Helios via the Tor proxy.
     /// On sync failure, retries once with a different consensus endpoint
     /// and schedules a background retry for later.
+    ///
+    /// If Tor is not ready, returns immediately WITHOUT setting
+    /// `autoStartAttempted`, so a future `.TorDidBecomeReady` notification
+    /// can still trigger a fresh attempt.
     private func autoStartIfNeeded() async {
         guard !autoStartAttempted else { return }
-        autoStartAttempted = true
-
         guard !isRunning else { return }
         guard isFFIAvailable else { return }
+
+        // Only proceed if Tor is actually ready — otherwise we'd try to
+        // route through a non-existent SOCKS proxy and fail. Don't set
+        // autoStartAttempted so the Tor notification can trigger us later.
+        guard TorManager.shared.isReady else {
+            SecureLogger.debug("HeliosManager: autoStartIfNeeded skipped — Tor not ready yet", category: .network)
+            return
+        }
+
+        autoStartAttempted = true
 
         // Detect testnet/mainnet from the user's wallet preference
         let useTestnet = UserDefaults.standard.object(forKey: "wallet-use-testnet") != nil
@@ -388,8 +414,13 @@ public final class HeliosManager: ObservableObject {
     
     /// Public method to restart Helios if it's not running.
     /// Call from wallet view or any UI that needs Helios.
+    /// Safe to call early (before Tor is ready) — will no-op and the
+    /// `.TorDidBecomeReady` notification will trigger Helios later.
     public func restartIfNeeded() {
         guard !isRunning, isFFIAvailable else { return }
+        // Don't reset autoStartAttempted unless Tor is ready — otherwise
+        // we'd waste the flag and block the Tor notification handler.
+        guard TorManager.shared.isReady else { return }
         autoStartAttempted = false
         Task { @MainActor [weak self] in
             await self?.autoStartIfNeeded()

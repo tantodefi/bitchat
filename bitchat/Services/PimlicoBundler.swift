@@ -191,7 +191,7 @@ actor PimlicoBundler {
     private func userOpToDict(_ op: PackedUserOperation) -> [String: Any] {
         var dict: [String: Any] = [
             "sender": ABIEncoder.dataToHex(op.sender, prefixed: true),
-            "nonce": ABIEncoder.dataToHex(op.nonce, prefixed: true),
+            "nonce": unpackUInt256Hex(op.nonce),  // Minimal hex — bundler rejects padded uint256
             "callData": ABIEncoder.dataToHex(op.callData, prefixed: true),
             "signature": ABIEncoder.dataToHex(op.signature, prefixed: true),
         ]
@@ -204,8 +204,8 @@ actor PimlicoBundler {
             dict["callGasLimit"] = cgl
         }
         
-        // preVerificationGas as hex string
-        dict["preVerificationGas"] = ABIEncoder.dataToHex(op.preVerificationGas, prefixed: true)
+        // preVerificationGas as minimal hex string (strip leading zeros)
+        dict["preVerificationGas"] = unpackUInt256Hex(op.preVerificationGas)
         
         // Unpack gasFees (32 bytes) → maxPriorityFeePerGas (upper 16) + maxFeePerGas (lower 16)
         if op.gasFees.count == 32 {

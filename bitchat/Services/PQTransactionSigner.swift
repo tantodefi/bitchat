@@ -183,17 +183,20 @@ actor PQTransactionSigner {
         
         SecureLogger.info("PQ UserOp gas: maxFee=\(maxFee / 1_000_000_000)gwei, priority=\(priorityFee / 1_000_000_000)gwei", category: .session)
         
-        // Build initial UserOp with placeholder gas limits (bundler will estimate)
+        // Build initial UserOp with HIGH placeholder gas limits for estimation.
+        // ML-DSA-44 on-chain verification is extremely gas-intensive (~2–10M gas)
+        // so verificationGasLimit must be large enough for the bundler's simulation
+        // to complete without OOG (which surfaces as AA24 "signature validation failed").
         var userOp = PackedUserOperation(
             sender: ABIEncoder.hexToData(String(sender.dropFirst(2))),
             nonce: nonce,
             initCode: initCode,
             callData: executeCalldata,
             accountGasLimits: UserOperationBuilder.packAccountGasLimits(
-                verificationGasLimit: UInt64(500_000),
-                callGasLimit: UInt64(200_000)
+                verificationGasLimit: UInt64(10_000_000),
+                callGasLimit: UInt64(1_000_000)
             ),
-            preVerificationGas: UInt64(100_000),
+            preVerificationGas: UInt64(500_000),
             gasFees: UserOperationBuilder.packGasFees(
                 maxPriorityFeePerGas: priorityFee,
                 maxFeePerGas: maxFee
@@ -209,23 +212,34 @@ actor PQTransactionSigner {
         // Estimate gas
         let gasEstimate = try await bundler.estimateUserOperationGas(userOp: userOp)
         
-        // Update gas values
-        userOp.accountGasLimits = UserOperationBuilder.packAccountGasLimits(
-            verificationGasLimit: gasEstimate.verificationGasLimit,
-            callGasLimit: gasEstimate.callGasLimit
+        // Apply 1.2x safety multiplier — bundler estimates are tight minimums
+        // and ML-DSA-44 verification gas can vary slightly between runs.
+        let safeVerificationGas = gasEstimate.verificationGasLimit * 6 / 5
+        let safeCallGas = gasEstimate.callGasLimit * 6 / 5
+        let safePreVerificationGas = gasEstimate.preVerificationGas * 6 / 5
+        
+        SecureLogger.info(
+            "PQ gas estimate: vgl=\(gasEstimate.verificationGasLimit)→\(safeVerificationGas), cgl=\(gasEstimate.callGasLimit)→\(safeCallGas), pvg=\(gasEstimate.preVerificationGas)→\(safePreVerificationGas)",
+            category: .session
         )
-        userOp.preVerificationGas = PackedUserOperation.uint256Data(gasEstimate.preVerificationGas)
+        
+        // Update gas values with safety margin
+        userOp.accountGasLimits = UserOperationBuilder.packAccountGasLimits(
+            verificationGasLimit: safeVerificationGas,
+            callGasLimit: safeCallGas
+        )
+        userOp.preVerificationGas = PackedUserOperation.uint256Data(safePreVerificationGas)
         
         // Re-sign with correct gas values
         let finalSig = try await signUserOp(&userOp)
         userOp.signature = finalSig
         
-        // Cache gas values for offline fallback
+        // Cache gas values for offline fallback (use safe values with multiplier)
         saveGasCache(
             baseGasPrice: baseGasPrice,
-            verificationGasLimit: gasEstimate.verificationGasLimit,
-            callGasLimit: gasEstimate.callGasLimit,
-            preVerificationGas: gasEstimate.preVerificationGas,
+            verificationGasLimit: safeVerificationGas,
+            callGasLimit: safeCallGas,
+            preVerificationGas: safePreVerificationGas,
             nonce: nonce
         )
         
@@ -492,17 +506,17 @@ actor PQTransactionSigner {
             category: .session
         )
         
-        // Build UserOp
+        // Build UserOp — ML-DSA-44 on-chain verification needs ~2–10M gas
         var userOp = PackedUserOperation(
             sender: ABIEncoder.hexToData(String(sender.dropFirst(2))),
             nonce: nonce,
             initCode: initCode,
             callData: executeCalldata,
             accountGasLimits: UserOperationBuilder.packAccountGasLimits(
-                verificationGasLimit: UInt64(600_000), // Higher for deploy+sweep
-                callGasLimit: UInt64(200_000)
+                verificationGasLimit: UInt64(10_000_000), // High for ML-DSA-44 + deploy
+                callGasLimit: UInt64(1_000_000)
             ),
-            preVerificationGas: UInt64(150_000),
+            preVerificationGas: UInt64(500_000),
             gasFees: UserOperationBuilder.packGasFees(
                 maxPriorityFeePerGas: priorityFee,
                 maxFeePerGas: maxFee
@@ -518,12 +532,17 @@ actor PQTransactionSigner {
         // Estimate gas
         let gasEstimate = try await bundler.estimateUserOperationGas(userOp: userOp)
         
-        // Update gas values
+        // Apply 1.2x safety multiplier for ML-DSA-44 gas variance
+        let safeVerificationGas = gasEstimate.verificationGasLimit * 6 / 5
+        let safeCallGas = gasEstimate.callGasLimit * 6 / 5
+        let safePreVerificationGas = gasEstimate.preVerificationGas * 6 / 5
+        
+        // Update gas values with safety margin
         userOp.accountGasLimits = UserOperationBuilder.packAccountGasLimits(
-            verificationGasLimit: gasEstimate.verificationGasLimit,
-            callGasLimit: gasEstimate.callGasLimit
+            verificationGasLimit: safeVerificationGas,
+            callGasLimit: safeCallGas
         )
-        userOp.preVerificationGas = PackedUserOperation.uint256Data(gasEstimate.preVerificationGas)
+        userOp.preVerificationGas = PackedUserOperation.uint256Data(safePreVerificationGas)
         
         // Re-sign with correct gas values
         let finalSig = try await signStealthUserOp(&userOp, stealthPrivateKey: stealthPrivateKey)
