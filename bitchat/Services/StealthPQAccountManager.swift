@@ -153,7 +153,9 @@ actor StealthPQAccountManager {
         
         do {
             let data = try Data(contentsOf: url)
-            let decoded = try JSONDecoder().decode([StealthPQAccount].self, from: data)
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let decoded = try decoder.decode([StealthPQAccount].self, from: data)
             for account in decoded {
                 accounts[account.index] = account
             }
