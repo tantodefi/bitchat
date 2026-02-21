@@ -49,6 +49,9 @@ final class MeshTransactionRelay: ObservableObject {
     private let pathMonitor = NWPathMonitor()
     private let monitorQueue = DispatchQueue(label: "mesh-tx-network-monitor")
     
+    /// Fast network status from NWPathMonitor (updated instantly, no HTTP overhead)
+    private var networkPathSatisfied: Bool = false
+    
     /// App Group UserDefaults for persistence across reinstalls
     private var appGroupDefaults: UserDefaults {
         UserDefaults(suiteName: BitchatApp.groupID) ?? .standard
@@ -84,6 +87,8 @@ final class MeshTransactionRelay: ObservableObject {
         var relayedVia: String?
         var status: RelayStatus
         var retryCount: Int = 0
+        /// Timestamp of last status change (used for awaitingConfirmation timeout)
+        var statusChangedAt: Date = Date()
         /// Serialized TxUserOpPayload for PQ UserOp relays (nil for standard EOA txs)
         var userOpPayloadData: Data? = nil
     }
@@ -157,6 +162,9 @@ final class MeshTransactionRelay: ObservableObject {
     /// Immediately triggers `retryNow()` when the path becomes satisfied.
     private func startNetworkMonitor() {
         pathMonitor.pathUpdateHandler = { [weak self] path in
+            Task { @MainActor [weak self] in
+                self?.networkPathSatisfied = (path.status == .satisfied)
+            }
             guard path.status == .satisfied else { return }
             // Device just got connectivity — immediately retry queued transactions
             Task { @MainActor [weak self] in
@@ -217,31 +225,34 @@ final class MeshTransactionRelay: ObservableObject {
         }
     }
     
-    /// Attempt to relay a pending transaction
+    /// Attempt to relay a pending transaction.
+    /// Uses NWPathMonitor for instant offline detection — never blocks on HTTP when offline.
     private func attemptRelay(_ relay: PendingRelay) async {
-        // Always try direct broadcast first if we have internet
-        if await hasInternetConnectivity() {
-            SecureLogger.debug("Internet available, broadcasting tx directly", category: .session)
-            await broadcastTransaction(relay)
+        // Fast path: NWPathMonitor says we have network — try direct broadcast
+        if networkPathSatisfied {
+            // Verify with actual RPC call (path monitor can be optimistic)
+            if await hasInternetConnectivity() {
+                SecureLogger.debug("Internet available, broadcasting tx directly", category: .session)
+                await broadcastTransaction(relay)
+                return
+            }
+            // Path monitor said satisfied but RPC failed — fall through to BLE
+        }
+        
+        // No internet (or RPC unreachable) — try mesh relay via BLE first
+        if allowMeshRelay, let peerWithInternet = findRelayPeer() {
+            SecureLogger.debug("📡 No internet, relaying tx via BLE peer \(peerWithInternet.id.prefix(8))…", category: .session)
+            await relayViaMesh(relay, to: peerWithInternet)
             return
         }
         
-        // No internet - try mesh relay if enabled
-        guard allowMeshRelay else {
+        // No BLE peer either — keep in queue
+        if !allowMeshRelay {
             SecureLogger.debug("No internet and mesh relay disabled, keeping tx in queue for later", category: .session)
-            scheduleRetry()
-            return
-        }
-        
-        // Find a peer with internet for mesh relay
-        guard let peerWithInternet = findRelayPeer() else {
+        } else {
             SecureLogger.debug("No relay peer available for tx \(relay.id.prefix(8))…", category: .session)
-            scheduleRetry()
-            return
         }
-        
-        // Send via BLE mesh
-        await relayViaMesh(relay, to: peerWithInternet)
+        scheduleRetry()
     }
     
     /// Send transaction to a relay peer via BLE
@@ -354,6 +365,16 @@ final class MeshTransactionRelay: ObservableObject {
             // Remove from pending
             pendingRelays.remove(at: idx)
             savePendingRelays()
+            
+            // Update nonce cache so next offline TX uses correct nonce (nonce + 1).
+            // Without this, the sender reuses the same cached nonce → "nonce too low".
+            if let fromAddr = relay.payload.fromAddress?.lowercased() {
+                let nextNonce = relay.payload.nonce + 1
+                let nonceKey = "wallet-nonce-cache-\(fromAddr)-\(relay.payload.chainId)"
+                appGroupDefaults.set(Int(nextNonce), forKey: nonceKey)
+                appGroupDefaults.set(Date().timeIntervalSince1970, forKey: nonceKey + "-ts")
+                SecureLogger.info("🔢 Updated nonce cache for \(fromAddr.prefix(10))… chain \(relay.payload.chainId): \(relay.payload.nonce) → \(nextNonce)", category: .session)
+            }
         }
     }
     
@@ -414,30 +435,34 @@ final class MeshTransactionRelay: ObservableObject {
         }
     }
     
-    /// Attempt to submit a UserOp — direct to bundler if online, BLE mesh if offline
+    /// Attempt to submit a UserOp — direct to bundler if online, BLE mesh if offline.
+    /// Uses NWPathMonitor for instant offline detection — never blocks on HTTP when offline.
     private func attemptUserOpRelay(_ payload: TxUserOpPayload) async {
-        // Try direct bundler submission first
-        if await hasInternetConnectivity() {
-            SecureLogger.debug("Internet available, submitting UserOp directly to bundler", category: .session)
-            await submitUserOpToBundler(payload)
+        // Fast path: NWPathMonitor says we have network — try direct bundler submission
+        if networkPathSatisfied {
+            // Verify with actual connectivity check (path monitor can be optimistic)
+            if await hasInternetConnectivity() {
+                SecureLogger.debug("Internet available, submitting UserOp directly to bundler", category: .session)
+                await submitUserOpToBundler(payload)
+                return
+            }
+            // Path monitor said satisfied but RPC failed — fall through to BLE
+        }
+        
+        // No internet (or RPC unreachable) — try mesh relay via BLE first
+        if allowMeshRelay, let peerWithInternet = findRelayPeer() {
+            SecureLogger.debug("📡 No internet, relaying UserOp via BLE peer \(peerWithInternet.id.prefix(8))…", category: .session)
+            await relayUserOpViaMesh(payload, to: peerWithInternet)
             return
         }
         
-        // No internet — try mesh relay if enabled
-        guard allowMeshRelay else {
+        // No BLE peer either — keep in queue
+        if !allowMeshRelay {
             SecureLogger.debug("No internet and mesh relay disabled, keeping UserOp in queue", category: .session)
-            scheduleRetry()
-            return
-        }
-        
-        guard let peerWithInternet = findRelayPeer() else {
+        } else {
             SecureLogger.debug("No relay peer available for UserOp \(payload.requestId.prefix(8))…", category: .session)
-            scheduleRetry()
-            return
         }
-        
-        // Send via BLE mesh
-        await relayUserOpViaMesh(payload, to: peerWithInternet)
+        scheduleRetry()
     }
     
     /// Send UserOp to a relay peer via BLE
@@ -544,7 +569,8 @@ final class MeshTransactionRelay: ObservableObject {
         }
     }
     
-    /// Raw JSON-RPC call to submit UserOp to Pimlico bundler
+    /// Raw JSON-RPC call to submit UserOp to Pimlico bundler.
+    /// Routes through Tor for IP privacy, with clearnet fallback.
     private func submitUserOpToBundlerRPC(_ payload: TxUserOpPayload) async throws -> String {
         let url = URL(string: "https://api.pimlico.io/v2/\(payload.chainId)/rpc?apikey=\(payload.pimlicoAPIKey)")!
         
@@ -563,8 +589,27 @@ final class MeshTransactionRelay: ObservableObject {
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         request.timeoutInterval = 30
         
-        let (data, response) = try await URLSession.shared.data(for: request)
+        // Try Tor first for IP privacy, fall back to direct if Tor unavailable
+        let sessions: [URLSession] = TorManager.shared.isReady
+            ? [TorURLSession.shared.session, URLSession.shared]
+            : [URLSession.shared]
         
+        var lastError: Error = TransactionError.rpcFailed
+        for session in sessions {
+            do {
+                let (data, response) = try await session.data(for: request)
+                return try parseUserOpResponse(data: data, response: response)
+            } catch {
+                lastError = error
+                SecureLogger.debug("UserOp bundler attempt failed (\(session === URLSession.shared ? "direct" : "Tor")): \(error.localizedDescription)", category: .session)
+                continue
+            }
+        }
+        throw lastError
+    }
+    
+    /// Parse the JSON-RPC response from a UserOp bundler submission
+    private func parseUserOpResponse(data: Data, response: URLResponse) throws -> String {
         guard let httpResponse = response as? HTTPURLResponse,
               (200...299).contains(httpResponse.statusCode) else {
             let bodyStr = String(data: data, encoding: .utf8) ?? ""
@@ -740,6 +785,15 @@ final class MeshTransactionRelay: ObservableObject {
                 // Remove from pending
                 pendingRelays.removeAll { $0.id == relay.id }
                 savePendingRelays()
+                
+                // Update nonce cache so next offline TX uses correct nonce
+                if let fromAddr = relay.payload.fromAddress?.lowercased() {
+                    let nextNonce = relay.payload.nonce + 1
+                    let nonceKey = "wallet-nonce-cache-\(fromAddr)-\(relay.payload.chainId)"
+                    appGroupDefaults.set(Int(nextNonce), forKey: nonceKey)
+                    appGroupDefaults.set(Date().timeIntervalSince1970, forKey: nonceKey + "-ts")
+                    SecureLogger.info("🔢 Updated nonce cache: \(relay.payload.nonce) → \(nextNonce)", category: .session)
+                }
                 
                 if receipt != nil {
                     SecureLogger.info("✅ Transaction confirmed on-chain: \(txHash.prefix(16))… block=\(blockNum.map { String($0) } ?? "?")", category: .session)
@@ -992,6 +1046,7 @@ final class MeshTransactionRelay: ObservableObject {
         if let idx = pendingRelays.firstIndex(where: { $0.id == id }) {
             pendingRelays[idx].status = status
             pendingRelays[idx].relayedVia = relayedVia
+            pendingRelays[idx].statusChangedAt = Date()
             if status == .queued {
                 pendingRelays[idx].retryCount += 1
             }
@@ -1018,13 +1073,35 @@ final class MeshTransactionRelay: ObservableObject {
     private func retryQueuedTransactions() async {
         retryScheduled = false
         
+        // ── Unstick relays stuck in awaitingConfirmation for too long ──
+        // If the confirm/reject BLE packet never arrives (disconnect, packet drop),
+        // the relay would be stuck forever. Requeue after 90 seconds for retry.
+        let now = Date()
+        let staleConfirmations = pendingRelays.filter {
+            $0.status == .awaitingConfirmation &&
+            now.timeIntervalSince($0.statusChangedAt) > 90
+        }
+        for stale in staleConfirmations {
+            SecureLogger.warning("⏳ Relay \(stale.id.prefix(8))… stuck in awaitingConfirmation for >90s — requeuing", category: .session)
+            updateRelayStatus(stale.id, status: .queued, relayedVia: nil)
+        }
+        
+        // Also unstick relays stuck in .relaying (BLE send started but never progressed)
+        let staleRelaying = pendingRelays.filter {
+            $0.status == .relaying &&
+            now.timeIntervalSince($0.statusChangedAt) > 60
+        }
+        for stale in staleRelaying {
+            SecureLogger.warning("⏳ Relay \(stale.id.prefix(8))… stuck in relaying for >60s — requeuing", category: .session)
+            updateRelayStatus(stale.id, status: .queued, relayedVia: nil)
+        }
+        
         let queuedRelays = pendingRelays.filter { $0.status == .queued }
         guard !queuedRelays.isEmpty else { return }
         
         SecureLogger.info("🔄 Retrying \(queuedRelays.count) queued transaction(s)...", category: .session)
         
         // Check for stale transactions (older than maxRetryAge)
-        let now = Date()
         for relay in queuedRelays {
             if now.timeIntervalSince(relay.createdAt) > maxRetryAge {
                 SecureLogger.warning("⏰ Transaction \(relay.id.prefix(8))… expired after 24h", category: .session)
@@ -1045,19 +1122,21 @@ final class MeshTransactionRelay: ObservableObject {
             }
             
             // Standard EOA transaction relay
-            // Always try direct broadcast first if we have internet
-            if await hasInternetConnectivity() {
+            // Use NWPathMonitor for instant offline check — avoids 20s HTTP timeout when offline
+            if networkPathSatisfied, await hasInternetConnectivity() {
                 await broadcastTransaction(relay)
             } else if allowMeshRelay, let peer = findRelayPeer() {
-                // No internet - try mesh relay if enabled
+                // No internet (or path unsatisfied) — relay via BLE mesh
                 await relayViaMesh(relay, to: peer)
             }
-            // If no internet and mesh relay disabled, just keep in queue for next retry
+            // If no internet and no BLE peer, just keep in queue for next retry
         }
         
-        // Schedule another retry if there are still queued transactions
-        let stillQueued = pendingRelays.filter { $0.status == .queued }
-        if !stillQueued.isEmpty {
+        // Schedule another retry if there are still queued or stuck transactions
+        let needsRetry = pendingRelays.contains {
+            $0.status == .queued || $0.status == .awaitingConfirmation || $0.status == .relaying
+        }
+        if needsRetry {
             scheduleRetry()
         }
     }

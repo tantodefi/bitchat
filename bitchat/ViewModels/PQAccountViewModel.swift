@@ -588,8 +588,20 @@ final class PQAccountViewModel: ObservableObject {
 
             return hash
         } catch {
-            // If the direct bundler call failed, try offline mesh relay
-            if let meshRelay = meshRelay {
+            // Only fall through to mesh relay for network errors (URLError, timeout, etc.).
+            // Bundler validation errors (AA* codes, RPC errors) mean the UserOp is invalid —
+            // relaying the same invalid op through a peer won't fix it.
+            let isNetworkError: Bool
+            if let urlError = error as? URLError {
+                isNetworkError = true
+                SecureLogger.info("PQ bundler network error (\(urlError.code.rawValue)), will try mesh relay", category: .session)
+            } else if case TransactionError.rpcFailed = error {
+                isNetworkError = true
+            } else {
+                isNetworkError = false
+            }
+            
+            if isNetworkError, let meshRelay = meshRelay {
                 let peerIdForReply = replyToPeerId ?? (accountAddress ?? "")
                 SecureLogger.info("PQ bundler unreachable, attempting offline mesh relay for \(dest.prefix(10))…", category: .session)
                 

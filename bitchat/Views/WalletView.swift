@@ -195,6 +195,9 @@ struct WalletView: View {
             // ── UI is now unblocked — address + cached balances are available ──
             isLoading = false
             
+            // ── Background: Kick Helios if it failed to auto-start ──
+            HeliosManager.shared.restartIfNeeded()
+            
             // ── Background: PQ network initialization ──
             if XMTPServiceContainer.isConfigured {
                 await pqViewModel.initializeKeys(from: wallet)

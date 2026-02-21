@@ -48,6 +48,7 @@ struct OnChainTransaction: Identifiable, Equatable {
     let contractAddress: String? // For contract interactions
     let verificationLevel: EthereumBalanceService.VerificationLevel
     let failureReason: String?
+    let chainId: UInt64       // Chain ID (1=mainnet, 11155111=sepolia, 421614=arb sepolia, etc.)
 
     static func == (lhs: OnChainTransaction, rhs: OnChainTransaction) -> Bool {
         lhs.id == rhs.id
@@ -339,7 +340,8 @@ final class TransactionHistoryService: ObservableObject {
                 tokenAmount: nil,
                 contractAddress: nil,
                 verificationLevel: .unverified,
-                failureReason: nil
+                failureReason: nil,
+                chainId: pending.payload.chainId
             ))
         }
 
@@ -368,7 +370,8 @@ final class TransactionHistoryService: ObservableObject {
                 tokenAmount: nil,
                 contractAddress: nil,
                 verificationLevel: .unverified,
-                failureReason: nil
+                failureReason: nil,
+                chainId: confirmed.chainId
             ))
         }
 
@@ -394,7 +397,8 @@ final class TransactionHistoryService: ObservableObject {
                 tokenAmount: nil,
                 contractAddress: nil,
                 verificationLevel: .unverified,
-                failureReason: failed.reason
+                failureReason: failed.reason,
+                chainId: failed.chainId
             ))
         }
 
@@ -533,7 +537,8 @@ final class TransactionHistoryService: ObservableObject {
                 tokenAmount: nil,
                 contractAddress: hasCalldata && !to.isEmpty ? to : nil,
                 verificationLevel: level,
-                failureReason: isSuccess ? nil : "Transaction reverted"
+                failureReason: isSuccess ? nil : "Transaction reverted",
+                chainId: chainId
             )
         } catch {
             // Receipt fetch failed — skip this hash silently
@@ -637,12 +642,12 @@ final class TransactionHistoryService: ObservableObject {
         let allReceivedLogs = (try? await receivedLogs) ?? []
 
         for log in allSentLogs {
-            if let tx = parseTransferLog(log, userAddress: normalizedAddr, isSend: true) {
+            if let tx = parseTransferLog(log, userAddress: normalizedAddr, isSend: true, chainId: chainId) {
                 results.append(tx)
             }
         }
         for log in allReceivedLogs {
-            if let tx = parseTransferLog(log, userAddress: normalizedAddr, isSend: false) {
+            if let tx = parseTransferLog(log, userAddress: normalizedAddr, isSend: false, chainId: chainId) {
                 results.append(tx)
             }
         }
@@ -665,7 +670,7 @@ final class TransactionHistoryService: ObservableObject {
 
             let userOpLogs = (try? await fetchLogs(filter: userOpFilter, chainId: chainId, useTestnet: useTestnet)) ?? []
             for log in userOpLogs {
-                if let tx = parseUserOperationLog(log, pqAddress: pqAddr) {
+                if let tx = parseUserOperationLog(log, pqAddress: pqAddr, chainId: chainId) {
                     results.append(tx)
                 }
             }
@@ -715,7 +720,7 @@ final class TransactionHistoryService: ObservableObject {
     // MARK: - ERC-4337 UserOperation Parsing
 
     /// Parse an ERC-4337 UserOperationEvent log into an OnChainTransaction.
-    private func parseUserOperationLog(_ log: HeliosManager.VerifiedLog, pqAddress: String) -> OnChainTransaction? {
+    private func parseUserOperationLog(_ log: HeliosManager.VerifiedLog, pqAddress: String, chainId: UInt64) -> OnChainTransaction? {
         // UserOperationEvent(bytes32 indexed userOpHash, address indexed sender, address indexed paymaster,
         //                    uint256 nonce, bool success, uint256 actualGasCost, uint256 actualGasUsed)
         guard log.topics.count >= 3 else { return nil }
@@ -752,7 +757,8 @@ final class TransactionHistoryService: ObservableObject {
             tokenAmount: nil,
             contractAddress: Self.entryPointV07,
             verificationLevel: verificationLevel,
-            failureReason: success ? nil : "UserOperation reverted"
+            failureReason: success ? nil : "UserOperation reverted",
+            chainId: chainId
         )
     }
 
@@ -980,7 +986,8 @@ final class TransactionHistoryService: ObservableObject {
                             tokenAmount: nil,
                             contractAddress: nil,
                             verificationLevel: verificationLevel,
-                            failureReason: nil
+                            failureReason: nil,
+                            chainId: chainId
                         ))
                     }
                     continue
@@ -1021,7 +1028,8 @@ final class TransactionHistoryService: ObservableObject {
                     tokenAmount: nil,
                     contractAddress: isContractCall ? txTo : nil,
                     verificationLevel: verificationLevel,
-                    failureReason: nil
+                    failureReason: nil,
+                    chainId: chainId
                 ))
             }
 
@@ -1070,7 +1078,8 @@ final class TransactionHistoryService: ObservableObject {
     private func parseTransferLog(
         _ log: HeliosManager.VerifiedLog,
         userAddress: String,
-        isSend: Bool
+        isSend: Bool,
+        chainId: UInt64
     ) -> OnChainTransaction? {
         guard log.topics.count >= 3 else { return nil }
 
@@ -1107,7 +1116,8 @@ final class TransactionHistoryService: ObservableObject {
             tokenAmount: tokenAmount,
             contractAddress: contractAddr,
             verificationLevel: verificationLevel,
-            failureReason: nil
+            failureReason: nil,
+            chainId: chainId
         )
     }
 

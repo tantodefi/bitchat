@@ -273,9 +273,15 @@ public final class HeliosManager: ObservableObject {
 
     /// Whether auto-start has been attempted this session
     private var autoStartAttempted = false
+    
+    /// Whether an auto-start retry is scheduled (prevents spamming)
+    private var retryScheduled = false
 
     /// Sync status polling task
     private var syncPollTask: Task<Void, Never>?
+    
+    /// Sync progress polling task (active during initial sync wait)
+    private var syncProgressPollTask: Task<Void, Never>?
 
     private init() {
         setupTorAutoStart()
@@ -316,7 +322,7 @@ public final class HeliosManager: ObservableObject {
     ///
     /// When Tor becomes ready, attempts to start Helios via the Tor proxy.
     /// On sync failure, retries once with a different consensus endpoint
-    /// before giving up for this session.
+    /// and schedules a background retry for later.
     private func autoStartIfNeeded() async {
         guard !autoStartAttempted else { return }
         autoStartAttempted = true
@@ -354,8 +360,39 @@ public final class HeliosManager: ObservableObject {
                 consensusRpc: network.fallbackConsensusRpc,
                 torSocksPort: torPort
             )
+            return
         } catch {
             SecureLogger.error("HeliosManager: Auto-start attempt 2 failed: \(error)", category: .network)
+        }
+        
+        // Both attempts failed — schedule a background retry in 60 seconds
+        // so Helios can recover if Tor circuits stabilize later
+        scheduleDelayedRetry()
+    }
+    
+    /// Schedule a delayed retry for Helios start (called when both auto-start attempts fail).
+    private func scheduleDelayedRetry() {
+        guard !retryScheduled else { return }
+        retryScheduled = true
+        SecureLogger.info("HeliosManager: Will retry in 60 seconds", category: .network)
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 60_000_000_000) // 60 seconds
+            guard let self, !self.isRunning else { return }
+            self.retryScheduled = false
+            self.autoStartAttempted = false  // Allow fresh attempt
+            if TorManager.shared.isReady {
+                await self.autoStartIfNeeded()
+            }
+        }
+    }
+    
+    /// Public method to restart Helios if it's not running.
+    /// Call from wallet view or any UI that needs Helios.
+    public func restartIfNeeded() {
+        guard !isRunning, isFFIAvailable else { return }
+        autoStartAttempted = false
+        Task { @MainActor [weak self] in
+            await self?.autoStartIfNeeded()
         }
     }
 
@@ -364,6 +401,7 @@ public final class HeliosManager: ObservableObject {
             NotificationCenter.default.removeObserver(observer)
         }
         syncPollTask?.cancel()
+        syncProgressPollTask?.cancel()
     }
 
     // MARK: - Lifecycle
@@ -457,13 +495,21 @@ public final class HeliosManager: ObservableObject {
         syncStatus = .syncing(progress: 0.1)
         SecureLogger.info("HeliosManager: Client initialized, waiting for sync...", category: .network)
 
-        // Step 2: Wait for consensus sync to complete (blocks on background queue)
-        let syncResult: Int32 = try await withCheckedThrowingContinuation { continuation in
+        // Step 2: Start progress polling concurrently — reads the FFI sync
+        // progress atomic (non-blocking) so the UI shows real progress.
+        startSyncProgressPolling()
+
+        // Step 3: Wait for consensus sync to complete (blocks on background queue)
+        // Race against a 120-second timeout so the app isn't stuck forever.
+        let syncResult: Int32 = await withCheckedContinuation { continuation in
             heliosQueue.async {
                 let code = _helios_wait_synced()
                 continuation.resume(returning: code)
             }
         }
+        
+        syncProgressPollTask?.cancel()
+        syncProgressPollTask = nil
 
         guard syncResult == 0 else {
             // Sync failed — shut down the FFI layer so it can be re-initialized
@@ -473,11 +519,12 @@ public final class HeliosManager: ObservableObject {
             let torDetail = resolvedTorPort > 0
                 ? " (Tor port \(resolvedTorPort) — is Tor actually running?)"
                 : " (direct connection)"
+            let progress = currentSyncProgress
             let err = HeliosError.syncFailed(code: syncResult)
-            syncStatus = .error((err.localizedDescription ?? "Sync failed") + torDetail)
-            lastError = (err.localizedDescription ?? "Sync failed") + torDetail
+            syncStatus = .error("Sync failed (progress: \(progress)%)\(torDetail)")
+            lastError = "Sync failed (progress: \(progress)%)\(torDetail)"
             SecureLogger.error(
-                "HeliosManager: Sync failed (code \(syncResult))\(torDetail). FFI state cleared for retry.",
+                "HeliosManager: Sync failed (code \(syncResult), progress \(progress)%)\(torDetail). FFI state cleared for retry.",
                 category: .network
             )
             throw err
@@ -497,6 +544,8 @@ public final class HeliosManager: ObservableObject {
     public func stop() {
         syncPollTask?.cancel()
         syncPollTask = nil
+        syncProgressPollTask?.cancel()
+        syncProgressPollTask = nil
 
         #if HELIOS_FFI_AVAILABLE
         if isRunning {
@@ -818,7 +867,8 @@ public final class HeliosManager: ObservableObject {
         return stripped.count == 40 && stripped.allSatisfy(\.isHexDigit)
     }
 
-    /// Periodically poll finalized block number to update UI
+    /// Periodically poll finalized block number to update UI.
+    /// FFI calls dispatched to heliosQueue to avoid blocking the main thread.
     private func startSyncPolling() {
         syncPollTask?.cancel()
         syncPollTask = Task { [weak self] in
@@ -827,11 +877,39 @@ public final class HeliosManager: ObservableObject {
                 guard let self, self.isRunning, !Task.isCancelled else { break }
 
                 #if HELIOS_FFI_AVAILABLE
-                let block = _helios_finalized_block()
-                if block > 0 {
-                    await MainActor.run {
-                        self.syncStatus = .synced(blockNumber: UInt64(block))
+                let block: Int64 = await withCheckedContinuation { continuation in
+                    self.heliosQueue.async {
+                        continuation.resume(returning: Int64(_helios_finalized_block()))
                     }
+                }
+                if block > 0 {
+                    self.syncStatus = .synced(blockNumber: UInt64(block))
+                }
+                #endif
+            }
+        }
+    }
+    
+    /// Poll _helios_sync_progress() during initial sync to show real progress.
+    /// Called concurrently with the blocking _helios_wait_synced() call.
+    private func startSyncProgressPolling() {
+        syncProgressPollTask?.cancel()
+        syncProgressPollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(2))
+                guard let self, self.isRunning, !Task.isCancelled else { break }
+                
+                #if HELIOS_FFI_AVAILABLE
+                let progress = Int(_helios_sync_progress())
+                if progress >= 0 && progress < 100 {
+                    let fraction = Double(progress) / 100.0
+                    self.syncStatus = .syncing(progress: max(fraction, 0.05))
+                    SecureLogger.debug("HeliosManager: Sync progress: \(progress)%", category: .network)
+                } else if progress == 100 {
+                    break // Sync complete, polling no longer needed
+                } else if progress < 0 {
+                    SecureLogger.warning("HeliosManager: Sync progress error (\(progress))", category: .network)
+                    break
                 }
                 #endif
             }

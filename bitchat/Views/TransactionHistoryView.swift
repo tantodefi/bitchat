@@ -488,12 +488,26 @@ struct OnChainTransactionDetailView: View {
     @Environment(\.dismiss) private var dismiss
 
     private var networkName: String {
-        "Ethereum Mainnet"
+        switch transaction.chainId {
+        case 1: return "Ethereum Mainnet"
+        case 11155111: return "Sepolia Testnet"
+        case 421614: return "Arbitrum Sepolia"
+        case 42161: return "Arbitrum One"
+        case 8453: return "Base"
+        default: return "Chain \(transaction.chainId)"
+        }
     }
 
     private var explorerURL: URL? {
         guard let hash = transaction.txHash else { return nil }
-        return URL(string: "https://etherscan.io/tx/\(hash)")
+        switch transaction.chainId {
+        case 1: return URL(string: "https://etherscan.io/tx/\(hash)")
+        case 11155111: return URL(string: "https://sepolia.etherscan.io/tx/\(hash)")
+        case 421614: return URL(string: "https://sepolia.arbiscan.io/tx/\(hash)")
+        case 42161: return URL(string: "https://arbiscan.io/tx/\(hash)")
+        case 8453: return URL(string: "https://basescan.org/tx/\(hash)")
+        default: return nil
+        }
     }
 
     private var formattedETH: String {
