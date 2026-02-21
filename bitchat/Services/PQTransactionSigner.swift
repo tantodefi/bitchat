@@ -321,10 +321,12 @@ actor PQTransactionSigner {
         // Serialize to mesh-compatible payload
         let senderHex = "0x" + userOp.sender.map { String(format: "%02x", $0) }.joined()
         
+        let apiKey = await bundler.getAPIKey()
+        
         return TxUserOpPayload(
             requestId: UUID().uuidString,
             chainId: chainId,
-            pimlicoAPIKey: bundler.getAPIKey(),
+            pimlicoAPIKey: apiKey,
             sender: senderHex,
             nonce: dataToHex(userOp.nonce),
             callData: dataToHex(userOp.callData),
