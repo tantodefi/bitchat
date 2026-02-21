@@ -237,19 +237,33 @@ pub extern "C" fn helios_wait_synced() -> c_int {
 
     SYNC_PROGRESS.store(50, Ordering::SeqCst);
 
-    let result = match state.runtime.block_on(state.client.wait_synced()) {
-        Ok(()) => {
-            IS_SYNCED.store(true, Ordering::SeqCst);
-            SYNC_PROGRESS.store(100, Ordering::SeqCst);
-            tracing::info!("Helios synced successfully");
-            0
+    // Apply a 120-second timeout so the app never hangs forever if the
+    // sync task panics, deadlocks, or the Tor connection is too slow.
+    let result = state.runtime.block_on(async {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            state.client.wait_synced(),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                IS_SYNCED.store(true, Ordering::SeqCst);
+                SYNC_PROGRESS.store(100, Ordering::SeqCst);
+                tracing::info!("Helios synced successfully");
+                0
+            }
+            Ok(Err(e)) => {
+                tracing::error!("Helios sync failed: {}", e);
+                SYNC_PROGRESS.store(-1, Ordering::SeqCst);
+                -2
+            }
+            Err(_) => {
+                tracing::error!("Helios sync timed out after 120 seconds");
+                SYNC_PROGRESS.store(-1, Ordering::SeqCst);
+                -2
+            }
         }
-        Err(e) => {
-            tracing::error!("Helios sync failed: {}", e);
-            SYNC_PROGRESS.store(-1, Ordering::SeqCst);
-            -2
-        }
-    };
+    });
 
     // Put state back into the mutex (so shutdown/queries can find it)
     {
@@ -997,7 +1011,11 @@ fn build_client(
         .network(network)
         .consensus_rpc(consensus_rpc)?
         .execution_rpc(execution_rpc)?
-        .load_external_fallback()
+        // NOTE: Do NOT use .load_external_fallback() — it fetches from
+        // raw.githubusercontent.com which is blocked by Tor exit nodes.
+        // Instead, the Swift side fetches a fresh checkpoint via direct
+        // URLSession (no Tor) and passes it to helios_init(). If no valid
+        // checkpoint is available, the file DB cache is used.
         .data_dir(data_dir)
         .with_file_db();
 

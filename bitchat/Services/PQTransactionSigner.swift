@@ -243,6 +243,39 @@ actor PQTransactionSigner {
             nonce: nonce
         )
         
+        // Validate that the account has enough ETH to cover BOTH the send value
+        // AND the gas prefund. Without a paymaster, the EntryPoint requires the
+        // account to pay missingAccountFunds during validateUserOp. If the account
+        // can't cover the prefund, validateUserOp reverts → AA24 "signature error".
+        let totalGas = safeVerificationGas + safeCallGas + safePreVerificationGas
+        let requiredPrefund = totalGas * maxFee  // worst-case gas cost in wei
+        let balanceHex = try await deployer.getBalance(address: sender)
+        let senderBalance = Self.parseHexBalance(balanceHex)
+        
+        // Overflow-safe addition: if value + requiredPrefund overflows UInt64, it's definitely too much
+        let totalRequired: UInt64
+        if value > UInt64.max - requiredPrefund {
+            totalRequired = UInt64.max
+        } else {
+            totalRequired = value + requiredPrefund
+        }
+        
+        SecureLogger.info(
+            "PQ balance check: balance=\(senderBalance)wei, send=\(value)wei, gasPrefund=\(requiredPrefund)wei, total=\(totalRequired)wei",
+            category: .session
+        )
+        
+        if senderBalance < totalRequired {
+            let balanceEth = Double(senderBalance) / 1e18
+            let gasCostEth = Double(requiredPrefund) / 1e18
+            let sendEth = Double(value) / 1e18
+            throw PQTransactionError.insufficientBalance(
+                balance: balanceEth,
+                sendAmount: sendEth,
+                gasCost: gasCostEth
+            )
+        }
+        
         // Submit to bundler
         let userOpHash = try await bundler.sendUserOperation(userOp: userOp)
         SecureLogger.info("PQ UserOp submitted: \(userOpHash)", category: .session)
@@ -383,6 +416,15 @@ actor PQTransactionSigner {
         return String(format: "%.6f ETH", eth)
     }
     
+    /// Parse a 0x-prefixed hex balance string (from eth_getBalance) to UInt64.
+    /// Clamps values exceeding UInt64.max.
+    static func parseHexBalance(_ hexStr: String) -> UInt64 {
+        let hex = hexStr.hasPrefix("0x") ? String(hexStr.dropFirst(2)) : hexStr
+        // Use UInt64 directly — sufficient for up to ~18.4 ETH, which covers
+        // testnet balances. Balances above UInt64.max are clamped.
+        return UInt64(hex, radix: 16) ?? 0
+    }
+    
     /// Execute and wait for receipt
     func executeAndWait(
         dest: String,
@@ -447,8 +489,114 @@ actor PQTransactionSigner {
     
     // MARK: - Stealth Account Sweep
     
+    /// Estimate the gas cost for sweeping a stealth PQ account.
+    /// Returns the required gas prefund in wei (the amount that must stay in
+    /// the account to pay the EntryPoint during `validateUserOp`).
+    ///
+    /// This uses the Pimlico bundler for a real gas estimate, factoring in
+    /// deploy cost (if counterfactual) + ML-DSA-44 verification + transfer.
+    ///
+    /// - Parameters:
+    ///   - stealthAccount: The stealth PQ account to estimate for
+    ///   - stealthPrivateKey: Needed to produce a valid dummy signature for gas estimation
+    ///   - destinationAddress: Where funds will be sent
+    /// - Returns: `SweepGasEstimate` with gas cost and max sweepable amount
+    func estimateSweepGasCost(
+        stealthAccount: StealthPQAccount,
+        stealthPrivateKey: Data,
+        destinationAddress: String
+    ) async throws -> SweepGasEstimate {
+        let sender = stealthAccount.pqAccountAddress
+        let deployed = stealthAccount.isDeployed
+        
+        // Get live balance
+        let balanceHex = try await deployer.getBalance(address: sender)
+        let balance = Self.parseHexBalance(balanceHex)
+        
+        // Build initCode if counterfactual (not deployed yet)
+        var initCode = Data()
+        if !deployed {
+            let stealthSignerHex = stealthAccount.stealthSignerAddress
+            let hex = stealthSignerHex.hasPrefix("0x") ? String(stealthSignerHex.dropFirst(2)) : stealthSignerHex
+            let preQKey = ABIEncoder.hexToData(hex)
+            let postQKey = try await getPostQuantumKeyForFactory()
+            initCode = UserOperationBuilder.buildInitCode(
+                factoryAddress: PQAccountDeployer.factoryAddress,
+                preQuantumPubKey: preQKey,
+                postQuantumPubKey: postQKey
+            )
+        }
+        
+        // Use a placeholder sweep amount (1 wei) — gas cost is independent of transfer value
+        let placeholderCalldata = ABIEncoder.encodeExecute(
+            dest: destinationAddress,
+            value: 1,
+            funcData: Data()
+        )
+        
+        let nonce: UInt64 = deployed ? try await getEntryPointNonce(sender: sender) : 0
+        let baseGasPrice = try await deployer.getGasPrice()
+        let priorityFee = max(baseGasPrice / 10, 100_000_000)
+        let maxFee = baseGasPrice * 3 / 2 + priorityFee
+        
+        var userOp = PackedUserOperation(
+            sender: ABIEncoder.hexToData(String(sender.dropFirst(2))),
+            nonce: nonce,
+            initCode: initCode,
+            callData: placeholderCalldata,
+            accountGasLimits: UserOperationBuilder.packAccountGasLimits(
+                verificationGasLimit: UInt64(10_000_000),
+                callGasLimit: UInt64(1_000_000)
+            ),
+            preVerificationGas: UInt64(500_000),
+            gasFees: UserOperationBuilder.packGasFees(
+                maxPriorityFeePerGas: priorityFee,
+                maxFeePerGas: maxFee
+            ),
+            paymasterAndData: Data(),
+            signature: Data()
+        )
+        
+        let dummySig = try await signStealthUserOp(&userOp, stealthPrivateKey: stealthPrivateKey)
+        userOp.signature = dummySig
+        
+        let gasEstimate = try await bundler.estimateUserOperationGas(userOp: userOp)
+        
+        // Apply 1.5x safety multiplier (higher than normal 1.2x because deployment
+        // gas can vary more, and we'd rather over-reserve than fail with AA24)
+        let safeVerificationGas = gasEstimate.verificationGasLimit * 3 / 2
+        let safeCallGas = gasEstimate.callGasLimit * 3 / 2
+        let safePreVerificationGas = gasEstimate.preVerificationGas * 3 / 2
+        
+        let totalGas = safeVerificationGas + safeCallGas + safePreVerificationGas
+        let requiredPrefund = totalGas * maxFee
+        
+        // Max sweepable = balance - gas prefund (leave enough to pay EntryPoint)
+        let maxSweepable: UInt64 = balance > requiredPrefund ? balance - requiredPrefund : 0
+        
+        SecureLogger.info(
+            "Stealth sweep gas estimate: balance=\(balance)wei, gasCost=\(requiredPrefund)wei, maxSweep=\(maxSweepable)wei, deployed=\(deployed)",
+            category: .session
+        )
+        
+        return SweepGasEstimate(
+            balance: balance,
+            requiredGasPrefund: requiredPrefund,
+            maxSweepableWei: maxSweepable,
+            maxFeePerGas: maxFee,
+            verificationGasLimit: safeVerificationGas,
+            callGasLimit: safeCallGas,
+            preVerificationGas: safePreVerificationGas,
+            isDeployed: deployed
+        )
+    }
+    
     /// Sweep a stealth PQ account by deploying it (if needed) and transferring its
     /// balance to the user's main PQ account in a single ERC-4337 UserOp.
+    ///
+    /// The sweep amount is **auto-computed** from the live on-chain balance minus
+    /// the actual gas cost (estimated via the Pimlico bundler). This avoids the
+    /// AA24 revert caused by insufficient gas prefund.
     ///
     /// The stealth private key is used for ECDSA signing (it owns the stealth signer EOA),
     /// while the master ML-DSA-44 key is used for PQ signing (shared across all accounts).
@@ -457,30 +605,30 @@ actor PQTransactionSigner {
     ///   - stealthAccount: The stealth PQ account to sweep
     ///   - stealthPrivateKey: The 32-byte ECDSA private key for this stealth signer
     ///   - destinationAddress: Where to send the funds (usually main PQ account)
-    ///   - sweepAmountWei: Amount to sweep (leave some for gas if needed)
-    /// - Returns: UserOp hash for tracking
+    /// - Returns: `SweepResult` with the UserOp hash and amounts
     func sweepStealthAccount(
         stealthAccount: StealthPQAccount,
         stealthPrivateKey: Data,
-        destinationAddress: String,
-        sweepAmountWei: UInt64
-    ) async throws -> String {
+        destinationAddress: String
+    ) async throws -> SweepResult {
         let sender = stealthAccount.pqAccountAddress
-        
-        // Build execute calldata: transfer ETH to destination
-        let executeCalldata = ABIEncoder.encodeExecute(
-            dest: destinationAddress,
-            value: sweepAmountWei,
-            funcData: Data()
-        )
-        
-        // Check if the stealth PQ account is deployed
         let deployed = stealthAccount.isDeployed
+        
+        // Get live balance from chain
+        let balanceHex = try await deployer.getBalance(address: sender)
+        let balance = Self.parseHexBalance(balanceHex)
+        
+        guard balance > 0 else {
+            throw PQTransactionError.insufficientBalance(
+                balance: 0,
+                sendAmount: 0,
+                gasCost: 0
+            )
+        }
         
         // Build initCode if not deployed (deploy-on-sweep pattern)
         var initCode = Data()
         if !deployed {
-            // Use stealth signer address as preQ key, master PQ key as postQ
             let stealthSignerHex = stealthAccount.stealthSignerAddress
             let hex = stealthSignerHex.hasPrefix("0x") ? String(stealthSignerHex.dropFirst(2)) : stealthSignerHex
             let preQKey = ABIEncoder.hexToData(hex)
@@ -501,19 +649,21 @@ actor PQTransactionSigner {
         let priorityFee = max(baseGasPrice / 10, 100_000_000)
         let maxFee = baseGasPrice * 3 / 2 + priorityFee
         
-        SecureLogger.info(
-            "Stealth sweep UserOp: sender=\(sender.prefix(10))..., dest=\(destinationAddress.prefix(10))..., amount=\(sweepAmountWei)wei",
-            category: .session
+        // Phase 1: Estimate gas with a placeholder sweep amount (1 wei).
+        // Gas cost is independent of the transfer value for a simple ETH send.
+        let placeholderCalldata = ABIEncoder.encodeExecute(
+            dest: destinationAddress,
+            value: 1,
+            funcData: Data()
         )
         
-        // Build UserOp — ML-DSA-44 on-chain verification needs ~2–10M gas
-        var userOp = PackedUserOperation(
+        var estimationOp = PackedUserOperation(
             sender: ABIEncoder.hexToData(String(sender.dropFirst(2))),
             nonce: nonce,
             initCode: initCode,
-            callData: executeCalldata,
+            callData: placeholderCalldata,
             accountGasLimits: UserOperationBuilder.packAccountGasLimits(
-                verificationGasLimit: UInt64(10_000_000), // High for ML-DSA-44 + deploy
+                verificationGasLimit: UInt64(10_000_000),
                 callGasLimit: UInt64(1_000_000)
             ),
             preVerificationGas: UInt64(500_000),
@@ -525,34 +675,79 @@ actor PQTransactionSigner {
             signature: Data()
         )
         
-        // Sign with stealth private key (ECDSA) + master PQ key (ML-DSA-44)
-        let dummySig = try await signStealthUserOp(&userOp, stealthPrivateKey: stealthPrivateKey)
-        userOp.signature = dummySig
+        let dummySig = try await signStealthUserOp(&estimationOp, stealthPrivateKey: stealthPrivateKey)
+        estimationOp.signature = dummySig
         
-        // Estimate gas
-        let gasEstimate = try await bundler.estimateUserOperationGas(userOp: userOp)
+        let gasEstimate = try await bundler.estimateUserOperationGas(userOp: estimationOp)
         
-        // Apply 1.2x safety multiplier for ML-DSA-44 gas variance
-        let safeVerificationGas = gasEstimate.verificationGasLimit * 6 / 5
-        let safeCallGas = gasEstimate.callGasLimit * 6 / 5
-        let safePreVerificationGas = gasEstimate.preVerificationGas * 6 / 5
+        // Apply 1.5x safety multiplier — deployment + ML-DSA-44 gas can vary more
+        // than normal verification, so use a wider margin for counterfactual accounts.
+        let safetyMultiplierNum: UInt64 = deployed ? 6 : 3  // 1.2x if deployed, 1.5x if counterfactual
+        let safetyMultiplierDen: UInt64 = deployed ? 5 : 2
+        let safeVerificationGas = gasEstimate.verificationGasLimit * safetyMultiplierNum / safetyMultiplierDen
+        let safeCallGas = gasEstimate.callGasLimit * safetyMultiplierNum / safetyMultiplierDen
+        let safePreVerificationGas = gasEstimate.preVerificationGas * safetyMultiplierNum / safetyMultiplierDen
         
-        // Update gas values with safety margin
-        userOp.accountGasLimits = UserOperationBuilder.packAccountGasLimits(
-            verificationGasLimit: safeVerificationGas,
-            callGasLimit: safeCallGas
+        // Compute the actual gas cost (EntryPoint prefund) and max sweepable amount
+        let totalGas = safeVerificationGas + safeCallGas + safePreVerificationGas
+        let requiredPrefund = totalGas * maxFee
+        
+        guard balance > requiredPrefund else {
+            let balanceEth = Double(balance) / 1e18
+            let gasCostEth = Double(requiredPrefund) / 1e18
+            throw PQTransactionError.insufficientBalance(
+                balance: balanceEth,
+                sendAmount: 0,
+                gasCost: gasCostEth
+            )
+        }
+        
+        let sweepAmount = balance - requiredPrefund
+        
+        SecureLogger.info(
+            "Stealth sweep: balance=\(balance)wei, gasCost=\(requiredPrefund)wei, sweep=\(sweepAmount)wei (\(String(format: "%.6f", Double(sweepAmount) / 1e18)) ETH), deployed=\(deployed)",
+            category: .session
         )
-        userOp.preVerificationGas = PackedUserOperation.uint256Data(safePreVerificationGas)
         
-        // Re-sign with correct gas values
+        // Phase 2: Build the real UserOp with the computed sweep amount
+        let realCalldata = ABIEncoder.encodeExecute(
+            dest: destinationAddress,
+            value: sweepAmount,
+            funcData: Data()
+        )
+        
+        var userOp = PackedUserOperation(
+            sender: ABIEncoder.hexToData(String(sender.dropFirst(2))),
+            nonce: nonce,
+            initCode: initCode,
+            callData: realCalldata,
+            accountGasLimits: UserOperationBuilder.packAccountGasLimits(
+                verificationGasLimit: safeVerificationGas,
+                callGasLimit: safeCallGas
+            ),
+            preVerificationGas: safePreVerificationGas,
+            gasFees: UserOperationBuilder.packGasFees(
+                maxPriorityFeePerGas: priorityFee,
+                maxFeePerGas: maxFee
+            ),
+            paymasterAndData: Data(),
+            signature: Data()
+        )
+        
+        // Sign with stealth private key (ECDSA) + master PQ key (ML-DSA-44)
         let finalSig = try await signStealthUserOp(&userOp, stealthPrivateKey: stealthPrivateKey)
         userOp.signature = finalSig
         
         // Submit
         let userOpHash = try await bundler.sendUserOperation(userOp: userOp)
-        SecureLogger.info("Stealth sweep UserOp submitted: \(userOpHash)", category: .session)
+        SecureLogger.info("Stealth sweep UserOp submitted: \(userOpHash), sweep=\(sweepAmount)wei", category: .session)
         
-        return userOpHash
+        return SweepResult(
+            userOpHash: userOpHash,
+            sweepAmountWei: sweepAmount,
+            gasCostWei: requiredPrefund,
+            balance: balance
+        )
     }
     
     // MARK: - Signing
@@ -691,6 +886,59 @@ actor PQTransactionSigner {
     }
 }
 
+// MARK: - Sweep Types
+
+/// Result of a gas estimation for a stealth PQ account sweep.
+struct SweepGasEstimate {
+    /// Current on-chain balance of the stealth account (wei)
+    let balance: UInt64
+    /// Gas prefund the EntryPoint will require during validateUserOp (wei)
+    let requiredGasPrefund: UInt64
+    /// Maximum amount that can be swept: balance - gasPrefund (wei)
+    let maxSweepableWei: UInt64
+    /// The maxFeePerGas used for the estimate
+    let maxFeePerGas: UInt64
+    /// Estimated gas limits with safety margin
+    let verificationGasLimit: UInt64
+    let callGasLimit: UInt64
+    let preVerificationGas: UInt64
+    /// Whether the account is already deployed
+    let isDeployed: Bool
+    
+    /// Whether a sweep is viable (balance covers gas)
+    var canSweep: Bool { maxSweepableWei > 0 }
+    
+    /// Gas cost as ETH (for display)
+    var gasCostETH: Double { Double(requiredGasPrefund) / 1e18 }
+    
+    /// Max sweepable as ETH (for display)
+    var maxSweepableETH: Double { Double(maxSweepableWei) / 1e18 }
+    
+    /// Balance as ETH (for display)
+    var balanceETH: Double { Double(balance) / 1e18 }
+    
+    /// Sweep efficiency: what percentage of the balance is actually swept
+    var sweepEfficiency: Double {
+        guard balance > 0 else { return 0 }
+        return Double(maxSweepableWei) / Double(balance) * 100
+    }
+}
+
+/// Result of a successful stealth PQ account sweep.
+struct SweepResult {
+    /// The UserOp hash from the bundler (for receipt tracking)
+    let userOpHash: String
+    /// Amount actually swept to the destination (wei)
+    let sweepAmountWei: UInt64
+    /// Gas cost paid from the stealth balance (wei)
+    let gasCostWei: UInt64
+    /// Original balance before sweep (wei)
+    let balance: UInt64
+    
+    var sweepAmountETH: Double { Double(sweepAmountWei) / 1e18 }
+    var gasCostETH: Double { Double(gasCostWei) / 1e18 }
+}
+
 // MARK: - Errors
 
 enum PQTransactionError: Error, LocalizedError {
@@ -698,6 +946,7 @@ enum PQTransactionError: Error, LocalizedError {
     case configurationError(String)
     case rpcError(String)
     case signingFailed(String)
+    case insufficientBalance(balance: Double, sendAmount: Double, gasCost: Double)
     
     var errorDescription: String? {
         switch self {
@@ -709,6 +958,8 @@ enum PQTransactionError: Error, LocalizedError {
             return "PQ RPC error: \(msg)"
         case .signingFailed(let msg):
             return "PQ signing failed: \(msg)"
+        case .insufficientBalance(let balance, let sendAmount, let gasCost):
+            return String(format: "Insufficient balance: you have %.6f ETH but need %.6f ETH to send + %.6f ETH for gas (total %.6f ETH). Reduce the send amount or add funds.", balance, sendAmount, gasCost, sendAmount + gasCost)
         }
     }
 }

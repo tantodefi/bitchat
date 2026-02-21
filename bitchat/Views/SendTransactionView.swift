@@ -196,8 +196,13 @@ struct SendTransactionView: View {
         guard let balance = currentBalance,
               let sendWei = amountInWei else { return false }
         if isPQMode {
-            // PQ mode: bundler handles gas, just check send amount fits
-            return !(balance.wei >= BigUInt(sendWei))
+            // PQ mode (no paymaster): account pays gas from its own balance.
+            // Reserve gas for ML-DSA-44 verification (~12M gas × maxFee).
+            let pqEstimatedGas: UInt64 = 12_000_000
+            let gasPrice = max(maxFeeWei, 1_000_000_000)
+            let gasCostWei = BigUInt(pqEstimatedGas) * BigUInt(gasPrice)
+            let totalWei = BigUInt(sendWei) + gasCostWei
+            return !(balance.wei >= totalWei)
         }
         // Use conservative estimate: contract wallets (PQ accounts) need ~60k gas
         let gasLimit: UInt64 = 65000
@@ -651,10 +656,26 @@ struct SendTransactionView: View {
         guard let balance = currentBalance else { return }
         
         if isPQMode {
-            // PQ mode: bundler handles gas, so use full balance
-            // (bundler deducts gas from account separately via paymaster or prefund)
-            let maxSendEth = balance.wei.toDouble() / 1e18
-            amount = String(format: "%.6f", maxSendEth)
+            // PQ mode (no paymaster): the smart account pays gas from its own balance
+            // during validateUserOp. Reserve estimated gas cost so the EntryPoint's
+            // _payPrefund doesn't revert (which surfaces as AA24 "signature error").
+            //
+            // Conservative estimate: ML-DSA-44 verification uses ~5-10M gas.
+            // Total gas ≈ 12M, multiplied by maxFeePerGas for worst-case cost.
+            let pqEstimatedGas: UInt64 = 12_000_000  // verification + call + preVerification
+            let gasPrice = max(maxFeeWei, 1_000_000_000) // at least 1 gwei
+            let gasCostWei = BigUInt(pqEstimatedGas) * BigUInt(gasPrice)
+            // Apply 1.5x safety margin on the gas reserve
+            let safeGasCost = gasCostWei * 3 / 2
+            
+            guard balance.wei > safeGasCost else {
+                amount = "0"
+                return
+            }
+            
+            let maxSendWei = balance.wei - safeGasCost
+            let maxSendEth = maxSendWei.toDouble() / 1e18
+            amount = String(format: "%.6f", max(0, maxSendEth))
             return
         }
         

@@ -186,7 +186,9 @@ public final class HeliosManager: ObservableObject {
             }
         }
 
-        /// Checkpoint sources for fetching a fresh weak subjectivity checkpoint
+        /// Checkpoint sources for fetching a fresh weak subjectivity checkpoint.
+        /// These are fetched via direct URLSession (no Tor) so they must be
+        /// publicly accessible endpoints. Order matters — first success wins.
         public var checkpointSources: [String] {
             switch self {
             case .mainnet:
@@ -196,6 +198,10 @@ public final class HeliosManager: ObservableObject {
                 ]
             case .sepolia:
                 return [
+                    // finality_checkpoints is the canonical endpoint for weak subjectivity checkpoints
+                    "https://lodestar-sepolia.chainsafe.io/eth/v1/beacon/states/finalized/finality_checkpoints",
+                    "https://ethereum-sepolia-beacon-api.publicnode.com/eth/v1/beacon/states/finalized/finality_checkpoints",
+                    // Fallback: finalized header root (also valid as a checkpoint)
                     "https://lodestar-sepolia.chainsafe.io/eth/v1/beacon/headers/finalized",
                     "https://ethereum-sepolia-beacon-api.publicnode.com/eth/v1/beacon/headers/finalized",
                 ]
@@ -366,6 +372,19 @@ public final class HeliosManager: ObservableObject {
         let torPort: UInt16 = 39050
         SecureLogger.info("HeliosManager: Tor is ready, auto-starting Helios on \(network.rawValue) via Tor (:\(torPort))", category: .network)
 
+        // Brief warmup delay: Tor's SOCKS port is listening and bootstrap
+        // reports 100%, but Tor circuits may not be fully established yet.
+        // Wait a few seconds so the first Helios requests don't timeout.
+        try? await Task.sleep(nanoseconds: 3_000_000_000) // 3 seconds
+        guard !Task.isCancelled else { return }
+        
+        // Re-check Tor after the delay in case it went down
+        guard TorManager.shared.isReady else {
+            SecureLogger.warning("HeliosManager: Tor went down during warmup, aborting", category: .network)
+            autoStartAttempted = false
+            return
+        }
+
         // Try with default endpoints first
         do {
             try await start(network: network, torSocksPort: torPort)
@@ -482,9 +501,11 @@ public final class HeliosManager: ObservableObject {
             checkpointStr = await Self.fetchLatestCheckpoint(network: network)
         }
 
+        let isFreshCheckpoint = checkpointStr != Self.bundledCheckpoint
         let torLabel = resolvedTorPort > 0 ? "via Tor (:\(resolvedTorPort))" : "direct (no Tor)"
+        let cpLabel = isFreshCheckpoint ? "fresh checkpoint" : "no checkpoint (will use cache)"
         SecureLogger.info(
-            "HeliosManager: Starting \(network.rawValue) \(torLabel) with RPC=\(effectiveRpc), consensus=\(effectiveConsensus)",
+            "HeliosManager: Starting \(network.rawValue) \(torLabel), \(cpLabel), RPC=\(effectiveRpc), consensus=\(effectiveConsensus)",
             category: .network
         )
 
@@ -531,7 +552,8 @@ public final class HeliosManager: ObservableObject {
         startSyncProgressPolling()
 
         // Step 3: Wait for consensus sync to complete (blocks on background queue)
-        // Race against a 120-second timeout so the app isn't stuck forever.
+        // Race against a 150-second timeout so the app isn't stuck forever.
+        // (The Rust side has a 120s timeout internally; this is a safety net.)
         let syncResult: Int32 = await withCheckedContinuation { continuation in
             heliosQueue.async {
                 let code = _helios_wait_synced()
@@ -539,6 +561,7 @@ public final class HeliosManager: ObservableObject {
             }
         }
         
+        // Cancel the 150s safety-net timeout (Rust returned in time)
         syncProgressPollTask?.cancel()
         syncProgressPollTask = nil
 
@@ -961,34 +984,53 @@ public final class HeliosManager: ObservableObject {
     public static func fetchLatestCheckpoint(network: EthereumNetwork = .mainnet) async -> String {
         let sources = network.checkpointSources
 
+        // Use a short timeout — checkpoint fetch is on the critical path and
+        // we have multiple fallback sources. Direct URLSession (no Tor).
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 10
+        config.timeoutIntervalForResource = 15
+        let session = URLSession(configuration: config)
+
         for source in sources {
             guard let url = URL(string: source) else { continue }
             do {
-                let (data, response) = try await URLSession.shared.data(from: url)
+                let (data, response) = try await session.data(from: url)
                 guard let httpResponse = response as? HTTPURLResponse,
                       httpResponse.statusCode == 200 else { continue }
 
-                // Try standard beacon API response format: {"data":{"root":"0x..."}}
                 if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                     // Format 1: lightclientdata.org style {"data": "0x..."}
-                    if let checkpoint = json["data"] as? String, checkpoint.hasPrefix("0x") {
+                    if let checkpoint = json["data"] as? String, checkpoint.hasPrefix("0x"),
+                       checkpoint.count == 66 {
                         SecureLogger.info("HeliosManager: Got \(network.rawValue) checkpoint from \(source)", category: .network)
                         return checkpoint
                     }
-                    // Format 2: Beacon API style {"data":{"root":"0x..."}}
-                    if let dataObj = json["data"] as? [String: Any],
-                       let root = dataObj["root"] as? String,
-                       root.hasPrefix("0x") {
-                        SecureLogger.info("HeliosManager: Got \(network.rawValue) checkpoint from \(source)", category: .network)
-                        return root
+
+                    if let dataObj = json["data"] as? [String: Any] {
+                        // Format 2: finality_checkpoints {"data":{"finalized":{"epoch":"...","root":"0x..."}}}
+                        if let finalized = dataObj["finalized"] as? [String: Any],
+                           let root = finalized["root"] as? String,
+                           root.hasPrefix("0x"), root.count == 66 {
+                            SecureLogger.info("HeliosManager: Got \(network.rawValue) finalized checkpoint from \(source)", category: .network)
+                            return root
+                        }
+
+                        // Format 3: Beacon headers {"data":{"root":"0x..."}}
+                        if let root = dataObj["root"] as? String,
+                           root.hasPrefix("0x"), root.count == 66 {
+                            SecureLogger.info("HeliosManager: Got \(network.rawValue) header checkpoint from \(source)", category: .network)
+                            return root
+                        }
                     }
                 }
+                SecureLogger.debug("HeliosManager: Unexpected checkpoint format from \(source)", category: .network)
             } catch {
+                SecureLogger.debug("HeliosManager: Checkpoint fetch failed from \(source): \(error.localizedDescription)", category: .network)
                 continue
             }
         }
 
-        SecureLogger.info("HeliosManager: Using bundled checkpoint for \(network.rawValue) (external sources failed)", category: .network)
+        SecureLogger.warning("HeliosManager: All checkpoint sources failed for \(network.rawValue), using bundled", category: .network)
         return bundledCheckpoint
     }
 }

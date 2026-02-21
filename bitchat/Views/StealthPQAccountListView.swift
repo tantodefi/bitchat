@@ -747,31 +747,23 @@ class StealthPQAccountViewModel: ObservableObject {
         }
     }
     
-    /// Sweep a single stealth account to the main PQ account
+    /// Sweep a single stealth account to the main PQ account.
+    /// The sweep amount is auto-computed: balance - actual gas cost.
+    /// No hardcoded gas reserve — uses live bundler gas estimation.
     func sweep(account: StealthPQAccount) async {
         do {
             let mainAccountAddress = try await signer.getAccountAddress()
             let stealthKey = try await manager.getStealthPrivateKey(at: account.index)
             
-            // Leave some for gas overhead
-            let balanceHex = account.balanceWei.hasPrefix("0x")
-                ? String(account.balanceWei.dropFirst(2))
-                : account.balanceWei
-            guard let totalWei = UInt64(balanceHex, radix: 16) else { return }
-            
-            // Reserve 0.002 ETH for gas on Arbitrum Sepolia
-            let gasReserve: UInt64 = 2_000_000_000_000_000
-            guard totalWei > gasReserve else { return }
-            let sweepAmount = totalWei - gasReserve
-            
-            let hash = try await signer.sweepStealthAccount(
+            let result = try await signer.sweepStealthAccount(
                 stealthAccount: account,
                 stealthPrivateKey: stealthKey,
-                destinationAddress: mainAccountAddress,
-                sweepAmountWei: sweepAmount
+                destinationAddress: mainAccountAddress
             )
             
-            sweepResults[account.index] = hash
+            sweepResults[account.index] = result.userOpHash
+            
+            print("Swept \(String(format: "%.6f", result.sweepAmountETH)) ETH from stealth #\(account.index) (gas: \(String(format: "%.6f", result.gasCostETH)) ETH)")
             
             // After sweep, advance the index and rotate ENS
             let newIndex = await manager.advanceIndex()

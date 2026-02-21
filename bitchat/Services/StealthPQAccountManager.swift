@@ -83,9 +83,12 @@ actor StealthPQAccountManager {
     
     // MARK: - Configuration
     
-    /// Minimum balance (in wei) required before sweep is allowed.
-    /// On Arbitrum Sepolia, PQ deploy + sweep costs ~0.003-0.005 ETH.
-    static let minimumSweepBalanceWei: UInt64 = 5_000_000_000_000_000 // 0.005 ETH
+    /// Conservative floor balance (in wei) below which sweep is never attempted.
+    /// This is a UI filter \u2014 the actual gas cost is computed at sweep time via
+    /// bundler estimation (see `PQTransactionSigner.sweepStealthAccount`).
+    /// On Arbitrum Sepolia, counterfactual PQ deploy + sweep costs ~0.005-0.02 ETH
+    /// depending on gas price and ML-DSA-44 on-chain verification cost.
+    static let minimumSweepBalanceWei: UInt64 = 8_000_000_000_000_000 // 0.008 ETH
     
     /// Number of stealth addresses to scan ahead for balances
     static let scanWindowSize: UInt32 = 10
