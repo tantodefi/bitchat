@@ -666,9 +666,9 @@ struct SendTransactionView: View {
             let gasPrice = max(maxFeeWei, 1_000_000_000) // at least 1 gwei
             let gasCostWei = BigUInt(pqEstimatedGas) * BigUInt(gasPrice)
             // Apply 1.5x safety margin on the gas reserve
-            let safeGasCost = gasCostWei * 3 / 2
+            let safeGasCost = gasCostWei * BigUInt(3) / BigUInt(2)
             
-            guard balance.wei > safeGasCost else {
+            guard !(safeGasCost >= balance.wei) else {
                 amount = "0"
                 return
             }
