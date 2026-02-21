@@ -30,6 +30,53 @@ actor PQTransactionSigner {
     private var _accountAddress: String?
     private var _cachedExpandedPQKey: Data?
     
+    // MARK: - Offline Gas Cache
+    
+    /// Cached gas values from last successful online transaction for offline fallback
+    private struct GasCache: Codable {
+        let baseGasPrice: UInt64
+        let verificationGasLimit: UInt64
+        let callGasLimit: UInt64
+        let preVerificationGas: UInt64
+        let lastNonce: UInt64
+        let timestamp: Date
+    }
+    
+    /// UserDefaults key for gas cache (per chainId)
+    private var gasCacheKey: String { "pq-gas-cache-\\(chainId)" }
+    
+    /// Cache gas values from a successful online transaction
+    private func saveGasCache(
+        baseGasPrice: UInt64,
+        verificationGasLimit: UInt64,
+        callGasLimit: UInt64,
+        preVerificationGas: UInt64,
+        nonce: UInt64
+    ) {
+        let cache = GasCache(
+            baseGasPrice: baseGasPrice,
+            verificationGasLimit: verificationGasLimit,
+            callGasLimit: callGasLimit,
+            preVerificationGas: preVerificationGas,
+            lastNonce: nonce,
+            timestamp: Date()
+        )
+        if let data = try? JSONEncoder().encode(cache) {
+            UserDefaults.standard.set(data, forKey: gasCacheKey)
+        }
+    }
+    
+    /// Load cached gas values for offline use
+    private func loadGasCache() -> GasCache? {
+        guard let data = UserDefaults.standard.data(forKey: gasCacheKey),
+              let cache = try? JSONDecoder().decode(GasCache.self, from: data) else {
+            return nil
+        }
+        // Accept cache up to 24 hours old
+        guard Date().timeIntervalSince(cache.timestamp) < 24 * 60 * 60 else { return nil }
+        return cache
+    }
+    
     init(
         wallet: EmbeddedWallet,
         pqKeyManager: PQKeyManager,
@@ -173,11 +220,151 @@ actor PQTransactionSigner {
         let finalSig = try await signUserOp(&userOp)
         userOp.signature = finalSig
         
+        // Cache gas values for offline fallback
+        saveGasCache(
+            baseGasPrice: baseGasPrice,
+            verificationGasLimit: gasEstimate.verificationGasLimit,
+            callGasLimit: gasEstimate.callGasLimit,
+            preVerificationGas: gasEstimate.preVerificationGas,
+            nonce: nonce
+        )
+        
         // Submit to bundler
         let userOpHash = try await bundler.sendUserOperation(userOp: userOp)
         SecureLogger.info("PQ UserOp submitted: \(userOpHash)", category: .session)
         
         return userOpHash
+    }
+    
+    // MARK: - Offline Mesh Relay Support
+    
+    /// Build a fully signed UserOperation for relay via BLE mesh.
+    /// Uses cached gas values from the last successful online transaction.
+    /// The relay peer will submit this to the Pimlico bundler on our behalf.
+    ///
+    /// - Parameters:
+    ///   - dest: Target address (hex with 0x prefix)
+    ///   - value: ETH value in wei
+    ///   - data: Calldata for target contract
+    ///   - replyToPeerId: PeerID for confirmation routing
+    /// - Returns: Serialized `TxUserOpPayload` ready for mesh transmission
+    func buildSignedUserOpForRelay(
+        dest: String,
+        value: UInt64 = 0,
+        data: Data = Data(),
+        replyToPeerId: String
+    ) async throws -> TxUserOpPayload {
+        // Require cached account address (should be available if ever online)
+        guard let sender = _accountAddress else {
+            throw PQTransactionError.configurationError("PQ account address not available (never connected online)")
+        }
+        
+        // Load cached gas values
+        guard let gasCache = loadGasCache() else {
+            throw PQTransactionError.configurationError("No cached gas values available. Send at least one PQ transaction while online first.")
+        }
+        
+        // Build execute calldata
+        let executeCalldata = ABIEncoder.encodeExecute(
+            dest: dest,
+            value: value,
+            funcData: data
+        )
+        
+        // Use cached nonce + 1 (assumes last cached tx was mined)
+        // If the user queues multiple offline txs, each call increments from cache
+        let offlineNonce = gasCache.lastNonce + 1
+        
+        // Apply safety multipliers to cached gas values for staleness
+        let baseGasPrice = gasCache.baseGasPrice
+        let priorityFee = max(baseGasPrice / 10, 100_000_000)
+        let maxFee = baseGasPrice * 2 + priorityFee  // 2x base (extra buffer for offline)
+        
+        let verificationGasLimit = gasCache.verificationGasLimit * 3 / 2  // 1.5x buffer
+        let callGasLimit = gasCache.callGasLimit * 3 / 2
+        let preVerificationGas = gasCache.preVerificationGas * 3 / 2
+        
+        SecureLogger.info("PQ offline UserOp: nonce=\(offlineNonce), maxFee=\(maxFee / 1_000_000_000)gwei (cached)", category: .session)
+        
+        // Build UserOp with cached gas estimates (no RPC calls needed)
+        var userOp = PackedUserOperation(
+            sender: ABIEncoder.hexToData(String(sender.dropFirst(2))),
+            nonce: offlineNonce,
+            initCode: Data(), // Account must be deployed for offline sends
+            callData: executeCalldata,
+            accountGasLimits: UserOperationBuilder.packAccountGasLimits(
+                verificationGasLimit: verificationGasLimit,
+                callGasLimit: callGasLimit
+            ),
+            preVerificationGas: preVerificationGas,
+            gasFees: UserOperationBuilder.packGasFees(
+                maxPriorityFeePerGas: priorityFee,
+                maxFeePerGas: maxFee
+            ),
+            paymasterAndData: Data(),
+            signature: Data()
+        )
+        
+        // Sign fully (ECDSA + ML-DSA-44 hybrid) — all local, no network needed
+        let signature = try await signUserOp(&userOp)
+        userOp.signature = signature
+        
+        // Update nonce cache so next offline tx uses nonce+2
+        saveGasCache(
+            baseGasPrice: baseGasPrice,
+            verificationGasLimit: gasCache.verificationGasLimit,
+            callGasLimit: gasCache.callGasLimit,
+            preVerificationGas: gasCache.preVerificationGas,
+            nonce: offlineNonce
+        )
+        
+        // Serialize to mesh-compatible payload
+        let senderHex = "0x" + userOp.sender.map { String(format: "%02x", $0) }.joined()
+        
+        return TxUserOpPayload(
+            requestId: UUID().uuidString,
+            chainId: chainId,
+            pimlicoAPIKey: bundler.getAPIKey(),
+            sender: senderHex,
+            nonce: dataToHex(userOp.nonce),
+            callData: dataToHex(userOp.callData),
+            signature: dataToHex(userOp.signature),
+            verificationGasLimit: uint64ToHex(verificationGasLimit),
+            callGasLimit: uint64ToHex(callGasLimit),
+            preVerificationGas: uint64ToHex(preVerificationGas),
+            maxPriorityFeePerGas: uint64ToHex(priorityFee),
+            maxFeePerGas: uint64ToHex(maxFee),
+            factory: nil,
+            factoryData: nil,
+            paymaster: nil,
+            paymasterVerificationGasLimit: nil,
+            paymasterPostOpGasLimit: nil,
+            paymasterData: nil,
+            signedAt: Date(),
+            description: "PQ Transfer \(Self.formatWei(value)) to \(dest.prefix(10))…",
+            toAddress: dest,
+            fromAddress: sender,
+            amount: value,
+            replyToPeerId: replyToPeerId
+        )
+    }
+    
+    /// Expose chain ID for external use
+    func getChainId() -> UInt64 { chainId }
+    
+    // MARK: - Hex Helpers
+    
+    private func dataToHex(_ data: Data) -> String {
+        "0x" + data.map { String(format: "%02x", $0) }.joined()
+    }
+    
+    private func uint64ToHex(_ value: UInt64) -> String {
+        "0x" + String(value, radix: 16)
+    }
+    
+    private static func formatWei(_ wei: UInt64) -> String {
+        let eth = Double(wei) / 1e18
+        return String(format: "%.6f ETH", eth)
     }
     
     /// Execute and wait for receipt

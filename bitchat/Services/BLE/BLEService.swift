@@ -889,7 +889,7 @@ final class BLEService: NSObject {
         case .noiseEncrypted, .noiseHandshake:
             return true
         case .none, .announce, .message, .leave, .requestSync, .fragment, .fileTransfer,
-             .txRequest, .txSigned, .txConfirm, .txReject:
+             .txRequest, .txSigned, .txConfirm, .txReject, .txUserOp:
             return false
         }
     }
@@ -1370,6 +1370,19 @@ final class BLEService: NSObject {
         Task { @MainActor in
             guard XMTPServiceContainer.isConfigured else { return }
             XMTPServiceContainer.shared.meshTransactionRelay.handleIncomingTxReject(packet.payload, from: peerID)
+        }
+    }
+    
+    private func handleTxUserOp(_ packet: BitchatPacket, from peerID: PeerID) {
+        // ERC-4337 UserOperation relay request - forward to MeshTransactionRelay service
+        SecureLogger.info("📥 Received txUserOp packet from \(peerID.id.prefix(8))…", category: .session)
+        
+        Task { @MainActor in
+            guard XMTPServiceContainer.isConfigured else {
+                SecureLogger.warning("XMTP container not configured, cannot handle UserOp relay", category: .session)
+                return
+            }
+            await XMTPServiceContainer.shared.meshTransactionRelay.handleIncomingTxUserOp(packet.payload, from: peerID)
         }
     }
     
@@ -3828,6 +3841,9 @@ extension BLEService {
             
         case .txReject:
             handleTxReject(packet, from: senderID)
+            
+        case .txUserOp:
+            handleTxUserOp(packet, from: senderID)
             
         case .none:
             SecureLogger.warning("⚠️ Unknown message type: \(packet.type)", category: .session)

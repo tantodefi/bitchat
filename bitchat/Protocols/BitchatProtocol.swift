@@ -86,6 +86,7 @@ enum MessageType: UInt8 {
     case txSigned = 0x51        // Pre-signed transaction for broadcast
     case txConfirm = 0x52       // Transaction confirmation with hash
     case txReject = 0x53        // Transaction rejected by relay peer
+    case txUserOp = 0x54        // ERC-4337 UserOperation for PQ account relay
     
     var description: String {
         switch self {
@@ -101,6 +102,7 @@ enum MessageType: UInt8 {
         case .txSigned: return "txSigned"
         case .txConfirm: return "txConfirm"
         case .txReject: return "txReject"
+        case .txUserOp: return "txUserOp"
         }
     }
 }

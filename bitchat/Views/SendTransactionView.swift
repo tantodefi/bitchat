@@ -88,6 +88,9 @@ struct SendTransactionView: View {
     @State private var ensError: String?
     @State private var ensResolveTask: Task<Void, Never>?
     
+    // Network selection
+    @State private var selectedNetwork: EthereumBalanceService.Network = .sepolia
+    
     // Gas settings
     @State private var selectedGasSpeed: GasSpeed = .average
     @State private var customPriorityFee: String = "1.5"
@@ -141,15 +144,18 @@ struct SendTransactionView: View {
         accountMode == .pqAccount && pqViewModel != nil
     }
     
-    /// Get current network's balance
-    private var currentBalance: EthereumBalanceService.Balance? {
-        if isPQMode {
-            // PQ accounts are only on testnets for now — check Sepolia and Arbitrum Sepolia
-            if let b = balanceService.balances[.sepolia], !b.wei.isZero { return b }
-            return balanceService.balances[.arbitrumSepolia]
+    /// Available networks based on current mode
+    private var availableNetworks: [EthereumBalanceService.Network] {
+        if balanceService.useTestnet {
+            return EthereumBalanceService.Network.testnets
+        } else {
+            return EthereumBalanceService.Network.mainnets
         }
-        let network = balanceService.useTestnet ? EthereumBalanceService.Network.sepolia : EthereumBalanceService.Network.ethereum
-        return balanceService.balances[network]
+    }
+    
+    /// Get current network's balance using the user's selected network
+    private var currentBalance: EthereumBalanceService.Balance? {
+        return balanceService.balances[selectedNetwork]
     }
     
     /// Formatted available balance
@@ -243,6 +249,54 @@ struct SendTransactionView: View {
                     Text("To")
                 }
                 
+                // MARK: - Network Selector
+                Section {
+                    Picker("Network", selection: $selectedNetwork) {
+                        ForEach(availableNetworks, id: \.self) { network in
+                            HStack(spacing: 6) {
+                                Text(networkIcon(for: network))
+                                Text(network.rawValue)
+                            }
+                            .tag(network)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    
+                    if let balance = currentBalance {
+                        HStack {
+                            Text("Balance on \(selectedNetwork.rawValue)")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            Spacer()
+                            Text("\(balance.formattedETH) ETH")
+                                .font(.caption)
+                                .fontWeight(.medium)
+                        }
+                    } else {
+                        HStack {
+                            Text("Balance on \(selectedNetwork.rawValue)")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            Spacer()
+                            Text("-- ETH")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                } header: {
+                    Text("Network")
+                } footer: {
+                    if isPQMode {
+                        HStack(spacing: 4) {
+                            Image(systemName: "shield.checkered")
+                                .foregroundColor(.green)
+                            Text("Sending from PQ smart account via ERC-4337 UserOperation")
+                                .foregroundColor(.green)
+                        }
+                        .font(.caption)
+                    }
+                }
+                
                 Section {
                     HStack {
                         TextField("0.0", text: $amount)
@@ -288,25 +342,6 @@ struct SendTransactionView: View {
                     }
                 } header: {
                     Text("Amount")
-                } footer: {
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack {
-                            Text("Network:")
-                            Text(balanceService.useTestnet ? "Sepolia Testnet" : "Ethereum Mainnet")
-                                .foregroundColor(balanceService.useTestnet ? .orange : .primary)
-                        }
-                        .font(.caption)
-                        
-                        if isPQMode {
-                            HStack(spacing: 4) {
-                                Image(systemName: "shield.checkered")
-                                    .foregroundColor(.green)
-                                Text("Sending from PQ smart account via ERC-4337 UserOperation")
-                                    .foregroundColor(.green)
-                            }
-                            .font(.caption)
-                        }
-                    }
                 }
                 
                 // Gas settings — only for EOA mode.
@@ -526,6 +561,8 @@ struct SendTransactionView: View {
                 }
             }
             .task {
+                // Set initial network based on testnet mode
+                selectedNetwork = balanceService.useTestnet ? .sepolia : .ethereum
                 await checkConnectivity()
             }
             .task {
@@ -559,9 +596,15 @@ struct SendTransactionView: View {
         do {
             if isPQMode, let pqVM = pqViewModel {
                 // PQ mode: send via ERC-4337 UserOperation through the smart account
+                // Falls back to offline mesh relay if bundler is unreachable
+                let pqChain: PQAccountDeployer.Chain = selectedNetwork == .arbitrumSepolia ? .arbitrumSepolia : .sepolia
+                let myAddress = try await wallet.getAddress()
                 let txHash = await pqVM.executeTransaction(
                     to: effectiveRecipientAddress,
-                    value: wei
+                    value: wei,
+                    chain: pqChain,
+                    meshRelay: meshRelay,
+                    replyToPeerId: myAddress
                 )
                 
                 if let hash = txHash {
@@ -590,7 +633,8 @@ struct SendTransactionView: View {
                     maxPriorityFeePerGas: priorityFeeWei,
                     maxFeePerGas: maxFeeWei,
                     replyToPeerId: myAddress,
-                    description: "Send \(amount) ETH"
+                    description: "Send \(amount) ETH",
+                    selectedNetwork: selectedNetwork
                 )
                 
                 submittedTxId = requestId
@@ -644,13 +688,21 @@ struct SendTransactionView: View {
         }
     }
     
+    /// Icon for each network in the picker
+    private func networkIcon(for network: EthereumBalanceService.Network) -> String {
+        switch network {
+        case .ethereum: return "⟠"
+        case .base: return "🔵"
+        case .arbitrum: return "🔷"
+        case .sepolia: return "⟠"
+        case .arbitrumSepolia: return "🔷"
+        }
+    }
+    
     private func checkConnectivity() async {
         // Quick connectivity check — try direct URLSession first (faster),
         // then Tor session as fallback. Avoids false-negative when Tor isn't bootstrapped.
-        guard let url = URL(string: "https://sepolia.drpc.org") else {
-            isOnline = false
-            return
-        }
+        let url = selectedNetwork.rpcURL
         
         var request = URLRequest(url: url)
         request.httpMethod = "POST"

@@ -23,6 +23,7 @@ struct SyncTypeFlags: OptionSet {
         case .txSigned: return 9
         case .txConfirm: return 10
         case .txReject: return 11
+        case .txUserOp: return 12
         }
     }
 

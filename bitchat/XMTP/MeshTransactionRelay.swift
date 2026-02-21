@@ -63,6 +63,7 @@ final class MeshTransactionRelay: ObservableObject {
     private let rpcEndpoints: [UInt64: String] = [
         1: "https://rpc.flashbots.net",                      // Ethereum mainnet (Flashbots Protect)
         11155111: "https://sepolia.drpc.org",                 // Sepolia testnet (dRPC - reliable)
+        421614: "https://sepolia-rollup.arbitrum.io/rpc",     // Arbitrum Sepolia testnet
         8453: "https://mainnet.base.org"                     // Base mainnet
     ]
     
@@ -70,6 +71,7 @@ final class MeshTransactionRelay: ObservableObject {
     private let fallbackRPCs: [UInt64: [String]] = [
         1: ["https://eth.llamarpc.com", "https://rpc.ankr.com/eth"],
         11155111: ["https://rpc2.sepolia.org", "https://1rpc.io/sepolia"],
+        421614: ["https://arbitrum-sepolia-rpc.publicnode.com"],
         8453: ["https://base.llamarpc.com", "https://rpc.ankr.com/base"]
     ]
     
@@ -82,6 +84,8 @@ final class MeshTransactionRelay: ObservableObject {
         var relayedVia: String?
         var status: RelayStatus
         var retryCount: Int = 0
+        /// Serialized TxUserOpPayload for PQ UserOp relays (nil for standard EOA txs)
+        var userOpPayloadData: Data? = nil
     }
     
     enum RelayStatus: String, Codable {
@@ -332,6 +336,223 @@ final class MeshTransactionRelay: ObservableObject {
         
         // Mark as failed, will retry with different peer
         updateRelayStatus(reject.requestId, status: .queued, relayedVia: nil)
+    }
+    
+    // MARK: - ERC-4337 UserOp Relay (PQ Accounts)
+    
+    /// Queue a signed UserOperation for mesh relay (PQ account transactions).
+    /// Tries direct bundler submission first, falls back to BLE mesh relay.
+    func queueUserOp(_ payload: TxUserOpPayload) {
+        // Encode the full UserOp payload so it survives persistence for retries
+        let userOpData = try? JSONEncoder().encode(payload)
+        
+        let relay = PendingRelay(
+            id: payload.requestId,
+            payload: TxSignedPayload(
+                signedTx: Data(), // Not used for UserOps — payload is in userOpPayloadData
+                chainId: payload.chainId,
+                nonce: 0,
+                gasLimit: 0,
+                maxFeePerGas: 0,
+                maxPriorityFee: 0,
+                toAddress: payload.toAddress,
+                replyToPeerId: payload.replyToPeerId,
+                fromAddress: payload.fromAddress,
+                description: payload.description,
+                transactionType: "pq-userop",
+                currency: "ETH",
+                amount: payload.amount,
+                decimals: 18
+            ),
+            createdAt: Date(),
+            relayedVia: nil,
+            status: .queued,
+            retryCount: 0,
+            userOpPayloadData: userOpData
+        )
+        
+        pendingRelays.append(relay)
+        savePendingRelays()
+        
+        SecureLogger.info("📤 Queued PQ UserOp for mesh relay: \(payload.requestId.prefix(8))…", category: .session)
+        
+        // Try to submit/relay immediately
+        Task {
+            await attemptUserOpRelay(payload)
+        }
+    }
+    
+    /// Attempt to submit a UserOp — direct to bundler if online, BLE mesh if offline
+    private func attemptUserOpRelay(_ payload: TxUserOpPayload) async {
+        // Try direct bundler submission first
+        if await hasInternetConnectivity() {
+            SecureLogger.debug("Internet available, submitting UserOp directly to bundler", category: .session)
+            await submitUserOpToBundler(payload)
+            return
+        }
+        
+        // No internet — try mesh relay if enabled
+        guard allowMeshRelay else {
+            SecureLogger.debug("No internet and mesh relay disabled, keeping UserOp in queue", category: .session)
+            scheduleRetry()
+            return
+        }
+        
+        guard let peerWithInternet = findRelayPeer() else {
+            SecureLogger.debug("No relay peer available for UserOp \(payload.requestId.prefix(8))…", category: .session)
+            scheduleRetry()
+            return
+        }
+        
+        // Send via BLE mesh
+        await relayUserOpViaMesh(payload, to: peerWithInternet)
+    }
+    
+    /// Send UserOp to a relay peer via BLE
+    private func relayUserOpViaMesh(_ payload: TxUserOpPayload, to peerID: PeerID) async {
+        guard let bleService = bleService else { return }
+        
+        updateRelayStatus(payload.requestId, status: .relaying, relayedVia: peerID.id)
+        
+        guard let payloadData = payload.encode() else {
+            SecureLogger.error("Failed to encode UserOp payload for relay", category: .session)
+            return
+        }
+        
+        let packet = BitchatPacket(
+            type: MessageType.txUserOp.rawValue,
+            ttl: 2, // Limit hops for security
+            senderID: bleService.myPeerID,
+            payload: payloadData,
+            isRSR: false
+        )
+        
+        bleService.sendPacket(to: peerID, packet: packet)
+        
+        updateRelayStatus(payload.requestId, status: .awaitingConfirmation, relayedVia: peerID.id)
+        SecureLogger.info("🔀 Relayed PQ UserOp via \(peerID.id.prefix(8))…: \(payload.requestId.prefix(8))…", category: .session)
+    }
+    
+    /// Handle incoming UserOp relay request (we are the relay peer with internet)
+    func handleIncomingTxUserOp(_ data: Data, from senderPeerID: PeerID) async {
+        guard let payload = TxUserOpPayload.decode(data) else {
+            SecureLogger.warning("Invalid TxUserOp packet from \(senderPeerID.id.prefix(8))…", category: .session)
+            return
+        }
+        
+        SecureLogger.info("📥 Received PQ UserOp relay request: \(payload.requestId.prefix(8))…", category: .session)
+        
+        // Check if we have internet
+        guard await hasInternetConnectivity() else {
+            await sendTxReject(to: senderPeerID, requestId: payload.requestId, reason: .noInternet)
+            return
+        }
+        
+        // Submit UserOp to bundler on behalf of the sender
+        do {
+            let userOpHash = try await submitUserOpToBundlerRPC(payload)
+            await sendTxConfirm(to: senderPeerID, requestId: payload.requestId, txHash: userOpHash, status: .pending)
+            SecureLogger.info("✅ Relayed PQ UserOp to bundler: \(userOpHash.prefix(16))…", category: .session)
+        } catch {
+            SecureLogger.error("PQ UserOp bundler submission failed: \(error.localizedDescription)", category: .session)
+            await sendTxReject(to: senderPeerID, requestId: payload.requestId, reason: .bundlerRejected, message: error.localizedDescription)
+        }
+    }
+    
+    /// Submit a UserOp directly to the Pimlico bundler (when we have internet)
+    private func submitUserOpToBundler(_ payload: TxUserOpPayload) async {
+        updateRelayStatus(payload.requestId, status: .relaying, relayedVia: nil)
+        
+        do {
+            let userOpHash = try await submitUserOpToBundlerRPC(payload)
+            
+            SecureLogger.info("📡 PQ UserOp accepted by bundler: \(userOpHash.prefix(16))…", category: .session)
+            
+            // Move to confirmed (bundler accepted — it will handle inclusion)
+            let confirmed = ConfirmedTransaction(
+                id: payload.requestId,
+                txHash: userOpHash,
+                chainId: payload.chainId,
+                toAddress: payload.toAddress,
+                fromAddress: payload.fromAddress,
+                amount: payload.amount,
+                currency: "ETH",
+                confirmedAt: Date(),
+                blockNumber: nil
+            )
+            confirmedTransactions.append(confirmed)
+            saveConfirmedTransactions()
+            
+            // Persist to TransactionStore
+            Task { @MainActor in
+                TransactionStore.shared.record(
+                    CachedTransaction(
+                        id: userOpHash,
+                        txHash: userOpHash,
+                        from: (payload.fromAddress ?? "").lowercased(),
+                        to: payload.toAddress.lowercased(),
+                        value: payload.amount.map { String(format: "0x%llx", $0) } ?? "0x0",
+                        timestamp: Date(),
+                        blockNumber: nil,
+                        chainId: UInt64(payload.chainId),
+                        source: .pqAccount
+                    ),
+                    for: (payload.fromAddress ?? "").lowercased()
+                )
+            }
+            
+            pendingRelays.removeAll { $0.id == payload.requestId }
+            savePendingRelays()
+            
+        } catch {
+            // Network error — keep queued for retry
+            updateRelayStatus(payload.requestId, status: .queued, relayedVia: nil)
+            SecureLogger.warning("📶 UserOp bundler submission failed (will retry): \(error.localizedDescription)", category: .session)
+            scheduleRetry()
+        }
+    }
+    
+    /// Raw JSON-RPC call to submit UserOp to Pimlico bundler
+    private func submitUserOpToBundlerRPC(_ payload: TxUserOpPayload) async throws -> String {
+        let url = URL(string: "https://api.pimlico.io/v2/\(payload.chainId)/rpc?apikey=\(payload.pimlicoAPIKey)")!
+        
+        let userOpDict = payload.toBundlerDict()
+        
+        let body: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_sendUserOperation",
+            "params": [userOpDict, UserOperationBuilder.entryPointV07]
+        ]
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.timeoutInterval = 30
+        
+        let (data, response) = try await URLSession.shared.data(for: request)
+        
+        guard let httpResponse = response as? HTTPURLResponse,
+              (200...299).contains(httpResponse.statusCode) else {
+            let bodyStr = String(data: data, encoding: .utf8) ?? ""
+            throw TransactionError.rpcError("Bundler HTTP error: \(bodyStr.prefix(200))")
+        }
+        
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw TransactionError.invalidResponse
+        }
+        
+        if let error = json["error"] as? [String: Any],
+           let message = error["message"] as? String {
+            throw TransactionError.rpcError("Bundler: \(message)")
+        }
+        
+        guard let hash = json["result"] as? String else {
+            throw TransactionError.invalidResponse
+        }
+        
+        return hash
     }
     
     // MARK: - RPC Broadcasting
@@ -779,6 +1000,19 @@ final class MeshTransactionRelay: ObservableObject {
                 continue
             }
             
+            // Check if this is a PQ UserOp relay
+            if relay.payload.transactionType == "pq-userop" {
+                if let opData = relay.userOpPayloadData,
+                   let userOpPayload = try? JSONDecoder().decode(TxUserOpPayload.self, from: opData) {
+                    await attemptUserOpRelay(userOpPayload)
+                } else {
+                    SecureLogger.error("❌ Cannot retry UserOp \(relay.id.prefix(8))… — missing payload data", category: .session)
+                    moveToFailedHistory(relay, reason: "UserOp payload data lost, cannot retry")
+                }
+                continue
+            }
+            
+            // Standard EOA transaction relay
             // Always try direct broadcast first if we have internet
             if await hasInternetConnectivity() {
                 await broadcastTransaction(relay)

@@ -32,6 +32,12 @@ actor PimlicoBundler {
         self.session = session
     }
     
+    /// Expose API key for mesh relay payloads (relay peer needs it to submit UserOps)
+    func getAPIKey() -> String { apiKey }
+    
+    /// Expose chain ID for external use
+    func getChainId() -> UInt64 { chainId }
+    
     // MARK: - ERC-4337 Methods
     
     /// Estimate gas for a UserOperation

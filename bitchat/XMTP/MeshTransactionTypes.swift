@@ -28,12 +28,16 @@ enum TxPacketType: UInt8, CaseIterable {
     /// Transaction rejected by relay peer
     case txReject = 0x53
     
+    /// ERC-4337 UserOperation for PQ account (bundler submission)
+    case txUserOp = 0x54
+    
     var description: String {
         switch self {
         case .txRequest: return "txRequest"
         case .txSigned: return "txSigned"
         case .txConfirm: return "txConfirm"
         case .txReject: return "txReject"
+        case .txUserOp: return "txUserOp"
         }
     }
 }
@@ -207,6 +211,95 @@ enum TxRejectReason: String, Codable {
     case gasToLow           // Gas price below minimum
     case rateLimited        // Too many relay requests
     case policyViolation    // Relay peer policy rejection
+    case bundlerRejected    // ERC-4337 bundler rejected the UserOp
+}
+
+// MARK: - ERC-4337 UserOperation Payload
+
+/// A fully signed ERC-4337 UserOperation for PQ smart account transactions.
+/// Relayed via BLE mesh so a peer with internet can submit to the Pimlico bundler.
+struct TxUserOpPayload: Codable {
+    /// Unique request ID for tracking
+    let requestId: String
+    
+    /// Chain ID (11155111 = Sepolia, 421614 = Arbitrum Sepolia)
+    let chainId: UInt64
+    
+    /// Pimlico API key (needed by relay peer to submit to bundler)
+    let pimlicoAPIKey: String
+    
+    /// Serialized UserOp fields (JSON-RPC compatible unpacked format)
+    let sender: String              // 0x-prefixed hex address
+    let nonce: String               // 0x-prefixed hex uint256
+    let callData: String            // 0x-prefixed hex
+    let signature: String           // 0x-prefixed hex (hybrid ECDSA + ML-DSA-44)
+    let verificationGasLimit: String
+    let callGasLimit: String
+    let preVerificationGas: String
+    let maxPriorityFeePerGas: String
+    let maxFeePerGas: String
+    
+    /// Factory fields (non-empty only if account not yet deployed)
+    let factory: String?
+    let factoryData: String?
+    
+    /// Paymaster fields (empty for self-funded)
+    let paymaster: String?
+    let paymasterVerificationGasLimit: String?
+    let paymasterPostOpGasLimit: String?
+    let paymasterData: String?
+    
+    /// Timestamp when signed
+    let signedAt: Date
+    
+    /// Human-readable description for display
+    let description: String?
+    
+    /// Destination address (for UI/tracking)
+    let toAddress: String
+    
+    /// Sender PQ account address (for UI/tracking)
+    let fromAddress: String?
+    
+    /// Amount in wei (for UI/tracking)
+    let amount: UInt64?
+    
+    /// PeerID to send confirmation back to
+    let replyToPeerId: String
+    
+    func encode() -> Data? {
+        try? JSONEncoder().encode(self)
+    }
+    
+    static func decode(_ data: Data) -> TxUserOpPayload? {
+        try? JSONDecoder().decode(TxUserOpPayload.self, from: data)
+    }
+    
+    /// Convert back to a bundler-compatible dictionary for eth_sendUserOperation
+    func toBundlerDict() -> [String: Any] {
+        var dict: [String: Any] = [
+            "sender": sender,
+            "nonce": nonce,
+            "callData": callData,
+            "signature": signature,
+            "verificationGasLimit": verificationGasLimit,
+            "callGasLimit": callGasLimit,
+            "preVerificationGas": preVerificationGas,
+            "maxPriorityFeePerGas": maxPriorityFeePerGas,
+            "maxFeePerGas": maxFeePerGas,
+        ]
+        if let factory = factory, !factory.isEmpty && factory != "0x" {
+            dict["factory"] = factory
+            dict["factoryData"] = factoryData ?? "0x"
+        }
+        if let paymaster = paymaster, !paymaster.isEmpty && paymaster != "0x" {
+            dict["paymaster"] = paymaster
+            dict["paymasterVerificationGasLimit"] = paymasterVerificationGasLimit ?? "0x0"
+            dict["paymasterPostOpGasLimit"] = paymasterPostOpGasLimit ?? "0x0"
+            dict["paymasterData"] = paymasterData ?? "0x"
+        }
+        return dict
+    }
 }
 
 // MARK: - XMTP-Compatible Transaction Reference

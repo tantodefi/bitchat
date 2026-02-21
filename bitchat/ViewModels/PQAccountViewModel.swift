@@ -120,6 +120,10 @@ final class PQAccountViewModel: ObservableObject {
     /// UserDefaults key for persisting deployed chain IDs
     private static let deployedChainsKey = "pq-deployed-chain-ids"
     
+    /// UserDefaults key for persisting the PQ counterfactual address
+    /// (CREATE2 address is deterministic, safe to cache once computed)
+    private static let persistedAddressKey = "pq-account-address"
+    
     /// Whether the deployment services are configured (Pimlico API key set)
     var canDeploy: Bool {
         !chainServices.isEmpty
@@ -258,6 +262,7 @@ final class PQAccountViewModel: ObservableObject {
                 
                 if let address {
                     accountAddress = address
+                    Self.persistAccountAddress(address)
                     
                     // Check deployment status on all configured chains
                     await checkAllChainDeployments(address: address)
@@ -268,21 +273,51 @@ final class PQAccountViewModel: ObservableObject {
                     } else {
                         state = .keysReady
                     }
+                } else if let cachedAddress = Self.loadPersistedAccountAddress() {
+                    // Address computation timed out (offline) — restore from cache
+                    accountAddress = cachedAddress
+                    
+                    // chainStatuses already restored persisted deployment flags in configure(),
+                    // so if any chain was previously deployed, honour that state offline.
+                    if chainStatuses.contains(where: { $0.isDeployed }) {
+                        state = .deployed(cachedAddress)
+                        SecureLogger.info("PQ address restored from cache (offline), state: deployed", category: .session)
+                    } else {
+                        state = .keysReady
+                        SecureLogger.warning("PQ address restored from cache but no deployed chains found", category: .session)
+                    }
                 } else {
                     // Address computation timed out — keys are still ready
                     state = .keysReady
                     SecureLogger.warning("PQ address computation timed out, continuing with keys ready", category: .session)
                 }
             } else {
-                state = .keysReady
+                // No chain services configured — try restoring cached address
+                if let cachedAddress = Self.loadPersistedAccountAddress(),
+                   chainStatuses.contains(where: { $0.isDeployed }) {
+                    accountAddress = cachedAddress
+                    state = .deployed(cachedAddress)
+                } else {
+                    state = .keysReady
+                }
             }
             
             SecureLogger.info("PQ account initialized, state: \(state.displayStatus)", category: .session)
             
         } catch {
-            state = .error(error.localizedDescription)
-            lastError = error.localizedDescription
-            SecureLogger.error("PQ key initialization failed: \(error)", category: .session)
+            // If we have a cached address + persisted deployment, restore
+            // deployed state so the wallet remains usable offline.
+            if let cachedAddress = Self.loadPersistedAccountAddress(),
+               chainStatuses.contains(where: { $0.isDeployed }) {
+                accountAddress = cachedAddress
+                state = .deployed(cachedAddress)
+                lastError = nil
+                SecureLogger.info("PQ key init failed but restored deployed state from cache (offline)", category: .session)
+            } else {
+                state = .error(error.localizedDescription)
+                lastError = error.localizedDescription
+                SecureLogger.error("PQ key initialization failed: \(error)", category: .session)
+            }
         }
     }
     
@@ -487,11 +522,14 @@ final class PQAccountViewModel: ObservableObject {
     // MARK: - Transactions
     
     /// Execute a transaction through the PQ smart account on a specific chain.
+    /// Falls back to offline mesh relay if the bundler is unreachable.
     func executeTransaction(
         to dest: String,
         value: UInt64 = 0,
         data: Data = Data(),
-        chain: PQAccountDeployer.Chain = .sepolia
+        chain: PQAccountDeployer.Chain = .sepolia,
+        meshRelay: MeshTransactionRelay? = nil,
+        replyToPeerId: String? = nil
     ) async -> String? {
         guard let serviceSet = chainServices[chain.chainId] else {
             lastError = "Transaction signer not configured for \(chain.name)"
@@ -535,6 +573,34 @@ final class PQAccountViewModel: ObservableObject {
 
             return hash
         } catch {
+            // If the direct bundler call failed, try offline mesh relay
+            if let meshRelay = meshRelay {
+                let peerIdForReply = replyToPeerId ?? (accountAddress ?? "")
+                SecureLogger.info("PQ bundler unreachable, attempting offline mesh relay for \(dest.prefix(10))…", category: .session)
+                
+                do {
+                    let userOpPayload = try await serviceSet.signer.buildSignedUserOpForRelay(
+                        dest: dest,
+                        value: value,
+                        data: data,
+                        replyToPeerId: peerIdForReply
+                    )
+                    
+                    meshRelay.queueUserOp(userOpPayload)
+                    
+                    let requestId = userOpPayload.requestId
+                    lastTransactionHash = requestId
+                    isProcessingTransaction = false
+                    SecureLogger.info("📤 PQ UserOp queued for mesh relay: \(requestId.prefix(8))…", category: .session)
+                    return requestId
+                } catch {
+                    SecureLogger.error("PQ offline UserOp build failed: \(error)", category: .session)
+                    lastError = "Offline send failed: \(error.localizedDescription)"
+                    isProcessingTransaction = false
+                    return nil
+                }
+            }
+            
             lastError = error.localizedDescription
             isProcessingTransaction = false
             SecureLogger.error("PQ transaction failed: \(error)", category: .session)
@@ -630,6 +696,7 @@ final class PQAccountViewModel: ObservableObject {
         }
         // Clear persisted deployment state
         UserDefaults.standard.removeObject(forKey: Self.deployedChainsKey)
+        UserDefaults.standard.removeObject(forKey: Self.persistedAddressKey)
     }
     
     // MARK: - Deployment Persistence
@@ -647,6 +714,16 @@ final class PQAccountViewModel: ObservableObject {
         var current = loadDeployedChainIds()
         current.insert(chainId)
         UserDefaults.standard.set(current.map { Int($0) }, forKey: deployedChainsKey)
+    }
+    
+    /// Persist the PQ counterfactual address (deterministic via CREATE2, safe to cache).
+    private static func persistAccountAddress(_ address: String) {
+        UserDefaults.standard.set(address, forKey: persistedAddressKey)
+    }
+    
+    /// Load persisted PQ account address, if any.
+    private static func loadPersistedAccountAddress() -> String? {
+        UserDefaults.standard.string(forKey: persistedAddressKey)
     }
     
     // MARK: - Stealth PQ Account Integration

@@ -80,7 +80,9 @@ struct WalletView: View {
         ScrollView {
             VStack(spacing: 24) {
                 // MARK: - Account Mode Picker
-                if pqViewModel.state.isDeployed {
+                // Show if PQ is deployed, OR if user is already in PQ mode
+                // (persisted via @AppStorage) — so they can always switch back to EOA.
+                if pqViewModel.state.isDeployed || activeAccountMode == .pqAccount {
                     accountModePicker
                 }
                 

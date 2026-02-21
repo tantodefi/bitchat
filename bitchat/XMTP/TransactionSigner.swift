@@ -51,10 +51,11 @@ final class TransactionSigner {
         maxPriorityFeePerGas: UInt64? = nil,
         maxFeePerGas: UInt64? = nil,
         replyToPeerId: String,
-        description: String? = nil
+        description: String? = nil,
+        selectedNetwork: EthereumBalanceService.Network? = nil
     ) async throws -> String {
-        // Determine active network
-        let network = balanceService.useTestnet ? EthereumBalanceService.Network.sepolia : EthereumBalanceService.Network.ethereum
+        // Determine active network — use explicit selection if provided, else default
+        let network = selectedNetwork ?? (balanceService.useTestnet ? EthereumBalanceService.Network.sepolia : EthereumBalanceService.Network.ethereum)
         let chainId = UInt64(network.chainId)
         
         // Get wallet address
