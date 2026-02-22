@@ -398,6 +398,35 @@ final class PQAccountViewModel: ObservableObject {
         !undeployedChains.isEmpty
     }
     
+    // MARK: - Gas Estimation (UI)
+    
+    /// Fetch the live gas price from the network for UI gas estimation.
+    /// Uses Helios on Sepolia when available, otherwise RPC.
+    /// Returns gas price in wei. Falls back to 2 gwei on error.
+    func fetchLiveGasPrice(chain: PQAccountDeployer.Chain = .sepolia) async -> UInt64 {
+        guard let services = chainServices[chain.chainId] else { return 2_000_000_000 }
+        do {
+            return try await services.deployer.getGasPrice()
+        } catch {
+            return 2_000_000_000 // 2 gwei fallback
+        }
+    }
+    
+    /// Compute estimated gas cost in wei for a PQ UserOp transfer.
+    /// Uses the same maxFee formula as PQTransactionSigner for consistency.
+    /// `liveGasPrice` should come from `fetchLiveGasPrice()`.
+    static func estimatePQGasCost(liveGasPrice: UInt64) -> BigUInt {
+        let basePrice = liveGasPrice > 0 ? liveGasPrice : 2_000_000_000
+        // maxFee formula matches PQTransactionSigner.executeTransaction
+        let priorityFee = max(basePrice / 10, 100_000_000)  // 10% of base, min 0.1 gwei
+        let maxFee = basePrice * 3 / 2 + priorityFee         // 1.5x base + priority
+        // Conservative total gas for UI estimate (verification + call + preVerification).
+        // ML-DSA-44 on-chain verification is gas-intensive but the bundler
+        // does the real estimation at signing time.
+        let totalGas: UInt64 = 2_000_000
+        return BigUInt(totalGas) * BigUInt(maxFee)
+    }
+    
     // MARK: - Deployment
     
     /// Deploy the PQ smart account on the selected target chain(s).
@@ -597,6 +626,18 @@ final class PQAccountViewModel: ObservableObject {
                 SecureLogger.info("PQ bundler network error (\(urlError.code.rawValue)), will try mesh relay", category: .session)
             } else if case TransactionError.rpcFailed = error {
                 isNetworkError = true
+            } else if case DeployerError.networkError = error {
+                isNetworkError = true
+                SecureLogger.info("PQ deployer network error, will try mesh relay", category: .session)
+            } else if case BundlerError.networkError = error {
+                isNetworkError = true
+                SecureLogger.info("PQ bundler network error, will try mesh relay", category: .session)
+            } else if case BundlerError.httpError = error {
+                isNetworkError = true
+                SecureLogger.info("PQ bundler HTTP error, will try mesh relay", category: .session)
+            } else if case PQTransactionError.rpcError = error {
+                isNetworkError = true
+                SecureLogger.info("PQ RPC error, will try mesh relay", category: .session)
             } else {
                 isNetworkError = false
             }

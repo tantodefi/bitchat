@@ -97,6 +97,9 @@ struct SendTransactionView: View {
     @State private var customMaxFee: String = "30"
     @State private var showGasDetails = false
     
+    /// Live gas price fetched from the network (PQ mode only)
+    @State private var liveGasPriceWei: UInt64 = 0
+    
     /// Get the current status of the submitted transaction
     private var txStatus: MeshTransactionRelay.RelayStatus? {
         guard let txId = submittedTxId else { return nil }
@@ -183,9 +186,16 @@ struct SendTransactionView: View {
     }
     
     /// Estimated transaction cost in ETH
-    /// Uses 65000 as a conservative upper bound that covers both EOA (21k)
-    /// and smart contract wallet (PQ account) receive functions.
     private var estimatedCostEth: Double {
+        if isPQMode {
+            // PQ UserOps: use live gas price from the network.
+            // PQAccountViewModel.estimatePQGasCost uses the same maxFee formula
+            // as PQTransactionSigner for consistency. The real bundler estimation
+            // happens at signing time.
+            let cost = PQAccountViewModel.estimatePQGasCost(liveGasPrice: liveGasPriceWei)
+            return cost.toDouble() / 1e18
+        }
+        // EOA: 65k gas covers both simple transfers (21k) and contract receives.
         let gasLimit: UInt64 = 65000
         let maxCostWei = gasLimit * maxFeeWei
         return Double(maxCostWei) / 1e18
@@ -197,18 +207,17 @@ struct SendTransactionView: View {
               let sendWei = amountInWei else { return false }
         if isPQMode {
             // PQ mode (no paymaster): account pays gas from its own balance.
-            // Reserve gas for ML-DSA-44 verification (~12M gas × maxFee).
-            let pqEstimatedGas: UInt64 = 12_000_000
-            let gasPrice = max(maxFeeWei, 1_000_000_000)
-            let gasCostWei = BigUInt(pqEstimatedGas) * BigUInt(gasPrice)
+            // This is a lenient UI pre-check using the live network gas price.
+            // The real validation with exact bundler estimates happens in
+            // PQTransactionSigner.executeTransaction at signing time.
+            let gasCostWei = PQAccountViewModel.estimatePQGasCost(liveGasPrice: liveGasPriceWei)
             let totalWei = BigUInt(sendWei) + gasCostWei
             return !(balance.wei >= totalWei)
         }
-        // Use conservative estimate: contract wallets (PQ accounts) need ~60k gas
+        // EOA: conservative 65k gas covers both simple transfers and contract receives
         let gasLimit: UInt64 = 65000
         let maxCostWei = gasLimit * maxFeeWei
         let totalWei = BigUInt(sendWei) + BigUInt(maxCostWei)
-        // Use >= with NOT: totalWei > balance.wei  ≡  !(balance.wei >= totalWei)
         return !(balance.wei >= totalWei)
     }
     
@@ -576,6 +585,13 @@ struct SendTransactionView: View {
                     await balanceService.fetchBalances(for: addr)
                 }
             }
+            .task(id: selectedNetwork) {
+                // Fetch live gas price from the network for PQ mode estimation
+                if isPQMode, let pqVM = pqViewModel {
+                    let chain: PQAccountDeployer.Chain = selectedNetwork == .arbitrumSepolia ? .arbitrumSepolia : .sepolia
+                    liveGasPriceWei = await pqVM.fetchLiveGasPrice(chain: chain)
+                }
+            }
             .confirmationDialog("Confirm Transaction", isPresented: $showingConfirmation) {
                 Button(isOnline ? "Sign & Send" : "Sign & Queue") {
                     Task { await signAndSend() }
@@ -659,14 +675,10 @@ struct SendTransactionView: View {
             // PQ mode (no paymaster): the smart account pays gas from its own balance
             // during validateUserOp. Reserve estimated gas cost so the EntryPoint's
             // _payPrefund doesn't revert (which surfaces as AA24 "signature error").
-            //
-            // Conservative estimate: ML-DSA-44 verification uses ~5-10M gas.
-            // Total gas ≈ 12M, multiplied by maxFeePerGas for worst-case cost.
-            let pqEstimatedGas: UInt64 = 12_000_000  // verification + call + preVerification
-            let gasPrice = max(maxFeeWei, 1_000_000_000) // at least 1 gwei
-            let gasCostWei = BigUInt(pqEstimatedGas) * BigUInt(gasPrice)
-            // Apply 1.5x safety margin on the gas reserve
-            let safeGasCost = gasCostWei * BigUInt(3) / BigUInt(2)
+            // Uses live network gas price for accuracy.
+            let gasCostWei = PQAccountViewModel.estimatePQGasCost(liveGasPrice: liveGasPriceWei)
+            // Apply 1.5x safety margin on the gas reserve for the Max button
+            let safeGasCost = gasCostWei * BigUInt(15) / BigUInt(10)
             
             guard !(safeGasCost >= balance.wei) else {
                 amount = "0"

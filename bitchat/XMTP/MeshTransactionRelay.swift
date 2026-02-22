@@ -190,9 +190,14 @@ final class MeshTransactionRelay: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             guard let self = self else { return }
-            let queued = self.pendingRelays.filter { $0.status == .queued }
-            guard !queued.isEmpty else { return }
-            SecureLogger.info("📡 BLE peer connected — retrying \(queued.count) queued tx(s) via mesh", category: .session)
+            // Retry queued relays AND relays stuck in .relaying (BLE send may have
+            // failed silently for a previous peer). The retryQueuedTransactions()
+            // method handles unsticking .relaying → .queued after timeout.
+            let retriable = self.pendingRelays.filter {
+                $0.status == .queued || $0.status == .relaying || $0.status == .awaitingConfirmation
+            }
+            guard !retriable.isEmpty else { return }
+            SecureLogger.info("📡 BLE peer connected — retrying \(retriable.count) pending tx(s) via mesh", category: .session)
             self.retryNow()
         }
     }
@@ -1006,40 +1011,51 @@ final class MeshTransactionRelay: ObservableObject {
     }
     
     private func hasInternetConnectivity() async -> Bool {
-        // Quick connectivity check using reliable public endpoints
-        // Try BOTH Tor session and direct URLSession — Tor may not be bootstrapped
-        let sessions: [URLSession] = [URLSession.shared, TorURLSession.shared.session]
+        // Quick connectivity check with aggressive timeout.
+        // Uses a task group so ALL checks race concurrently — first success wins.
+        // Overall 4s cap prevents blocking the BLE relay path when WiFi is connected
+        // but has no actual internet (NWPathMonitor says "satisfied" optimistically).
         let checkURLs = [
             "https://sepolia.drpc.org",     // Fast, reliable public endpoint
             "https://rpc.flashbots.net"     // Fallback
         ]
         
-        for session in sessions {
-            for urlString in checkURLs {
-                guard let url = URL(string: urlString) else { continue }
-                var request = URLRequest(url: url)
-                request.httpMethod = "POST"
-                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                // Simple eth_chainId request
-                request.httpBody = try? JSONSerialization.data(withJSONObject: [
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "eth_chainId",
-                    "params": []
-                ])
-                request.timeoutInterval = 5
-                
-                do {
-                    let (_, response) = try await session.data(for: request)
-                    if (response as? HTTPURLResponse)?.statusCode == 200 {
-                        return true
+        return await withTaskGroup(of: Bool.self) { group in
+            // Race all checks concurrently (both sessions × both URLs)
+            for session in [URLSession.shared, TorURLSession.shared.session] {
+                for urlString in checkURLs {
+                    group.addTask {
+                        guard let url = URL(string: urlString) else { return false }
+                        var request = URLRequest(url: url)
+                        request.httpMethod = "POST"
+                        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                        request.httpBody = try? JSONSerialization.data(withJSONObject: [
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "eth_chainId",
+                            "params": []
+                        ])
+                        request.timeoutInterval = 4
+                        
+                        do {
+                            let (_, response) = try await session.data(for: request)
+                            return (response as? HTTPURLResponse)?.statusCode == 200
+                        } catch {
+                            return false
+                        }
                     }
-                } catch {
-                    continue
                 }
             }
+            
+            // Return true as soon as ANY check succeeds
+            for await result in group {
+                if result {
+                    group.cancelAll()
+                    return true
+                }
+            }
+            return false
         }
-        return false
     }
     
     private func updateRelayStatus(_ id: String, status: RelayStatus, relayedVia: String?) {
@@ -1075,24 +1091,26 @@ final class MeshTransactionRelay: ObservableObject {
         
         // ── Unstick relays stuck in awaitingConfirmation for too long ──
         // If the confirm/reject BLE packet never arrives (disconnect, packet drop),
-        // the relay would be stuck forever. Requeue after 90 seconds for retry.
+        // the relay would be stuck forever. Requeue after 30 seconds for retry.
         let now = Date()
         let staleConfirmations = pendingRelays.filter {
             $0.status == .awaitingConfirmation &&
-            now.timeIntervalSince($0.statusChangedAt) > 90
+            now.timeIntervalSince($0.statusChangedAt) > 30
         }
         for stale in staleConfirmations {
-            SecureLogger.warning("⏳ Relay \(stale.id.prefix(8))… stuck in awaitingConfirmation for >90s — requeuing", category: .session)
+            SecureLogger.warning("⏳ Relay \(stale.id.prefix(8))… stuck in awaitingConfirmation for >30s — requeuing", category: .session)
             updateRelayStatus(stale.id, status: .queued, relayedVia: nil)
         }
         
-        // Also unstick relays stuck in .relaying (BLE send started but never progressed)
+        // Also unstick relays stuck in .relaying (BLE send started but never progressed).
+        // Reduced from 60s to 15s — BLE sends complete in <2s; if stuck longer, the peer
+        // likely disconnected or the packet was lost.
         let staleRelaying = pendingRelays.filter {
             $0.status == .relaying &&
-            now.timeIntervalSince($0.statusChangedAt) > 60
+            now.timeIntervalSince($0.statusChangedAt) > 15
         }
         for stale in staleRelaying {
-            SecureLogger.warning("⏳ Relay \(stale.id.prefix(8))… stuck in relaying for >60s — requeuing", category: .session)
+            SecureLogger.warning("⏳ Relay \(stale.id.prefix(8))… stuck in relaying for >15s — requeuing", category: .session)
             updateRelayStatus(stale.id, status: .queued, relayedVia: nil)
         }
         
