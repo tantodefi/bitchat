@@ -333,7 +333,7 @@ extension ChatViewModel {
     /// Send a voice note via XMTP to the current XMTP conversation
     @MainActor
     func sendXMTPVoiceNote(from sourceURL: URL, to peerID: PeerID) {
-        let minimumVoiceBytes = 1024
+        let minimumVoiceBytes = 100
         guard XMTPServiceContainer.isConfigured, XMTPServiceContainer.shared.isInitialized else {
             addSystemMessage("❌ XMTP not connected")
             return

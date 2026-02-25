@@ -236,6 +236,10 @@ final class TransactionSigner {
             rpcURLs = ["https://sepolia.drpc.org", "https://rpc2.sepolia.org", "https://1rpc.io/sepolia"]
         case 8453:
             rpcURLs = ["https://mainnet.base.org", "https://base.llamarpc.com"]
+        case 42161:
+            rpcURLs = ["https://arb1.arbitrum.io/rpc", "https://arbitrum.llamarpc.com", "https://rpc.ankr.com/arbitrum"]
+        case 421614:
+            rpcURLs = ["https://sepolia-rollup.arbitrum.io/rpc", "https://arbitrum-sepolia-rpc.publicnode.com"]
         default:
             // Even for unsupported chains, check cache before throwing
             if let cachedNonce = loadNonceFromCache(for: address, chainId: chainId) {
@@ -256,7 +260,7 @@ final class TransactionSigner {
         ]
         
         // Use Tor for mainnet, direct for testnets
-        let session = (chainId == 1 || chainId == 8453) ? TorURLSession.shared.session : URLSession.shared
+        let session = (chainId == 1 || chainId == 8453 || chainId == 42161) ? TorURLSession.shared.session : URLSession.shared
 
         var lastError: Error = TransactionError.rpcFailed
         
@@ -381,6 +385,10 @@ final class TransactionSigner {
             rpcURLs = ["https://sepolia.drpc.org", "https://rpc2.sepolia.org", "https://1rpc.io/sepolia"]
         case 8453:
             rpcURLs = ["https://mainnet.base.org", "https://base.llamarpc.com"]
+        case 42161:
+            rpcURLs = ["https://arb1.arbitrum.io/rpc", "https://arbitrum.llamarpc.com", "https://rpc.ankr.com/arbitrum"]
+        case 421614:
+            rpcURLs = ["https://sepolia-rollup.arbitrum.io/rpc", "https://arbitrum-sepolia-rpc.publicnode.com"]
         default:
             throw TransactionError.unsupportedChain
         }
@@ -401,7 +409,7 @@ final class TransactionSigner {
             "params": [txObject]
         ]
         
-        let session = (chainId == 1 || chainId == 8453) ? TorURLSession.shared.session : URLSession.shared
+        let session = (chainId == 1 || chainId == 8453 || chainId == 42161) ? TorURLSession.shared.session : URLSession.shared
 
         var lastError: Error = TransactionError.rpcFailed
         

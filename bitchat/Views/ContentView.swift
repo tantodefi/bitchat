@@ -2003,7 +2003,8 @@ private extension ContentView {
         }
         recordingStartDate = nil
         if send {
-            let minimumDuration: TimeInterval = 1.0
+            let minimumDuration: TimeInterval = 0.2
+            let capturedDuration = recordingDuration
             VoiceRecorder.shared.stopRecording { url in
                 DispatchQueue.main.async {
                     guard
@@ -2011,15 +2012,16 @@ private extension ContentView {
                         let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
                         let fileSize = attributes[.size] as? NSNumber,
                         fileSize.intValue > 0,
-                        recordingDuration >= minimumDuration
+                        capturedDuration >= minimumDuration
                     else {
                         if let url = url {
                             try? FileManager.default.removeItem(at: url)
                         }
-                        recordingAlertMessage = recordingDuration < minimumDuration
-                            ? "Recording is too short."
-                            : "Recording failed to save."
-                        showRecordingAlert = true
+                        // Silently discard too-short recordings (e.g. accidental taps)
+                        if capturedDuration >= minimumDuration {
+                            recordingAlertMessage = "Recording failed to save."
+                            showRecordingAlert = true
+                        }
                         return
                     }
                     viewModel.sendVoiceNote(at: url)

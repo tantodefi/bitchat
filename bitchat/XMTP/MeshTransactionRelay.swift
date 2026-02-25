@@ -75,6 +75,7 @@ final class MeshTransactionRelay: ObservableObject {
     private let rpcEndpoints: [UInt64: String] = [
         1: "https://rpc.flashbots.net",                      // Ethereum mainnet (Flashbots Protect)
         11155111: "https://sepolia.drpc.org",                 // Sepolia testnet (dRPC - reliable)
+        42161: "https://arb1.arbitrum.io/rpc",               // Arbitrum One mainnet
         421614: "https://sepolia-rollup.arbitrum.io/rpc",     // Arbitrum Sepolia testnet
         8453: "https://mainnet.base.org"                     // Base mainnet
     ]
@@ -83,6 +84,7 @@ final class MeshTransactionRelay: ObservableObject {
     private let fallbackRPCs: [UInt64: [String]] = [
         1: ["https://eth.llamarpc.com", "https://rpc.ankr.com/eth"],
         11155111: ["https://rpc2.sepolia.org", "https://1rpc.io/sepolia"],
+        42161: ["https://arbitrum.llamarpc.com", "https://rpc.ankr.com/arbitrum"],
         421614: ["https://arbitrum-sepolia-rpc.publicnode.com"],
         8453: ["https://base.llamarpc.com", "https://rpc.ankr.com/base"]
     ]
@@ -707,7 +709,7 @@ final class MeshTransactionRelay: ObservableObject {
         ]
         
         // Use Tor for mainnet chains, direct for testnets
-        let isMainnet = payload.chainId == 1 || payload.chainId == 8453
+        let isMainnet = payload.chainId == 1 || payload.chainId == 8453 || payload.chainId == 42161
         let session = isMainnet ? TorURLSession.shared.session : URLSession.shared
 
         var lastError: Error = TransactionError.rpcFailed
@@ -884,7 +886,7 @@ final class MeshTransactionRelay: ObservableObject {
     /// - Returns: Receipt result, or nil if receipt not available after timeout.
     private func pollForReceipt(txHash: String, chainId: UInt64, maxAttempts: Int = 15, intervalSeconds: UInt64 = 4) async -> TxReceiptResult? {
         // Use Tor session for mainnet chains
-        let isMainnet = chainId == 1 || chainId == 8453
+        let isMainnet = chainId == 1 || chainId == 8453 || chainId == 42161
         let session = isMainnet ? TorURLSession.shared.session : URLSession.shared
 
         guard let primaryRPC = rpcEndpoints[chainId] else { return nil }
