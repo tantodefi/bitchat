@@ -406,7 +406,7 @@
 				B8C407587481BBB190741C93 /* XCRemoteSwiftPackageReference "swift-secp256k1" */,
 				A6E3E56E2E77036A0032EA8A /* XCLocalSwiftPackageReference "localPackages/BitLogger" */,
 				A6E3EA7D2E7706720032EA8A /* XCLocalSwiftPackageReference "localPackages/Arti" */,
-				PQ0001007481BBB190741C93 /* XCRemoteSwiftPackageReference "SwiftDilithium" */,
+				PQ0001007481BBB190741C93 /* XCLocalSwiftPackageReference "localPackages/SwiftDilithium" */,
 				PQ0002007481BBB190741C93 /* XCRemoteSwiftPackageReference "BigInt" */,
 				PQ0003007481BBB190741C93 /* XCRemoteSwiftPackageReference "Digest" */,
 				HB0001002E77069A0032EA8A /* XCLocalSwiftPackageReference "localPackages/HeliosBridge" */,
@@ -1091,6 +1091,10 @@
 			isa = XCLocalSwiftPackageReference;
 			relativePath = localPackages/HeliosBridge;
 		};
+		PQ0001007481BBB190741C93 /* XCLocalSwiftPackageReference "localPackages/SwiftDilithium" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = localPackages/SwiftDilithium;
+		};
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCRemoteSwiftPackageReference section */
@@ -1102,14 +1106,7 @@
 				version = 0.21.1;
 			};
 		};
-		PQ0001007481BBB190741C93 /* XCRemoteSwiftPackageReference "SwiftDilithium" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/leif-ibsen/SwiftDilithium";
-			requirement = {
-				kind = upToNextMajorVersion;
-				minimumVersion = 3.5.0;
-			};
-		};
+/* Removed — SwiftDilithium is now local */
 		PQ0002007481BBB190741C93 /* XCRemoteSwiftPackageReference "BigInt" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/leif-ibsen/BigInt";
@@ -1165,7 +1162,6 @@
 		};
 		PQ0011008464F1EA38F4E286 /* SwiftDilithium */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = PQ0001007481BBB190741C93 /* XCRemoteSwiftPackageReference "SwiftDilithium" */;
 			productName = SwiftDilithium;
 		};
 		PQ0012008464F1EA38F4E286 /* BigInt */ = {
@@ -1180,7 +1176,6 @@
 		};
 		PQ0021008464F1EA38F4E286 /* SwiftDilithium */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = PQ0001007481BBB190741C93 /* XCRemoteSwiftPackageReference "SwiftDilithium" */;
 			productName = SwiftDilithium;
 		};
 		PQ0022008464F1EA38F4E286 /* BigInt */ = {

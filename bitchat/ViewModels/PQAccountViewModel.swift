@@ -123,6 +123,11 @@ final class PQAccountViewModel: ObservableObject {
     /// UserDefaults key for persisting the PQ counterfactual address
     /// (CREATE2 address is deterministic, safe to cache once computed)
     private static let persistedAddressKey = "pq-account-address"
+
+    /// UserDefaults key for the expansion version that produced the persisted address.
+    /// If this doesn't match MLDSAKeyExpander.expansionVersion, the persisted address
+    /// is stale (was computed with an older expansion algorithm) and must be cleared.
+    private static let persistedExpansionVersionKey = "pq-expansion-version"
     
     /// Whether the deployment services are configured (Pimlico API key set)
     var canDeploy: Bool {
@@ -165,6 +170,48 @@ final class PQAccountViewModel: ObservableObject {
     /// Call after `configure()` but before `initializeKeys()`.
     func restoreCachedAddressIfNeeded() {
         guard accountAddress == nil else { return }
+
+        // ── Stale expansion detection ──
+        // If the persisted address was derived from an older key expansion version,
+        // the on-chain PKContract has wrong data and the account must be redeployed.
+        let storedVersion = UserDefaults.standard.string(forKey: Self.persistedExpansionVersionKey)
+        let currentVersion = MLDSAKeyExpander.expansionVersion
+
+        // If there's a persisted address but NO version tag, it was created before
+        // versioning was added → treat as stale (version "1" predates NTT fix).
+        if Self.loadPersistedAccountAddress() != nil && storedVersion == nil {
+            SecureLogger.warning(
+                "PQ key expansion: no version stored — pre-versioning deployment detected. "
+                + "Clearing stale address and deployment state — account must be redeployed.",
+                category: .session
+            )
+            UserDefaults.standard.removeObject(forKey: Self.persistedAddressKey)
+            UserDefaults.standard.removeObject(forKey: Self.deployedChainsKey)
+            UserDefaults.standard.set(currentVersion, forKey: Self.persistedExpansionVersionKey)
+            chainStatuses = chainStatuses.map { status in
+                PQChainDeploymentStatus(chain: status.chain, isDeployed: false, isDeploying: false)
+            }
+            state = .notInitialized
+            return
+        }
+
+        if let storedVersion, storedVersion != currentVersion {
+            SecureLogger.warning(
+                "PQ key expansion version changed (\(storedVersion) → \(currentVersion)). "
+                + "Clearing stale address and deployment state — account must be redeployed.",
+                category: .session
+            )
+            UserDefaults.standard.removeObject(forKey: Self.persistedAddressKey)
+            UserDefaults.standard.removeObject(forKey: Self.deployedChainsKey)
+            UserDefaults.standard.set(currentVersion, forKey: Self.persistedExpansionVersionKey)
+            // Also clear in-memory deployment flags (were set from stale UserDefaults in configure())
+            chainStatuses = chainStatuses.map { status in
+                PQChainDeploymentStatus(chain: status.chain, isDeployed: false, isDeploying: false)
+            }
+            state = .notInitialized
+            return
+        }
+
         if let cached = Self.loadPersistedAccountAddress() {
             accountAddress = cached
             // If any chain was persisted as deployed, honour that state
@@ -278,6 +325,7 @@ final class PQAccountViewModel: ObservableObject {
                 if let address {
                     accountAddress = address
                     Self.persistAccountAddress(address)
+                    await pqKeyManager.setAccountAddress(address)
                     
                     // Check deployment status on all configured chains
                     await checkAllChainDeployments(address: address)
@@ -669,7 +717,25 @@ final class PQAccountViewModel: ObservableObject {
                 }
             }
             
-            lastError = error.localizedDescription
+            // Translate common errors into user-friendly messages
+            let userMessage: String
+            if case PQTransactionError.insufficientBalance(let bal, let send, let gas) = error {
+                let total = send + gas
+                let shortfall = total - bal
+                userMessage = String(format: "Not enough ETH for PQ transaction.\n\nBalance: %.6f ETH\nSend amount: %.6f ETH\nGas (PQ signature verification): %.6f ETH\nTotal needed: %.6f ETH\n\nYou need ~%.4f more ETH.", bal, send, gas, total, max(shortfall, 0))
+            } else {
+                let desc = error.localizedDescription
+                if desc.contains("AA21") && desc.contains("prefund") {
+                    userMessage = "Your PQ smart account doesn't have enough ETH to pay for gas. Send ETH to your PQ account address first, then retry."
+                } else if desc.contains("AA23") {
+                    userMessage = "PQ transaction validation failed. This can happen if a recent ETH transfer hasn't fully propagated yet. Please wait 30 seconds and try again."
+                } else if desc.contains("AA25") {
+                    userMessage = "PQ account nonce is invalid. Please try again."
+                } else {
+                    userMessage = desc
+                }
+            }
+            lastError = userMessage
             isProcessingTransaction = false
             SecureLogger.error("PQ transaction failed: \(error)", category: .session)
             return nil
@@ -765,6 +831,7 @@ final class PQAccountViewModel: ObservableObject {
         // Clear persisted deployment state
         UserDefaults.standard.removeObject(forKey: Self.deployedChainsKey)
         UserDefaults.standard.removeObject(forKey: Self.persistedAddressKey)
+        UserDefaults.standard.removeObject(forKey: Self.persistedExpansionVersionKey)
     }
     
     // MARK: - Deployment Persistence
@@ -787,6 +854,7 @@ final class PQAccountViewModel: ObservableObject {
     /// Persist the PQ counterfactual address (deterministic via CREATE2, safe to cache).
     private static func persistAccountAddress(_ address: String) {
         UserDefaults.standard.set(address, forKey: persistedAddressKey)
+        UserDefaults.standard.set(MLDSAKeyExpander.expansionVersion, forKey: persistedExpansionVersionKey)
     }
     
     /// Load persisted PQ account address, if any.

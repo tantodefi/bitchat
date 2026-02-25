@@ -19,6 +19,11 @@ struct CrossChainSwapView: View {
     
     @Environment(\.dismiss) private var dismiss
     
+    // Token selection
+    @StateObject private var tokenStore = TokenStore.shared
+    @State private var selectedAsset: SelectedAsset = .eth
+    @State private var showTokenPicker: Bool = false
+    
     // Form state
     @State private var sourceChainId: UInt64 = 1
     @State private var destinationChainId: UInt64 = 10
@@ -54,6 +59,9 @@ struct CrossChainSwapView: View {
                 VStack(spacing: 24) {
                     // MARK: - Chain Selection
                     chainSelectionSection
+                    
+                    // MARK: - Token Selection
+                    tokenSelectionSection
                     
                     // MARK: - Amount Input
                     amountSection
@@ -103,13 +111,109 @@ struct CrossChainSwapView: View {
             .task {
                 await loadChains()
             }
+            .sheet(isPresented: $showTokenPicker) {
+                NavigationStack {
+                    List {
+                        // Native ETH
+                        Section {
+                            Button {
+                                selectedAsset = .eth
+                                showTokenPicker = false
+                            } label: {
+                                HStack(spacing: 12) {
+                                    ETHIconView(size: 28)
+                                        .frame(width: 36, height: 36)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("ETH")
+                                            .font(.headline)
+                                            .foregroundColor(.primary)
+                                        Text("Native Ether")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                    }
+                                    Spacer()
+                                    if selectedAsset.isETH {
+                                        Image(systemName: "checkmark.circle.fill")
+                                            .foregroundColor(.accentColor)
+                                    }
+                                }
+                            }
+                            .buttonStyle(.plain)
+                        } header: {
+                            Text("Native")
+                        }
+                        
+                        // ERC-20 tokens on source chain
+                        Section {
+                            if sourceChainTokens.isEmpty {
+                                Text("No ERC-20 tokens on this chain")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            } else {
+                                ForEach(sourceChainTokens, id: \.symbol) { token in
+                                    let isSelected: Bool = {
+                                        if case .token(let t) = selectedAsset {
+                                            return t.symbol == token.symbol
+                                        }
+                                        return false
+                                    }()
+                                    
+                                    Button {
+                                        selectedAsset = .token(token)
+                                        showTokenPicker = false
+                                    } label: {
+                                        HStack(spacing: 12) {
+                                            TokenIconView(token: token, size: 28)
+                                                .frame(width: 36, height: 36)
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                Text(token.symbol)
+                                                    .font(.headline)
+                                                    .foregroundColor(.primary)
+                                                Text(token.name)
+                                                    .font(.caption)
+                                                    .foregroundColor(.secondary)
+                                            }
+                                            Spacer()
+                                            if isSelected {
+                                                Image(systemName: "checkmark.circle.fill")
+                                                    .foregroundColor(.accentColor)
+                                            }
+                                        }
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                        } header: {
+                            Text("ERC-20 Tokens")
+                        }
+                    }
+                    .navigationTitle("Select Token")
+                    #if os(iOS)
+                    .navigationBarTitleDisplayMode(.inline)
+                    #endif
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Done") { showTokenPicker = false }
+                        }
+                    }
+                }
+            }
             .onChange(of: amount) { _ in
                 refreshQuote()
             }
             .onChange(of: sourceChainId) { _ in
+                // Reset to ETH if current token isn't available on the new source chain
+                if case .token(let token) = selectedAsset {
+                    if token.address(onChainId: Int(sourceChainId)) == nil {
+                        selectedAsset = .eth
+                    }
+                }
                 refreshQuote()
             }
             .onChange(of: destinationChainId) { _ in
+                refreshQuote()
+            }
+            .onChange(of: selectedAsset) { _ in
                 refreshQuote()
             }
         }
@@ -202,7 +306,7 @@ struct CrossChainSwapView: View {
                     .keyboardType(.decimalPad)
                     .textFieldStyle(.plain)
                 
-                Text(sourceChain?.symbol ?? "ETH")
+                Text(selectedAsset.symbol)
                     .font(.headline)
                     .foregroundColor(.secondary)
             }
@@ -217,11 +321,74 @@ struct CrossChainSwapView: View {
                         .font(.caption)
                         .foregroundColor(.secondary)
                     
-                    Text("— \(sourceChain.symbol)")
+                    if selectedAsset.isETH {
+                        Text("— \(sourceChain.symbol)")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    } else if case .token(let token) = selectedAsset,
+                              let network = EthereumBalanceService.Network.from(chainId: Int(sourceChain.id)),
+                              let bal = tokenStore.balance(for: token, on: network) {
+                        Text("\(bal.formattedBalance) \(token.symbol)")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    } else {
+                        Text("— \(selectedAsset.symbol)")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Tokens available on the currently selected source chain.
+    private var sourceChainTokens: [TokenMetadata] {
+        tokenStore.tokens(forChainId: Int(sourceChainId))
+    }
+    
+    private var tokenSelectionSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Token")
+                .font(.headline)
+            
+            Button {
+                showTokenPicker = true
+            } label: {
+                HStack(spacing: 12) {
+                    if case .token(let token) = selectedAsset {
+                        TokenIconView(token: token, size: 28)
+                            .frame(width: 36, height: 36)
+                    } else {
+                        ETHIconView(size: 28)
+                            .frame(width: 36, height: 36)
+                    }
+                    
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(selectedAsset.symbol)
+                            .font(.headline)
+                            .foregroundColor(.primary)
+                        Text(selectedAsset.isETH ? "Native Ether" : "ERC-20 Token")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    
+                    Spacer()
+                    
+                    if !sourceChainTokens.isEmpty {
+                        Text("\(sourceChainTokens.count) token\(sourceChainTokens.count == 1 ? "" : "s")")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    
+                    Image(systemName: "chevron.right")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
+                .padding()
+                .background(Color(.systemGray).opacity(0.1))
+                .cornerRadius(12)
             }
+            .buttonStyle(.plain)
         }
     }
     
@@ -260,15 +427,15 @@ struct CrossChainSwapView: View {
             }
             
             VStack(spacing: 8) {
-                quoteRow(label: "You send", value: formatAmount(quote.sourceAmount), suffix: sourceChain?.symbol ?? "ETH")
+                quoteRow(label: "You send", value: formatAmount(quote.sourceAmount), suffix: selectedAsset.symbol)
                 
                 Divider()
                 
-                quoteRow(label: "You receive (est.)", value: formatAmount(quote.destinationAmount), suffix: destinationChain?.symbol ?? "ETH")
+                quoteRow(label: "You receive (est.)", value: formatAmount(quote.destinationAmount), suffix: selectedAsset.symbol)
                 
                 Divider()
                 
-                quoteRow(label: "Fee", value: formatAmount(quote.fee), suffix: sourceChain?.symbol ?? "ETH")
+                quoteRow(label: "Fee", value: formatAmount(quote.fee), suffix: selectedAsset.symbol)
                 
                 Divider()
                 
@@ -488,8 +655,9 @@ struct CrossChainSwapView: View {
             return
         }
         
-        // Convert to wei
-        let weiAmount = String(format: "%.0f", amountValue * pow(10, 18))
+        // Convert to smallest unit using the selected asset's decimals
+        let decimals = Double(selectedAsset.decimals)
+        let weiAmount = String(format: "%.0f", amountValue * pow(10, decimals))
         
         isLoadingQuote = true
         quoteError = nil
@@ -543,7 +711,8 @@ struct CrossChainSwapView: View {
     
     private func formatAmount(_ weiString: String) -> String {
         guard let wei = Decimal(string: weiString) else { return "0" }
-        let eth = wei / Decimal(pow(10.0, 18.0))
+        let decimals = Double(selectedAsset.decimals)
+        let eth = wei / Decimal(pow(10.0, decimals))
         
         let formatter = NumberFormatter()
         formatter.minimumFractionDigits = 0

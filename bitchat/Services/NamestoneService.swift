@@ -12,7 +12,6 @@
 //
 
 import Foundation
-import Tor
 
 /// Service for managing ENS subdomains via Namestone API
 actor NamestoneService {
@@ -362,7 +361,7 @@ actor NamestoneService {
         return normalized
     }
     
-    /// Make a GET request
+    /// Make a GET request — uses clearnet (namestone.com is a public HTTPS API)
     private func get<T: Decodable>(endpoint: String, params: [String: String]) async throws -> T {
         var components = URLComponents(string: "\(baseURL)/\(endpoint)")!
         components.queryItems = params.map { URLQueryItem(name: $0.key, value: $0.value) }
@@ -376,14 +375,14 @@ actor NamestoneService {
         request.addValue(apiKey, forHTTPHeaderField: "Authorization")
         request.addValue("application/json", forHTTPHeaderField: "Accept")
         
-        let (data, response) = try await TorURLSession.shared.session.data(for: request)
+        let (data, response) = try await URLSession.shared.data(for: request)
         
         try validateResponse(response, data: data)
         
         return try JSONDecoder().decode(T.self, from: data)
     }
     
-    /// Make a POST request
+    /// Make a POST request — uses clearnet (namestone.com is a public HTTPS API)
     private func post<T: Decodable>(endpoint: String, body: [String: Any]) async throws -> T {
         guard let url = URL(string: "\(baseURL)/\(endpoint)") else {
             throw NamestoneError.invalidURL
@@ -396,7 +395,7 @@ actor NamestoneService {
         request.addValue("application/json", forHTTPHeaderField: "Accept")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         
-        let (data, response) = try await TorURLSession.shared.session.data(for: request)
+        let (data, response) = try await URLSession.shared.data(for: request)
         
         try validateResponse(response, data: data)
         

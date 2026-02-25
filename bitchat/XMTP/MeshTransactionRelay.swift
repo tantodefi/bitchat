@@ -30,6 +30,15 @@ final class MeshTransactionRelay: ObservableObject {
     /// Failed transactions with reasons (rejected by network, not network errors)
     @Published private(set) var failedTransactions: [FailedTransaction] = []
     
+    /// Number of connected BLE peers (updated on retries and peer events)
+    @Published private(set) var connectedPeerCount: Int = 0
+    
+    /// Last relay error for debugging (shown in settings UI)
+    @Published private(set) var lastRelayError: String?
+    
+    /// Timestamp of last relay error
+    @Published private(set) var lastRelayErrorAt: Date?
+    
     /// Relay strategy setting
     @Published var allowMeshRelay: Bool {
         didSet {
@@ -169,6 +178,17 @@ final class MeshTransactionRelay: ObservableObject {
             // Device just got connectivity — immediately retry queued transactions
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
+                
+                // Force-unstick relays that were waiting for a BLE peer —
+                // now that we have internet, we can broadcast them directly.
+                let stuckRelays = self.pendingRelays.filter {
+                    $0.status == .relaying || $0.status == .awaitingConfirmation
+                }
+                for stuck in stuckRelays {
+                    SecureLogger.info("📶 Network restored — requeuing stuck relay \(stuck.id.prefix(8))… (was \(stuck.status.rawValue))", category: .session)
+                    self.updateRelayStatus(stuck.id, status: .queued, relayedVia: nil)
+                }
+                
                 let queued = self.pendingRelays.filter { $0.status == .queued }
                 if !queued.isEmpty {
                     SecureLogger.info("📶 Network restored — retrying \(queued.count) queued tx(s) immediately", category: .session)
@@ -190,12 +210,24 @@ final class MeshTransactionRelay: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             guard let self = self else { return }
-            // Retry queued relays AND relays stuck in .relaying (BLE send may have
-            // failed silently for a previous peer). The retryQueuedTransactions()
-            // method handles unsticking .relaying → .queued after timeout.
-            let retriable = self.pendingRelays.filter {
-                $0.status == .queued || $0.status == .relaying || $0.status == .awaitingConfirmation
+            
+            // Update peer count immediately when a peer connects
+            self.refreshPeerCount()
+            
+            // Force-unstick relays that are stuck in .relaying or .awaitingConfirmation.
+            // When a NEW peer connects, any relay stuck with a PREVIOUS peer should be
+            // immediately retried with the new peer — don't wait for the 15s/30s timeout
+            // in retryQueuedTransactions(). Without this, retryNow() only processes
+            // .queued relays and the stuck ones sit idle despite a fresh peer.
+            let stuckRelays = self.pendingRelays.filter {
+                $0.status == .relaying || $0.status == .awaitingConfirmation
             }
+            for stuck in stuckRelays {
+                SecureLogger.info("📡 Force-requeuing stuck relay \(stuck.id.prefix(8))… (was \(stuck.status.rawValue)) for new BLE peer", category: .session)
+                self.updateRelayStatus(stuck.id, status: .queued, relayedVia: nil)
+            }
+            
+            let retriable = self.pendingRelays.filter { $0.status == .queued }
             guard !retriable.isEmpty else { return }
             SecureLogger.info("📡 BLE peer connected — retrying \(retriable.count) pending tx(s) via mesh", category: .session)
             self.retryNow()
@@ -569,6 +601,8 @@ final class MeshTransactionRelay: ObservableObject {
         } catch {
             // Network error — keep queued for retry
             updateRelayStatus(payload.requestId, status: .queued, relayedVia: nil)
+            lastRelayError = "UserOp submission failed: \(error.localizedDescription)"
+            lastRelayErrorAt = Date()
             SecureLogger.warning("📶 UserOp bundler submission failed (will retry): \(error.localizedDescription)", category: .session)
             scheduleRetry()
         }
@@ -812,16 +846,22 @@ final class MeshTransactionRelay: ObservableObject {
             case .rpcError(let message):
                 // Real blockchain error - move to failed history (invalid nonce, insufficient funds, etc.)
                 moveToFailedHistory(relay, reason: message)
+                lastRelayError = "TX rejected: \(message)"
+                lastRelayErrorAt = Date()
                 SecureLogger.error("❌ Transaction rejected by network: \(message)", category: .session)
             default:
                 // Network/connectivity error - keep queued for retry
                 updateRelayStatus(relay.id, status: .queued, relayedVia: nil)
+                lastRelayError = "Broadcast failed (will retry): \(error.localizedDescription)"
+                lastRelayErrorAt = Date()
                 SecureLogger.warning("📶 Broadcast failed (will retry): \(error.localizedDescription)", category: .session)
                 scheduleRetry()
             }
         } catch {
             // Network error (timeout, no connection) - keep queued for retry
             updateRelayStatus(relay.id, status: .queued, relayedVia: nil)
+            lastRelayError = "Network error (will retry): \(error.localizedDescription)"
+            lastRelayErrorAt = Date()
             SecureLogger.warning("📶 Broadcast failed (will retry): \(error.localizedDescription)", category: .session)
             scheduleRetry()
         }
@@ -1001,13 +1041,54 @@ final class MeshTransactionRelay: ObservableObject {
     // MARK: - Helpers
     
     private func findRelayPeer() -> PeerID? {
-        guard let bleService = bleService else { return nil }
+        guard let bleService = bleService else {
+            connectedPeerCount = 0
+            return nil
+        }
         let peers = bleService.currentPeerSnapshots()
         let connectedPeers = peers.filter { $0.isConnected }
+        connectedPeerCount = connectedPeers.count
         guard !connectedPeers.isEmpty else { return nil }
         // Randomise which peer we relay through to distribute load
         // and avoid repeatedly hitting a peer that might be offline
         return connectedPeers.randomElement()?.peerID
+    }
+    
+    /// Refresh the connected peer count from BLE service
+    func refreshPeerCount() {
+        guard let bleService = bleService else {
+            connectedPeerCount = 0
+            return
+        }
+        let peers = bleService.currentPeerSnapshots()
+        connectedPeerCount = peers.filter { $0.isConnected }.count
+    }
+    
+    /// Whether the relay has a BLE service configured
+    var isBLEConfigured: Bool {
+        bleService != nil
+    }
+    
+    /// Manual retry triggered from UI — bypasses debounce
+    func manualRetry() {
+        lastRelayError = nil
+        lastRelayErrorAt = nil
+        refreshPeerCount()
+        
+        let retriable = pendingRelays.filter {
+            $0.status == .queued || $0.status == .relaying || $0.status == .awaitingConfirmation
+        }
+        guard !retriable.isEmpty else {
+            lastRelayError = "No pending transactions to retry"
+            lastRelayErrorAt = Date()
+            return
+        }
+        
+        SecureLogger.info("🔄 Manual retry triggered for \(retriable.count) tx(s), \(connectedPeerCount) BLE peer(s) connected", category: .session)
+        
+        // Force reset debounce
+        lastRetryAt = .distantPast
+        retryNow()
     }
     
     private func hasInternetConnectivity() async -> Bool {

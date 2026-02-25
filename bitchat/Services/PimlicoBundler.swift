@@ -43,12 +43,26 @@ actor PimlicoBundler {
     /// Estimate gas for a UserOperation
     /// Returns (preVerificationGas, verificationGasLimit, callGasLimit)
     func estimateUserOperationGas(
-        userOp: PackedUserOperation
+        userOp: PackedUserOperation,
+        senderAddress: String? = nil
     ) async throws -> GasEstimate {
-        let params: [Any] = [
+        // Use stateOverride to give the sender a large simulated balance.
+        // This prevents AA21 ("didn't pay prefund") during gas estimation —
+        // the bundler simulation requires the account to cover the worst-case
+        // prefund (totalGas × maxFee) which can be huge for ML-DSA-44 PQ accounts.
+        // The actual balance check happens client-side after estimation.
+        var params: [Any] = [
             userOpToDict(userOp),
             UserOperationBuilder.entryPointV07
         ]
+        if let sender = senderAddress {
+            let stateOverride: [String: Any] = [
+                sender: [
+                    "balance": "0x21E19E0C9BAB2400000" // 10,000 ETH — enough for any simulation
+                ]
+            ]
+            params.append(stateOverride)
+        }
         
         let result = try await call(method: "eth_estimateUserOperationGas", params: params)
         
@@ -174,6 +188,15 @@ actor PimlicoBundler {
         if let error = json["error"] as? [String: Any] {
             let code = error["code"] as? Int ?? -1
             let message = error["message"] as? String ?? "Unknown error"
+            // Log full error including data field for AA23/AA21 debugging
+            if let data = error["data"] {
+                SecureLogger.error("Bundler RPC error \(code): \(message) — data: \(data)", category: .network)
+            }
+            // Include revert data in error message for AA errors (AA23, AA24, AA21, etc.)
+            // so callers can see the full diagnostic without checking separate log lines
+            if let data = error["data"], message.contains("AA") {
+                throw BundlerError.rpcError(code, "\(message) | revertData: \(data)")
+            }
             throw BundlerError.rpcError(code, message)
         }
         

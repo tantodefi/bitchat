@@ -4,8 +4,9 @@ import Combine
 import Tor
 
 /// Coordinates when the app is allowed to start Tor and connect to Nostr relays.
-/// Policy: permit start when either location permissions are authorized OR
-/// there exists at least one mutual favorite. Otherwise, do not start.
+/// Policy: always permit core networking (Tor, Nostr, Helios). The user's Tor
+/// preference toggle controls whether traffic routes through Tor or direct.
+/// Location-specific features have their own permission guards.
 @MainActor
 final class NetworkActivationService: ObservableObject {
     static let shared = NetworkActivationService()
@@ -98,9 +99,12 @@ final class NetworkActivationService: ObservableObject {
     }
 
     private func basePolicyAllowed() -> Bool {
-        let permOK = LocationChannelManager.shared.permissionState == .authorized
-        let hasMutual = !FavoritesPersistenceService.shared.mutualFavorites.isEmpty
-        return permOK || hasMutual
+        // Always allow core networking (Tor, Nostr relays, Helios).
+        // Location-specific features (geohash channels, presence broadcasting)
+        // have their own permission guards. Previously this gated ALL networking
+        // behind location authorization || mutual favorites, which meant Tor,
+        // Helios, and wallet operations wouldn't work without location services.
+        return true
     }
 
     private func applyTorState(torDesired: Bool) {

@@ -55,6 +55,8 @@ struct WalletView: View {
     // Cancellable task for mode-switch fetches — cancelled on re-toggle
     @State private var balanceFetchTask: Task<Void, Never>?
     
+    @StateObject private var tokenStore = TokenStore.shared
+    
     // Stealth address support
     @StateObject private var stealthStore = StealthAddressStore()
     private var stealthManager: StealthAddressManager {
@@ -238,14 +240,30 @@ struct WalletView: View {
             currentFetchAddress = targetAddress
             await balanceService.fetchBalances(for: targetAddress)
             
+            // Refresh remote token list if stale (Uniswap default list)
+            await tokenStore.refreshRemoteTokenListIfNeeded()
+            
+            // Fetch token balances alongside ETH
+            await tokenStore.fetchAllTokenBalances(
+                for: targetAddress,
+                useTestnet: balanceService.useTestnet
+            )
+            
             // Auto-refresh balances periodically
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(refreshInterval))
                 guard !Task.isCancelled else { break }
                 let addr = displayAddress
-                // Skip if address changed (user switched modes)
+                // Skip if address changed (user switched modes) or if
+                // a balanceFetchTask from .onChange is already running.
                 guard addr == currentFetchAddress && !addr.isEmpty else { continue }
+                guard balanceFetchTask == nil else { continue }
                 await balanceService.fetchBalances(for: addr)
+                guard !Task.isCancelled else { break }
+                await tokenStore.fetchAllTokenBalances(
+                    for: addr,
+                    useTestnet: balanceService.useTestnet
+                )
                 // Re-verify after fetch: if the user toggled during the await,
                 // clearBalances()+fetchGeneration already discarded stale results,
                 // but double-check we don't leave isLoading in a bad state.
@@ -263,6 +281,9 @@ struct WalletView: View {
             // clearBalances() also bumps the fetch generation, which makes
             // any still-running fetchBalances() discard its remaining results.
             balanceService.clearBalances()
+            // clearBalances + fetchAllTokenBalances bump the token generation
+            // counter, so any concurrent .task-loop fetch discards stale results.
+            tokenStore.clearBalances()
             // Immediately load cached balances for the new address so the UI
             // doesn't flash empty while the network fetch runs.
             balanceService.loadCachedBalances(for: newAddress)
@@ -270,6 +291,11 @@ struct WalletView: View {
                 // Re-check after potential suspension
                 guard !Task.isCancelled, displayAddress == newAddress else { return }
                 await balanceService.fetchBalances(for: newAddress)
+                guard !Task.isCancelled else { return }
+                await tokenStore.fetchAllTokenBalances(
+                    for: newAddress,
+                    useTestnet: balanceService.useTestnet
+                )
             }
         }
         .onAppear {
@@ -571,13 +597,17 @@ struct WalletView: View {
                 
                 Spacer()
                 
-                if balanceService.isLoading {
+                if balanceService.isLoading || tokenStore.isLoadingBalances {
                     ProgressView()
                         .scaleEffect(0.8)
                 } else {
                     Button {
                         Task {
                             await balanceService.fetchBalances(for: displayAddress)
+                            await tokenStore.fetchAllTokenBalances(
+                                for: displayAddress,
+                                useTestnet: balanceService.useTestnet
+                            )
                         }
                     } label: {
                         Image(systemName: "arrow.clockwise")
@@ -607,6 +637,19 @@ struct WalletView: View {
             }()
             ForEach(networks, id: \.self) { network in
                 balanceRow(for: network)
+                
+                // Token balances for this network
+                let tokens = tokenStore.tokens(for: network)
+                let tokensWithBalance = tokens.filter { token in
+                    if let bal = tokenStore.balance(for: token, on: network) {
+                        return bal.hasBalance
+                    }
+                    return false
+                }
+                
+                ForEach(tokensWithBalance, id: \.symbol) { token in
+                    tokenBalanceRow(for: token, on: network)
+                }
             }
             
             HStack {
@@ -1148,6 +1191,40 @@ struct WalletView: View {
         .padding()
         .background(Color(.systemGray).opacity(0.1))
         .cornerRadius(8)
+    }
+    
+    private func tokenBalanceRow(for token: TokenMetadata, on network: EthereumBalanceService.Network) -> some View {
+        HStack {
+            HStack(spacing: 8) {
+                TokenIconView(token: token, size: 18)
+                    .frame(width: 20)
+                
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(token.symbol)
+                        .font(.caption)
+                        .fontWeight(.medium)
+                    Text(token.name)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            }
+            
+            Spacer()
+            
+            if let balance = tokenStore.balance(for: token, on: network) {
+                Text("\(balance.formattedBalance) \(token.symbol)")
+                    .font(.system(.caption, design: .monospaced))
+                    .fontWeight(.medium)
+            } else {
+                Text("—")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 8)
+        .background(Color(.systemGray).opacity(0.06))
+        .cornerRadius(6)
     }
     
     private func errorSection(_ error: String) -> some View {

@@ -47,6 +47,7 @@ final class TransactionSigner {
     func signAndQueueTransfer(
         to: String,
         amountWei: UInt64,
+        data: Data? = nil,
         nonce: UInt64? = nil,
         maxPriorityFeePerGas: UInt64? = nil,
         maxFeePerGas: UInt64? = nil,
@@ -79,17 +80,18 @@ final class TransactionSigner {
         
         // Estimate gas dynamically — contract wallets (PQ accounts) need more than 21000
         let gasLimit: UInt64
+        let txData = data ?? Data()
         do {
             let estimated = try await estimateGas(
-                from: address, to: to, value: amountWei, chainId: chainId
+                from: address, to: to, value: amountWei, data: txData, chainId: chainId
             )
             // Add 20% buffer for safety
             gasLimit = max(estimated * 120 / 100, 21000)
             SecureLogger.debug("📍 Gas estimate: \(estimated) → using \(gasLimit) (with 20% buffer)", category: .session)
         } catch {
-            // Fallback to standard ETH transfer gas if estimation fails
-            gasLimit = 21000
-            SecureLogger.warning("Gas estimation failed, using fallback 21000: \(error.localizedDescription)", category: .session)
+            // Fallback: use higher gas for token transfers (ERC-20 transfer ~65k)
+            gasLimit = txData.isEmpty ? 21000 : 65000
+            SecureLogger.warning("Gas estimation failed, using fallback \(gasLimit): \(error.localizedDescription)", category: .session)
         }
         
         // Sign the transaction
@@ -101,7 +103,7 @@ final class TransactionSigner {
             gasLimit: gasLimit,
             to: to,
             value: amountWei,
-            data: Data()
+            data: txData
         )
         
         // Create payload for mesh relay

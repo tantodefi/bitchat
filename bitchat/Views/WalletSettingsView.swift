@@ -69,15 +69,83 @@ struct WalletSettingsView: View {
             // MARK: - Pending Transactions
             if !meshTransactionRelay.pendingRelays.isEmpty {
                 Section {
+                    // Connected peers & relay status
+                    HStack {
+                        Label {
+                            Text("BLE Peers Connected")
+                        } icon: {
+                            Image(systemName: "antenna.radiowaves.left.and.right")
+                                .foregroundColor(meshTransactionRelay.connectedPeerCount > 0 ? .green : .secondary)
+                        }
+                        Spacer()
+                        Text("\(meshTransactionRelay.connectedPeerCount)")
+                            .font(.body.monospacedDigit())
+                            .foregroundColor(meshTransactionRelay.connectedPeerCount > 0 ? .green : .secondary)
+                    }
+                    
+                    if !meshTransactionRelay.isBLEConfigured {
+                        Label {
+                            Text("BLE service not configured — relay unavailable")
+                                .font(.caption)
+                        } icon: {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundColor(.red)
+                        }
+                    }
+                    
                     ForEach(meshTransactionRelay.pendingRelays, id: \.id) { relay in
                         MeshRelayRow(relay: relay)
                     }
+                    
+                    // Manual retry button
+                    Button {
+                        meshTransactionRelay.manualRetry()
+                    } label: {
+                        Label {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Retry Relay Now")
+                                Text("Force retry all queued transactions via BLE or RPC")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                        } icon: {
+                            Image(systemName: "arrow.clockwise.circle.fill")
+                        }
+                    }
+                    .tint(.orange)
                 } header: {
                     HStack {
                         Text("Pending Transactions")
                         Spacer()
                         Text("\(meshTransactionRelay.pendingRelays.count)")
                             .foregroundColor(.secondary)
+                    }
+                }
+                
+                // Debug error display for BLE TX relay
+                if let relayError = meshTransactionRelay.lastRelayError {
+                    Section {
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Image(systemName: "exclamationmark.bubble.fill")
+                                    .foregroundColor(.red)
+                                Text("Last Relay Error")
+                                    .font(.subheadline.bold())
+                                Spacer()
+                                if let errorAt = meshTransactionRelay.lastRelayErrorAt {
+                                    Text(errorAt, style: .relative)
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                            Text(relayError)
+                                .font(.caption.monospaced())
+                                .foregroundColor(.red)
+                                .textSelection(.enabled)
+                        }
+                        .padding(.vertical, 2)
+                    } header: {
+                        Text("Relay Debug")
                     }
                 }
             }
@@ -157,6 +225,35 @@ struct WalletSettingsView: View {
                 Text("Wallet")
             } footer: {
                 Text("Testnet mode uses Sepolia for testing without real funds.")
+            }
+            
+            // MARK: - Token Management
+            Section {
+                NavigationLink {
+                    CustomTokenSettingsView(
+                        tokenStore: TokenStore.shared,
+                        balanceService: balanceService
+                    )
+                } label: {
+                    Label {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Manage Tokens")
+                            let customCount = TokenStore.shared.customTokens.count
+                            let totalKnown = TokenStore.shared.mergedDefaultTokens.count
+                            let enabledCount = TokenStore.shared.mergedDefaultTokens.filter { TokenStore.shared.isTokenEnabled($0.symbol) }.count
+                            Text("\(enabledCount)/\(totalKnown) enabled + \(customCount) custom")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    } icon: {
+                        Image(systemName: "circle.grid.2x2.fill")
+                            .foregroundColor(.orange)
+                    }
+                }
+            } header: {
+                Text("ERC-20 Tokens")
+            } footer: {
+                Text("View default tokens and add custom ERC-20 tokens by contract address.")
             }
             
             // MARK: - Post-Quantum Account
@@ -572,6 +669,9 @@ struct WalletSettingsView: View {
             })
         }
         .task {
+            // Refresh BLE peer count for relay debug UI
+            meshTransactionRelay.refreshPeerCount()
+            
             // Load wallet address for ENS settings
             do {
                 walletAddress = try await wallet.getAddress()
@@ -664,6 +764,13 @@ struct WalletSettingsView: View {
                         }
                         .font(.caption)
                         .foregroundColor(.orange)
+                    } else if let error = helios.lastError {
+                        Text("Failed — \(error)")
+                            .font(.caption)
+                            .foregroundColor(.red)
+                        Text("Tap to retry")
+                            .font(.caption2)
+                            .foregroundColor(.blue)
                     } else {
                         Text("Available — tap to start")
                             .font(.caption)

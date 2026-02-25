@@ -205,7 +205,42 @@ struct ABIEncoder {
     static func encodeGetNonce() -> Data {
         functionSelector("getNonce()")
     }
-    
+
+    // MARK: - ERC-20 Convenience Methods
+
+    /// Encode `balanceOf(address)` calldata for an ERC-20 token.
+    static func encodeBalanceOf(owner: String) -> Data {
+        let selector = functionSelector("balanceOf(address)")
+        let params = encode(
+            types: [.address],
+            values: [.address(owner)]
+        )
+        return selector + params
+    }
+
+    /// Encode `transfer(address,uint256)` calldata for an ERC-20 token.
+    /// - Parameters:
+    ///   - to: Recipient address
+    ///   - amount: Token amount in smallest unit (e.g. 6-decimal USDC = amount * 1e6)
+    static func encodeTransfer(to: String, amount: Data) -> Data {
+        let selector = functionSelector("transfer(address,uint256)")
+        let params = encode(
+            types: [.address, .uint256],
+            values: [.address(to), .uint256(amount)]
+        )
+        return selector + params
+    }
+
+    /// Encode `approve(address,uint256)` calldata for an ERC-20 token.
+    static func encodeApprove(spender: String, amount: Data) -> Data {
+        let selector = functionSelector("approve(address,uint256)")
+        let params = encode(
+            types: [.address, .uint256],
+            values: [.address(spender), .uint256(amount)]
+        )
+        return selector + params
+    }
+
     // MARK: - Function Selector
     
     /// Compute the 4-byte function selector from a Solidity function signature

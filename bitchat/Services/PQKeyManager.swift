@@ -116,11 +116,18 @@ actor PQKeyManager {
     // MARK: - Signing
     
     /// Sign a message with ML-DSA-44. Returns a 2420-byte deterministic signature.
+    ///
+    /// Uses the standard FIPS 204 Algorithm 2 (`Sign`) which prepends the domain
+    /// separator `[0x00, 0x00]` (pure mode, empty context) before calling
+    /// `SignInternal`. The on-chain ZKNOX dilithium verifier's ISigVerifier.verify()
+    /// applies the same prefix: `mPrime = abi.encodePacked(bytes1(0), bytes1(0), m)`
+    /// before calling `verifyInternal`, so both sides must agree on the prefix.
+    ///
     /// - Parameter message: The message bytes to sign (typically a 32-byte hash)
     /// - Returns: ML-DSA-44 signature (2420 bytes)
     func sign(message: Data) throws -> Data {
         let sk = try getSecretKey()
-        let signature = sk.Sign(message: Array(message))
+        let signature = sk.Sign(message: Array(message), randomize: false)
         return Data(signature)
     }
     

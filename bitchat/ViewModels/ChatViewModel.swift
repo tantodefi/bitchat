@@ -886,7 +886,8 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         }
     }
     
-    /// Register ENS subdomain for a new user
+    /// Register ENS subdomain for a new user.
+    /// Retries with exponential backoff to handle Tor / network not being ready at boot.
     private func registerENSSubdomainForNewUser() async {
         // Check if already registered (using App Group for persistence)
         let ensKey = "ensSubdomain"
@@ -898,15 +899,17 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
             return
         }
         
+        SecureLogger.info("ENS auto-registration starting for nickname: \(nickname)", category: .network)
+        
         // Wait for XMTP to be ready with a valid inbox ID (max 30 seconds)
-        var attempts = 0
-        while attempts < 30 {
+        var waitAttempts = 0
+        while waitAttempts < 30 {
             if XMTPServiceContainer.isConfigured,
                XMTPServiceContainer.shared.clientService.inboxId != nil {
                 break
             }
             try? await Task.sleep(nanoseconds: 1_000_000_000)
-            attempts += 1
+            waitAttempts += 1
         }
         
         guard XMTPServiceContainer.isConfigured,
@@ -918,48 +921,71 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         // Get wallet address from the container
         let wallet = XMTPServiceContainer.shared.wallet
         
-        do {
-            let address = try await wallet.getAddress()
-            
-            // Try to register the ENS name
-            let success = try await NamestoneService.shared.setName(
-                name: nickname,
-                address: address,
-                xmtpInboxId: inboxId
-            )
-            
-            if success {
-                let fullName = "\(nickname).dstealth.eth"
-                await MainActor.run {
-                    groupDefaults.set(fullName, forKey: ensKey)
-                }
-                SecureLogger.info("Registered ENS name: \(fullName) with inboxId: \(inboxId.prefix(16))…", category: .network)
+        // Retry up to 5 times with exponential backoff (2s, 4s, 8s, 16s, 32s)
+        for attempt in 1...5 {
+            // Re-check in case a parallel recovery path registered it
+            guard groupDefaults.string(forKey: ensKey) == nil else {
+                SecureLogger.info("ENS already registered by recovery path, skipping", category: .network)
+                return
             }
-        } catch NamestoneError.nameAlreadyTaken {
-            // Name collision - try with a different suffix
-            let uniqueNickname = "\(nickname)-\(Int.random(in: 100...999))"
+            
             do {
                 let address = try await wallet.getAddress()
                 
+                let nameToRegister = nickname
+                SecureLogger.info("ENS registration attempt \(attempt)/5 for \(nameToRegister).dstealth.eth → \(address.prefix(10))…", category: .network)
+                
+                // Try to register the ENS name
                 let success = try await NamestoneService.shared.setName(
-                    name: uniqueNickname,
+                    name: nameToRegister,
                     address: address,
                     xmtpInboxId: inboxId
                 )
                 
                 if success {
-                    let fullName = "\(uniqueNickname).dstealth.eth"
+                    let fullName = "\(nameToRegister).dstealth.eth"
                     await MainActor.run {
                         groupDefaults.set(fullName, forKey: ensKey)
                     }
-                    SecureLogger.info("Registered ENS name (with suffix): \(fullName)", category: .network)
+                    SecureLogger.info("✅ Registered ENS name: \(fullName) with inboxId: \(inboxId.prefix(16))…", category: .network)
+                    return
+                }
+            } catch NamestoneError.nameAlreadyTaken {
+                // Name collision — try with a random suffix
+                let uniqueNickname = "\(nickname)-\(Int.random(in: 100...999))"
+                SecureLogger.info("ENS name taken, retrying as \(uniqueNickname).dstealth.eth", category: .network)
+                do {
+                    let address = try await wallet.getAddress()
+                    
+                    let success = try await NamestoneService.shared.setName(
+                        name: uniqueNickname,
+                        address: address,
+                        xmtpInboxId: inboxId
+                    )
+                    
+                    if success {
+                        let fullName = "\(uniqueNickname).dstealth.eth"
+                        await MainActor.run {
+                            groupDefaults.set(fullName, forKey: ensKey)
+                        }
+                        SecureLogger.info("✅ Registered ENS name (with suffix): \(fullName)", category: .network)
+                        return
+                    }
+                } catch {
+                    SecureLogger.error("ENS registration with suffix failed (attempt \(attempt)): \(error)", category: .network)
                 }
             } catch {
-                SecureLogger.error("Failed to register ENS with unique suffix: \(error)", category: .network)
+                SecureLogger.error("ENS registration attempt \(attempt)/5 failed: \(error.localizedDescription)", category: .network)
             }
-        } catch {
-            SecureLogger.error("Failed to register ENS: \(error)", category: .network)
+            
+            // Exponential backoff: 2s, 4s, 8s, 16s (skip sleep on last attempt)
+            if attempt < 5 {
+                let backoff = UInt64(pow(2.0, Double(attempt))) * 1_000_000_000
+                try? await Task.sleep(nanoseconds: backoff)
+            }
         }
+        
+        SecureLogger.error("❌ ENS auto-registration failed after 5 attempts for \(nickname)", category: .network)
     }
     
     func saveNickname() {

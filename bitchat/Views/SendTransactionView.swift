@@ -73,6 +73,13 @@ struct SendTransactionView: View {
     /// The address whose balance to display (EOA or PQ smart contract wallet)
     var senderAddress: String? = nil
     
+    /// Token store for ERC-20 token support
+    @StateObject private var tokenStore = TokenStore.shared
+    
+    /// Currently selected asset (ETH or an ERC-20 token)
+    @State private var selectedAsset: SelectedAsset = .eth
+    @State private var showTokenPicker = false
+    
     @State private var recipientAddress = ""
     @State private var amount = ""
     @State private var isLoading = false
@@ -118,9 +125,27 @@ struct SendTransactionView: View {
         return meshRelay.failedTransactions.contains { $0.id == txId }
     }
     
+    /// Amount in the smallest unit of the selected asset.
+    /// For ETH: wei (1e18). For ERC-20: depends on token decimals.
     private var amountInWei: UInt64? {
         guard let ethAmount = Double(amount) else { return nil }
-        return UInt64(ethAmount * 1_000_000_000_000_000_000) // 1e18
+        let decimals = Double(selectedAsset.decimals)
+        let smallest = ethAmount * pow(10, decimals)
+        guard smallest >= 0, smallest <= Double(UInt64.max) else { return nil }
+        return UInt64(smallest)
+    }
+    
+    /// Amount as BigUInt for token transfers that may exceed UInt64.
+    private var amountBigUInt: BigUInt? {
+        guard let ethAmount = Double(amount) else { return nil }
+        let decimals = Int(selectedAsset.decimals)
+        let multiplier = BigUInt(10).power(decimals)
+        // Split into whole and fractional parts for precision
+        let wholePart = BigUInt(UInt64(ethAmount))
+        let fracPart = ethAmount - Double(UInt64(ethAmount))
+        let fracScaled = BigUInt(UInt64(fracPart * pow(10, Double(min(decimals, 18)))))
+        let fracMultiplier = BigUInt(10).power(max(0, decimals - min(decimals, 18)))
+        return wholePart * multiplier + fracScaled * fracMultiplier
     }
     
     private var isValidAddress: Bool {
@@ -161,10 +186,18 @@ struct SendTransactionView: View {
         return balanceService.balances[selectedNetwork]
     }
     
-    /// Formatted available balance
+    /// Formatted available balance for the selected asset.
     private var availableBalanceText: String {
-        guard let balance = currentBalance else { return "-- ETH" }
-        return balance.formattedETH + " ETH"
+        if selectedAsset.isETH {
+            guard let balance = currentBalance else { return "-- ETH" }
+            return balance.formattedETH + " ETH"
+        } else {
+            if case .token(let token) = selectedAsset,
+               let tokenBal = tokenStore.balance(for: token, on: selectedNetwork) {
+                return tokenBal.formattedBalance + " " + token.symbol
+            }
+            return "-- \(selectedAsset.symbol)"
+        }
     }
     
     /// Current priority fee in wei
@@ -201,15 +234,22 @@ struct SendTransactionView: View {
         return Double(maxCostWei) / 1e18
     }
     
-    /// Check if amount + gas exceeds balance
+    /// Check if amount + gas exceeds balance.
+    /// For token transfers: checks token balance for the amount and ETH balance for gas.
     private var exceedsBalance: Bool {
-        guard let balance = currentBalance,
-              let sendWei = amountInWei else { return false }
+        guard let sendWei = amountInWei else { return false }
+        
+        if !selectedAsset.isETH {
+            // Token transfer: check token balance for the amount
+            if case .token(let token) = selectedAsset,
+               let tokenBal = tokenStore.balance(for: token, on: selectedNetwork) {
+                return !(tokenBal.rawBalance >= BigUInt(sendWei))
+            }
+            return false // Can't determine — don't block
+        }
+        
+        guard let balance = currentBalance else { return false }
         if isPQMode {
-            // PQ mode (no paymaster): account pays gas from its own balance.
-            // This is a lenient UI pre-check using the live network gas price.
-            // The real validation with exact bundler estimates happens in
-            // PQTransactionSigner.executeTransaction at signing time.
             let gasCostWei = PQAccountViewModel.estimatePQGasCost(liveGasPrice: liveGasPriceWei)
             let totalWei = BigUInt(sendWei) + gasCostWei
             return !(balance.wei >= totalWei)
@@ -224,6 +264,42 @@ struct SendTransactionView: View {
     var body: some View {
         NavigationStack {
             Form {
+                // MARK: - Asset Selector
+                Section {
+                    Button {
+                        showTokenPicker = true
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: selectedAsset.iconName)
+                                .font(.title2)
+                                .foregroundColor(selectedAsset.isETH ? .blue : .orange)
+                                .frame(width: 36, height: 36)
+                            
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(selectedAsset.symbol)
+                                    .font(.headline)
+                                    .foregroundColor(.primary)
+                                Text(selectedAsset.isETH ? "Native Ether" : "ERC-20 Token")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                            
+                            Spacer()
+                            
+                            Text(availableBalanceText)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            
+                            Image(systemName: "chevron.right")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                } header: {
+                    Text("Asset")
+                }
+                
                 Section {
                     TextField("Address (0x...) or name.dstealth.eth", text: $recipientAddress)
                         .font(.system(.body, design: .monospaced))
@@ -267,34 +343,50 @@ struct SendTransactionView: View {
                 Section {
                     Picker("Network", selection: $selectedNetwork) {
                         ForEach(availableNetworks, id: \.self) { network in
-                            HStack(spacing: 6) {
-                                Text(networkIcon(for: network))
-                                Text(network.rawValue)
-                            }
-                            .tag(network)
+                            Text(network.rawValue).tag(network)
                         }
                     }
                     .pickerStyle(.menu)
                     
-                    if let balance = currentBalance {
-                        HStack {
-                            Text("Balance on \(selectedNetwork.rawValue)")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                            Spacer()
-                            Text("\(balance.formattedETH) ETH")
-                                .font(.caption)
-                                .fontWeight(.medium)
+                    if selectedAsset.isETH {
+                        if let balance = currentBalance {
+                            HStack {
+                                Text("ETH Balance on \(selectedNetwork.rawValue)")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                Spacer()
+                                Text("\(balance.formattedETH) ETH")
+                                    .font(.caption)
+                                    .fontWeight(.medium)
+                            }
+                        } else {
+                            HStack {
+                                Text("ETH Balance on \(selectedNetwork.rawValue)")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                Spacer()
+                                Text("-- ETH")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
                         }
-                    } else {
+                    } else if case .token(let token) = selectedAsset {
                         HStack {
-                            Text("Balance on \(selectedNetwork.rawValue)")
+                            Text("\(token.symbol) Balance on \(selectedNetwork.rawValue)")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                             Spacer()
-                            Text("-- ETH")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
+                            if let tokenBal = tokenStore.balance(for: token, on: selectedNetwork) {
+                                Text("\(tokenBal.formattedBalance) \(token.symbol)")
+                                    .font(.caption)
+                                    .fontWeight(.medium)
+                            } else if tokenStore.isLoadingBalances {
+                                ProgressView().scaleEffect(0.6)
+                            } else {
+                                Text("-- \(token.symbol)")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
                         }
                     }
                 } header: {
@@ -317,13 +409,13 @@ struct SendTransactionView: View {
                             .keyboardType(.decimalPad)
                             .font(.system(.title2, design: .monospaced))
                         
-                        Text("ETH")
+                        Text(selectedAsset.symbol)
                             .foregroundColor(.secondary)
                     }
                     
                     HStack {
                         if let wei = amountInWei {
-                            Text("\(wei) wei")
+                            Text(selectedAsset.isETH ? "\(wei) wei" : "\(wei) units")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
@@ -350,7 +442,7 @@ struct SendTransactionView: View {
                     }
                     
                     if exceedsBalance {
-                        Text("Amount + gas exceeds available balance")
+                        Text(selectedAsset.isETH ? "Amount + gas exceeds available balance" : "Amount exceeds \(selectedAsset.symbol) balance")
                             .font(.caption)
                             .foregroundColor(.red)
                     }
@@ -549,10 +641,10 @@ struct SendTransactionView: View {
                                     .padding(.trailing, 8)
                             }
                             if isPQMode {
-                                Text(isLoading ? "Submitting UserOp..." : "Send via PQ Account")
+                                Text(isLoading ? "Submitting UserOp..." : "Send \(selectedAsset.symbol) via PQ")
                                     .fontWeight(.semibold)
                             } else {
-                                Text(isLoading ? "Signing..." : (isOnline ? "Sign & Send" : "Sign & Queue"))
+                                Text(isLoading ? "Signing..." : (isOnline ? "Sign & Send \(selectedAsset.symbol)" : "Sign & Queue"))
                                     .fontWeight(.semibold)
                             }
                             Spacer()
@@ -567,7 +659,7 @@ struct SendTransactionView: View {
                     }
                 }
             }
-            .navigationTitle(isPQMode ? "Send ETH (PQ Account)" : "Send ETH")
+            .navigationTitle(isPQMode ? "Send \(selectedAsset.symbol) (PQ)" : "Send \(selectedAsset.symbol)")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -591,6 +683,20 @@ struct SendTransactionView: View {
                     let chain: PQAccountDeployer.Chain = selectedNetwork == .arbitrumSepolia ? .arbitrumSepolia : .sepolia
                     liveGasPriceWei = await pqVM.fetchLiveGasPrice(chain: chain)
                 }
+                // Fetch token balances for the selected network
+                if let addr = senderAddress, !addr.isEmpty {
+                    await tokenStore.fetchTokenBalances(for: addr, network: selectedNetwork)
+                }
+            }
+            .sheet(isPresented: $showTokenPicker) {
+                TokenPickerView(
+                    network: selectedNetwork,
+                    ethBalance: currentBalance,
+                    tokenStore: tokenStore,
+                    balanceService: balanceService,
+                    walletAddress: senderAddress ?? "",
+                    selectedAsset: $selectedAsset
+                )
             }
             .confirmationDialog("Confirm Transaction", isPresented: $showingConfirmation) {
                 Button(isOnline ? "Sign & Send" : "Sign & Queue") {
@@ -600,9 +706,9 @@ struct SendTransactionView: View {
             } message: {
                 let displayRecipient = resolvedENSName ?? String(effectiveRecipientAddress.prefix(10)) + "..."
                 if isOnline {
-                    Text("Send \(amount) ETH to \(displayRecipient)?\n\nThis will sign and broadcast the transaction immediately.")
+                    Text("Send \(amount) \(selectedAsset.symbol) to \(displayRecipient)?\n\nThis will sign and broadcast the transaction immediately.")
                 } else {
-                    Text("Send \(amount) ETH to \(displayRecipient)?\n\nThis will sign the transaction locally and queue it for mesh relay when connectivity is available.")
+                    Text("Send \(amount) \(selectedAsset.symbol) to \(displayRecipient)?\n\nThis will sign the transaction locally and queue it for mesh relay when connectivity is available.")
                 }
             }
         }
@@ -615,28 +721,56 @@ struct SendTransactionView: View {
         errorMessage = nil
         
         do {
+            // Determine if this is a token transfer or native ETH transfer
+            let isTokenTransfer = !selectedAsset.isETH
+            let tokenContractAddress = selectedAsset.contractAddress(on: selectedNetwork)
+            
             if isPQMode, let pqVM = pqViewModel {
                 // PQ mode: send via ERC-4337 UserOperation through the smart account
-                // Falls back to offline mesh relay if bundler is unreachable
                 let pqChain: PQAccountDeployer.Chain = selectedNetwork == .arbitrumSepolia ? .arbitrumSepolia : .sepolia
                 let myAddress = try await wallet.getAddress()
-                let txHash = await pqVM.executeTransaction(
-                    to: effectiveRecipientAddress,
-                    value: wei,
-                    chain: pqChain,
-                    meshRelay: meshRelay,
-                    replyToPeerId: myAddress
-                )
                 
-                if let hash = txHash {
-                    submittedTxId = hash
-                    // Auto-dismiss after showing success
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                        onSuccess?()
-                        dismiss()
+                if isTokenTransfer, let contractAddr = tokenContractAddress {
+                    // ERC-20 token transfer: execute(tokenContract, 0, transfer(to, amount))
+                    let transferData = ABIEncoder.encodeTransfer(
+                        to: effectiveRecipientAddress,
+                        amount: ABIEncoder.encodeUInt256(UInt64(wei))
+                    )
+                    let txHash = await pqVM.executeTransaction(
+                        to: contractAddr,
+                        value: 0,
+                        data: transferData,
+                        chain: pqChain,
+                        meshRelay: meshRelay,
+                        replyToPeerId: myAddress
+                    )
+                    if let hash = txHash {
+                        submittedTxId = hash
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                            onSuccess?()
+                            dismiss()
+                        }
+                    } else {
+                        errorMessage = pqVM.lastError ?? "PQ token transfer failed"
                     }
                 } else {
-                    errorMessage = pqVM.lastError ?? "PQ transaction failed"
+                    // Native ETH transfer
+                    let txHash = await pqVM.executeTransaction(
+                        to: effectiveRecipientAddress,
+                        value: wei,
+                        chain: pqChain,
+                        meshRelay: meshRelay,
+                        replyToPeerId: myAddress
+                    )
+                    if let hash = txHash {
+                        submittedTxId = hash
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                            onSuccess?()
+                            dismiss()
+                        }
+                    } else {
+                        errorMessage = pqVM.lastError ?? "PQ transaction failed"
+                    }
                 }
             } else {
                 // EOA mode: sign raw transaction and queue for mesh relay
@@ -648,17 +782,36 @@ struct SendTransactionView: View {
                 
                 let myAddress = try await wallet.getAddress()
                 
-                let requestId = try await signer.signAndQueueTransfer(
-                    to: effectiveRecipientAddress,
-                    amountWei: wei,
-                    maxPriorityFeePerGas: priorityFeeWei,
-                    maxFeePerGas: maxFeeWei,
-                    replyToPeerId: myAddress,
-                    description: "Send \(amount) ETH",
-                    selectedNetwork: selectedNetwork
-                )
-                
-                submittedTxId = requestId
+                if isTokenTransfer, let contractAddr = tokenContractAddress {
+                    // ERC-20 token transfer: send 0 ETH to token contract with transfer() calldata
+                    let transferData = ABIEncoder.encodeTransfer(
+                        to: effectiveRecipientAddress,
+                        amount: ABIEncoder.encodeUInt256(UInt64(wei))
+                    )
+                    let requestId = try await signer.signAndQueueTransfer(
+                        to: contractAddr,
+                        amountWei: 0,
+                        data: transferData,
+                        maxPriorityFeePerGas: priorityFeeWei,
+                        maxFeePerGas: maxFeeWei,
+                        replyToPeerId: myAddress,
+                        description: "Send \(amount) \(selectedAsset.symbol)",
+                        selectedNetwork: selectedNetwork
+                    )
+                    submittedTxId = requestId
+                } else {
+                    // Native ETH transfer
+                    let requestId = try await signer.signAndQueueTransfer(
+                        to: effectiveRecipientAddress,
+                        amountWei: wei,
+                        maxPriorityFeePerGas: priorityFeeWei,
+                        maxFeePerGas: maxFeeWei,
+                        replyToPeerId: myAddress,
+                        description: "Send \(amount) ETH",
+                        selectedNetwork: selectedNetwork
+                    )
+                    submittedTxId = requestId
+                }
             }
         } catch {
             errorMessage = error.localizedDescription
@@ -667,8 +820,16 @@ struct SendTransactionView: View {
         isLoading = false
     }
     
-    /// Set amount to max (balance minus estimated gas)
+    /// Set amount to max (balance minus estimated gas for ETH, or full token balance)
     private func setMaxAmount() {
+        // For token transfers, use the full token balance
+        if !selectedAsset.isETH {
+            if case .token(let token) = selectedAsset,
+               let tokenBal = tokenStore.balance(for: token, on: selectedNetwork) {
+                amount = tokenBal.formattedBalance
+            }
+            return
+        }
         guard let balance = currentBalance else { return }
         
         if isPQMode {
@@ -718,17 +879,6 @@ struct SendTransactionView: View {
             Text(value)
                 .foregroundColor(highlight ? .primary : .secondary)
                 .fontWeight(highlight ? .medium : .regular)
-        }
-    }
-    
-    /// Icon for each network in the picker
-    private func networkIcon(for network: EthereumBalanceService.Network) -> String {
-        switch network {
-        case .ethereum: return "⟠"
-        case .base: return "🔵"
-        case .arbitrum: return "🔷"
-        case .sepolia: return "⟠"
-        case .arbitrumSepolia: return "🔷"
         }
     }
     

@@ -19,7 +19,7 @@ let package = Package(
         .package(path: "localPackages/Arti"),
         .package(path: "localPackages/BitLogger"),
         .package(url: "https://github.com/21-DOT-DEV/swift-secp256k1", exact: "0.21.1"),
-        .package(url: "https://github.com/leif-ibsen/SwiftDilithium", from: "3.5.0"),
+        .package(path: "localPackages/SwiftDilithium"),
         .package(url: "https://github.com/leif-ibsen/BigInt", from: "1.21.0"),
         .package(url: "https://github.com/leif-ibsen/Digest", from: "1.13.0")
         // XMTP is now provided via CocoaPods (includes SQLCipher)

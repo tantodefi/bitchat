@@ -13,6 +13,7 @@ import BitLogger
 import CryptoSwift
 import Foundation
 @preconcurrency import P256K
+import SwiftDilithium
 
 // MARK: - PackedUserOperation (ERC-4337 v0.7)
 
@@ -216,11 +217,86 @@ struct UserOperationBuilder {
         // 2. ML-DSA-44 sign the userOpHash (produces 2420 bytes)
         let mldsaSig = try await pqKeyManager.sign(message: userOpHash)
         
+        // ── AA23 Diagnostic: log signature components ──
+        let vByte = ecdsaSig.count >= 65 ? ecdsaSig[64] : 0
+        SecureLogger.info(
+            "PQ signHybrid: ecdsaSigLen=\(ecdsaSig.count)B (v=\(vByte)), mldsaSigLen=\(mldsaSig.count)B, "
+            + "userOpHash=0x\(userOpHash.map { String(format: "%02x", $0) }.joined().prefix(16))…",
+            category: .session
+        )
+        // Log first 8 bytes of each signature for cross-checking
+        let ecdsaHead = ecdsaSig.prefix(8).map { String(format: "%02x", $0) }.joined()
+        let mldsaHead = mldsaSig.prefix(8).map { String(format: "%02x", $0) }.joined()
+        SecureLogger.debug(
+            "PQ signHybrid: ecdsa[0:8]=\(ecdsaHead), mldsa[0:8]=\(mldsaHead)",
+            category: .session
+        )
+        
+        // ── AA24 Diagnostic: verify both signatures locally before submission ──
+        
+        // 2a. Verify ML-DSA-44 signature locally using SwiftDilithium
+        do {
+            let pk = try await pqKeyManager.getPublicKey()
+            let mldsaValid = pk.Verify(message: Array(userOpHash), signature: Array(mldsaSig))
+            SecureLogger.info(
+                "PQ DIAG: ML-DSA local verify (FIPS 204 pure mode) = \(mldsaValid ? "✅ PASS" : "❌ FAIL")",
+                category: .session
+            )
+            if !mldsaValid {
+                SecureLogger.error(
+                    "PQ DIAG: ⚠️ ML-DSA signature is INVALID locally — signing is broken!",
+                    category: .session
+                )
+            }
+        } catch {
+            SecureLogger.error(
+                "PQ DIAG: ML-DSA verify check error: \(error)",
+                category: .session
+            )
+        }
+        
+        // 2b. Verify ECDSA signing key matches the expected EOA address
+        do {
+            let privateKey = try await wallet.getOrCreatePrivateKey()
+            let pubKeyAgreement = try P256K.KeyAgreement.PrivateKey(
+                dataRepresentation: privateKey, format: .uncompressed
+            )
+            let uncompressedPub = pubKeyAgreement.publicKey.dataRepresentation // 65 bytes (04 + x + y)
+            let pubKeyRaw = Data(uncompressedPub.dropFirst(1)) // 64 bytes: x + y
+            let addressHash = keccak256(pubKeyRaw)
+            let derivedAddress = "0x" + addressHash.suffix(20).map { String(format: "%02x", $0) }.joined()
+            let expectedAddress = try await wallet.getAddress()
+            let addressMatch = derivedAddress.lowercased() == expectedAddress.lowercased()
+            SecureLogger.info(
+                "PQ DIAG: ECDSA key→address=\(derivedAddress.prefix(14))…, "
+                + "expected=\(expectedAddress.prefix(14))…, match=\(addressMatch ? "✅" : "❌")",
+                category: .session
+            )
+            if !addressMatch {
+                SecureLogger.error(
+                    "PQ DIAG: ⚠️ ECDSA signing key does NOT match stored preQuantumPubKey!",
+                    category: .session
+                )
+            }
+        } catch {
+            SecureLogger.error(
+                "PQ DIAG: ECDSA address check error: \(error)",
+                category: .session
+            )
+        }
+        
         // 3. ABI-encode as hybrid: encode(bytes, bytes) = [ecdsaSig, mldsaSig]
-        return ABIEncoder.encodeHybridSignature(
+        let encoded = ABIEncoder.encodeHybridSignature(
             preQuantumSig: ecdsaSig,
             postQuantumSig: mldsaSig
         )
+        
+        SecureLogger.debug(
+            "PQ signHybrid: ABI-encoded hybridSig total=\(encoded.count)B",
+            category: .session
+        )
+        
+        return encoded
     }
     
     /// Sign a hash with the EOA's secp256k1 key directly (raw, no EIP-191 prefix).
@@ -290,6 +366,21 @@ struct UserOperationBuilder {
         
         // 2. ML-DSA-44 sign with master PQ key (shared across all stealth accounts)
         let mldsaSig = try await pqKeyManager.sign(message: userOpHash)
+        
+        // ── AA23 Diagnostic: log stealth signature components ──
+        // Derive the signer address from the stealth private key for verification
+        let pubKey = try P256K.KeyAgreement.PrivateKey(dataRepresentation: stealthPrivateKey, format: .uncompressed)
+        let uncompressedPub = pubKey.publicKey.dataRepresentation // 65 bytes (04 + x + y)
+        let pubKeyHash = Data(Array(uncompressedPub.dropFirst()).sha3(.keccak256)) // hash of x||y
+        let derivedAddress = "0x" + pubKeyHash.suffix(20).map { String(format: "%02x", $0) }.joined()
+        
+        let vByte = ecdsaSig.count >= 65 ? ecdsaSig[64] : 0
+        SecureLogger.info(
+            "PQ signHybridStealth: ecdsaSigLen=\(ecdsaSig.count)B (v=\(vByte)), mldsaSigLen=\(mldsaSig.count)B, "
+            + "derivedSignerAddr=\(derivedAddress.prefix(14))…, "
+            + "userOpHash=0x\(userOpHash.map { String(format: "%02x", $0) }.joined().prefix(16))…",
+            category: .session
+        )
         
         // 3. ABI-encode as hybrid
         return ABIEncoder.encodeHybridSignature(

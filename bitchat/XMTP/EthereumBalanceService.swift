@@ -94,6 +94,16 @@ final class EthereumBalanceService: ObservableObject {
             }
         }
         
+        /// Whether this network supports standard Merkle-Patricia trie proof verification.
+        /// L2 rollups (Arbitrum, Base) use different state trie structures, so
+        /// eth_getProof results cannot be verified with the standard MPT verifier.
+        var supportsProofVerification: Bool {
+            switch self {
+            case .ethereum, .sepolia: return true
+            case .base, .arbitrum, .arbitrumSepolia: return false
+            }
+        }
+        
         var symbol: String {
             switch self {
             case .ethereum, .sepolia: return "ETH"
@@ -102,6 +112,11 @@ final class EthereumBalanceService: ObservableObject {
             }
         }
         
+        /// Look up a Network by its chain ID, or nil if not supported.
+        static func from(chainId: Int) -> Network? {
+            allCases.first { $0.chainId == chainId }
+        }
+
         /// Networks shown in mainnet mode
         static var mainnets: [Network] {
             [.ethereum, .base, .arbitrum]
@@ -403,7 +418,9 @@ final class EthereumBalanceService: ObservableObject {
         }
         
         // Tier 2: Try Phase 1 proof-consistent verification (eth_getProof)
-        if proofVerificationEnabled {
+        // Only for L1 networks — L2 rollups (Arbitrum, Base) use different state
+        // trie structures incompatible with standard MPT proof verification.
+        if proofVerificationEnabled && network.supportsProofVerification {
             if let balance = await fetchBalanceWithProof(for: address, network: network) {
                 return balance
             }
@@ -541,6 +558,18 @@ final class EthereumBalanceService: ObservableObject {
                     verificationLevel: .proofConsistent
                 )
                 
+            } catch ProofVerificationError.keyNotFound {
+                // Account doesn't exist in the state trie → confirmed zero balance.
+                // This is normal for addresses that have never transacted on this chain.
+                SecureLogger.debug(
+                    "EthereumBalanceService: Account not in state trie on \(network.rawValue) (zero balance, via \(rpcURL.host ?? "?"))",
+                    category: .network
+                )
+                await MainActor.run {
+                    proofStats.totalQueries += 1
+                    proofStats.proofVerified += 1
+                }
+                return Balance(network: network, wei: BigUInt(0), lastUpdated: Date(), verificationLevel: .proofConsistent)
             } catch {
                 SecureLogger.warning(
                     "EthereumBalanceService: Proof verification failed via \(rpcURL.host ?? "?"): \(error)",

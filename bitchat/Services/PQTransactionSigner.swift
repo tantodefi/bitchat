@@ -184,16 +184,24 @@ actor PQTransactionSigner {
         SecureLogger.info("PQ UserOp gas: maxFee=\(maxFee / 1_000_000_000)gwei, priority=\(priorityFee / 1_000_000_000)gwei", category: .session)
         
         // Build initial UserOp with HIGH placeholder gas limits for estimation.
-        // ML-DSA-44 on-chain verification is extremely gas-intensive (~2–10M gas)
+        // ML-DSA-44 on-chain verification is extremely gas-intensive (~2–20M gas)
         // so verificationGasLimit must be large enough for the bundler's simulation
-        // to complete without OOG (which surfaces as AA24 "signature validation failed").
+        // to complete without OOG. AA23 = validateUserOp reverted, AA24 = OOG.
+        // Use 20M for first tx (with deploy initCode) and 15M for subsequent txs.
+        let estimationVGL: UInt64 = deployed ? 15_000_000 : 20_000_000
+        
+        SecureLogger.info(
+            "PQ UserOp: sender=\(sender.prefix(14))…, deployed=\(deployed), nonce=\(nonce), initCode=\(initCode.count)B, VGL=\(estimationVGL)",
+            category: .session
+        )
+        
         var userOp = PackedUserOperation(
             sender: ABIEncoder.hexToData(String(sender.dropFirst(2))),
             nonce: nonce,
             initCode: initCode,
             callData: executeCalldata,
             accountGasLimits: UserOperationBuilder.packAccountGasLimits(
-                verificationGasLimit: UInt64(10_000_000),
+                verificationGasLimit: estimationVGL,
                 callGasLimit: UInt64(1_000_000)
             ),
             preVerificationGas: UInt64(500_000),
@@ -209,78 +217,191 @@ actor PQTransactionSigner {
         let dummySig = try await signUserOp(&userOp)
         userOp.signature = dummySig
         
-        // Estimate gas
-        let gasEstimate = try await bundler.estimateUserOperationGas(userOp: userOp)
-        
-        // Apply 1.2x safety multiplier — bundler estimates are tight minimums
-        // and ML-DSA-44 verification gas can vary slightly between runs.
-        let safeVerificationGas = gasEstimate.verificationGasLimit * 6 / 5
-        let safeCallGas = gasEstimate.callGasLimit * 6 / 5
-        let safePreVerificationGas = gasEstimate.preVerificationGas * 6 / 5
-        
+        // ── AA23 Diagnostic: log pre-estimation state ──
+        // The dummy signature must pass validateUserOp simulation. If AA23 occurs
+        // here, the hybrid signature (ECDSA + ML-DSA-44) failed on-chain verification.
+        let preQKeyHex = "0x" + (try await getPreQuantumKeyForFactory()).map { String(format: "%02x", $0) }.joined()
         SecureLogger.info(
-            "PQ gas estimate: vgl=\(gasEstimate.verificationGasLimit)→\(safeVerificationGas), cgl=\(gasEstimate.callGasLimit)→\(safeCallGas), pvg=\(gasEstimate.preVerificationGas)→\(safePreVerificationGas)",
+            "PQ pre-estimation: preQuantumKey(EOA)=\(preQKeyHex.prefix(14))…, "
+            + "dummySigLen=\(dummySig.count)B, sender=\(sender.prefix(14))…",
             category: .session
         )
         
-        // Update gas values with safety margin
-        userOp.accountGasLimits = UserOperationBuilder.packAccountGasLimits(
-            verificationGasLimit: safeVerificationGas,
-            callGasLimit: safeCallGas
-        )
-        userOp.preVerificationGas = PackedUserOperation.uint256Data(safePreVerificationGas)
-        
-        // Re-sign with correct gas values
-        let finalSig = try await signUserOp(&userOp)
-        userOp.signature = finalSig
-        
-        // Cache gas values for offline fallback (use safe values with multiplier)
-        saveGasCache(
-            baseGasPrice: baseGasPrice,
-            verificationGasLimit: safeVerificationGas,
-            callGasLimit: safeCallGas,
-            preVerificationGas: safePreVerificationGas,
-            nonce: nonce
-        )
-        
-        // Validate that the account has enough ETH to cover BOTH the send value
-        // AND the gas prefund. Without a paymaster, the EntryPoint requires the
-        // account to pay missingAccountFunds during validateUserOp. If the account
-        // can't cover the prefund, validateUserOp reverts → AA24 "signature error".
-        let totalGas = safeVerificationGas + safeCallGas + safePreVerificationGas
-        let requiredPrefund = totalGas * maxFee  // worst-case gas cost in wei
-        let balanceHex = try await deployer.getBalance(address: sender)
-        let senderBalance = Self.parseHexBalance(balanceHex)
-        
-        // Overflow-safe addition: if value + requiredPrefund overflows UInt64, it's definitely too much
-        let totalRequired: UInt64
-        if value > UInt64.max - requiredPrefund {
-            totalRequired = UInt64.max
-        } else {
-            totalRequired = value + requiredPrefund
-        }
-        
-        SecureLogger.info(
-            "PQ balance check: balance=\(senderBalance)wei, send=\(value)wei, gasPrefund=\(requiredPrefund)wei, total=\(totalRequired)wei",
-            category: .session
-        )
-        
-        if senderBalance < totalRequired {
-            let balanceEth = Double(senderBalance) / 1e18
-            let gasCostEth = Double(requiredPrefund) / 1e18
-            let sendEth = Double(value) / 1e18
-            throw PQTransactionError.insufficientBalance(
-                balance: balanceEth,
-                sendAmount: sendEth,
-                gasCost: gasCostEth
+        // Estimate gas — AA23 here means validateUserOp reverted on-chain
+        // Pass sender address for stateOverride (fake high balance during simulation)
+        // so AA21 doesn't fire for low-balance accounts. Real balance check is below.
+        let gasEstimate: GasEstimate
+        do {
+            gasEstimate = try await bundler.estimateUserOperationGas(
+                userOp: userOp,
+                senderAddress: sender
             )
+        } catch let error as BundlerError {
+            // Enrich AA23/AA24 errors with diagnostic context
+            let ctx = "sender=\(sender.prefix(14))…, deployed=\(deployed), nonce=\(nonce), initCode=\(initCode.count)B, sigLen=\(dummySig.count)B, VGL=\(estimationVGL)"
+            SecureLogger.error("PQ gas estimation failed [\(ctx)]: \(error)", category: .session)
+            throw PQTransactionError.bundlerRejected("Gas estimation failed: \(error.localizedDescription) [\(ctx)]")
         }
         
-        // Submit to bundler
-        let userOpHash = try await bundler.sendUserOperation(userOp: userOp)
-        SecureLogger.info("PQ UserOp submitted: \(userOpHash)", category: .session)
+        // The bundler's estimateUserOperationGas typically SKIPS signature verification
+        // during gas estimation (it replaces validateUserOp with a gas-measuring stub).
+        // This means the returned VGL only covers non-verification overhead (nonce checks,
+        // SLOADs, etc.) — NOT the cost of on-chain ML-DSA-44 signature verification.
+        //
+        // ML-DSA-44 verification on EVM (NTT transforms, modular arithmetic) costs
+        // millions of gas. The kohaku reference implementation enforces a minimum VGL
+        // of 9M (JS) / 13.5M (TS) and uses 20M in Foundry tests. The bundler has a
+        // per-UserOp total gas cap (typically 15M on Pimlico).
+        let baseVGL = gasEstimate.verificationGasLimit
+        let safeCallGas = gasEstimate.callGasLimit * 6 / 5
         
-        return userOpHash
+        // PQ signature calldata (~2.6 KB) makes the bundler underestimate PVG.
+        // Kohaku reference applies 4× multiplier with an 800K floor.
+        let safePreVerificationGas = max(gasEstimate.preVerificationGas * 4, 800_000)
+        
+        // Bundler's per-UserOp gas cap. Pimlico enforces totalGas ≤ 15M.
+        // maxVGL = cap − CGL − PVG − buffer so total stays under the cap.
+        let bundlerMaxGasPerUserOp: UInt64 = 15_000_000
+        let maxVGL = bundlerMaxGasPerUserOp - safeCallGas - safePreVerificationGas - 50_000
+        
+        // ML-DSA-44 on-chain verification always costs millions of gas. The bundler's
+        // estimate (baseVGL ~111K) only covers non-verification overhead. Per kohaku
+        // reference, enforce a 9M minimum VGL floor — skip useless low-gas attempts.
+        let minVerificationGas: UInt64 = 9_000_000
+        let vglAttempts: [UInt64] = [
+            min(max(baseVGL * 3, minVerificationGas), maxVGL),  // floor 9M, cap at maxVGL
+            maxVGL                                               // maximum (~13–14M)
+        ]
+        
+        SecureLogger.info(
+            "PQ gas estimate: vgl=\(baseVGL), cgl=\(gasEstimate.callGasLimit)→\(safeCallGas), pvg=\(gasEstimate.preVerificationGas)→\(safePreVerificationGas), attempts=\(vglAttempts.map { String($0) }.joined(separator: "/"))",
+            category: .session
+        )
+        
+        // Try each VGL level, re-signing at each step
+        var lastError: Error?
+        let ctx = "sender=\(sender.prefix(14))…, deployed=\(deployed), nonce=\(nonce)"
+        
+        for (attemptIndex, attemptVGL) in vglAttempts.enumerated() {
+            // Update gas values
+            userOp.accountGasLimits = UserOperationBuilder.packAccountGasLimits(
+                verificationGasLimit: attemptVGL,
+                callGasLimit: safeCallGas
+            )
+            userOp.preVerificationGas = PackedUserOperation.uint256Data(safePreVerificationGas)
+            
+            // Re-sign with updated gas values (changes the userOpHash)
+            let sig = try await signUserOp(&userOp)
+            userOp.signature = sig
+            
+            // Validate balance on first attempt — use MAX VGL for worst-case prefund
+            if attemptIndex == 0 {
+                // Cache gas values for offline fallback (use maxVGL for safety)
+                saveGasCache(
+                    baseGasPrice: baseGasPrice,
+                    verificationGasLimit: maxVGL,
+                    callGasLimit: safeCallGas,
+                    preVerificationGas: safePreVerificationGas,
+                    nonce: nonce
+                )
+                
+                // Use maxVGL (not current attemptVGL) so we don't falsely reject
+                // a send that would succeed at a higher VGL after AA23 retry
+                let totalGas = maxVGL + safeCallGas + safePreVerificationGas
+                let requiredPrefund = totalGas * maxFee
+                let balanceHex = try await deployer.getBalance(address: sender)
+                let senderBalance = Self.parseHexBalance(balanceHex)
+                
+                let totalRequired: UInt64
+                if value > UInt64.max - requiredPrefund {
+                    totalRequired = UInt64.max
+                } else {
+                    totalRequired = value + requiredPrefund
+                }
+                
+                SecureLogger.info(
+                    "PQ balance check: balance=\(senderBalance)wei, send=\(value)wei, gasPrefund=\(requiredPrefund)wei, total=\(totalRequired)wei",
+                    category: .session
+                )
+                
+                if senderBalance < totalRequired {
+                    let balanceEth = Double(senderBalance) / 1e18
+                    let gasCostEth = Double(requiredPrefund) / 1e18
+                    let sendEth = Double(value) / 1e18
+                    throw PQTransactionError.insufficientBalance(
+                        balance: balanceEth,
+                        sendAmount: sendEth,
+                        gasCost: gasCostEth
+                    )
+                }
+            }
+            
+            // Submit to bundler
+            do {
+                let userOpHash = try await bundler.sendUserOperation(userOp: userOp)
+                SecureLogger.info("PQ UserOp submitted: \(userOpHash) (VGL=\(attemptVGL), attempt \(attemptIndex + 1)/\(vglAttempts.count))", category: .session)
+                return userOpHash
+            } catch let error as BundlerError {
+                if case .rpcError(_, let msg) = error, msg.contains("AA23") {
+                    SecureLogger.warning(
+                        "PQ sendUserOp AA23 — VGL=\(attemptVGL) (est=\(baseVGL), attempt \(attemptIndex + 1)/\(vglAttempts.count)) [\(ctx)]",
+                        category: .session
+                    )
+                    lastError = error
+                    
+                    // Check if the highest VGL can still be covered by the balance
+                    if attemptIndex + 1 < vglAttempts.count {
+                        let nextVGL = vglAttempts[attemptIndex + 1]
+                        let nextTotalGas = nextVGL + safeCallGas + safePreVerificationGas
+                        let nextPrefund = nextTotalGas * maxFee
+                        let nextTotal = value + nextPrefund
+                        let balHex = try? await deployer.getBalance(address: sender)
+                        let bal = balHex.map { Self.parseHexBalance($0) } ?? 0
+                        if bal < nextTotal {
+                            SecureLogger.error(
+                                "PQ AA23: can't retry with higher VGL=\(nextVGL) — balance \(bal)wei < needed \(nextTotal)wei [\(ctx)]",
+                                category: .session
+                            )
+                            break
+                        }
+                        SecureLogger.info(
+                            "PQ AA23: retrying with higher VGL=\(nextVGL) (attempt \(attemptIndex + 2)/\(vglAttempts.count)) [\(ctx)]",
+                            category: .session
+                        )
+                    }
+                    continue
+                } else {
+                    // ── AA24 Diagnostic: call each verifier individually to identify the failure ──
+                    let diagHash = UserOperationBuilder.getUserOpHash(
+                        userOp: userOp,
+                        entryPoint: UserOperationBuilder.entryPointAddress,
+                        chainId: chainId
+                    )
+                    await diagnoseVerifiersOnChain(
+                        sender: sender,
+                        userOpHash: diagHash,
+                        hybridSig: userOp.signature
+                    )
+                    
+                    SecureLogger.error("PQ sendUserOp failed [\(ctx)]: \(error)", category: .session)
+                    throw PQTransactionError.bundlerRejected(
+                        "Submit failed: \(error.localizedDescription) [\(ctx)]"
+                    )
+                }
+            }
+        }
+        
+        // All VGL attempts exhausted — this indicates the issue is NOT gas-related
+        SecureLogger.error(
+            "PQ sendUserOp failed all \(vglAttempts.count) VGL attempts [\(ctx)]. "
+            + "Max VGL tried: \(vglAttempts.last ?? 0). This likely indicates an on-chain "
+            + "contract issue (not gas). Check validateUserOp logic.",
+            category: .session
+        )
+        throw PQTransactionError.bundlerRejected(
+            "Submit failed after \(vglAttempts.count) VGL escalations (max=\(vglAttempts.last ?? 0)): "
+            + "\(lastError?.localizedDescription ?? "AA23 reverted") [\(ctx)]"
+        )
     }
     
     // MARK: - Offline Mesh Relay Support
@@ -545,7 +666,7 @@ actor PQTransactionSigner {
             initCode: initCode,
             callData: placeholderCalldata,
             accountGasLimits: UserOperationBuilder.packAccountGasLimits(
-                verificationGasLimit: UInt64(10_000_000),
+                verificationGasLimit: UInt64(deployed ? 15_000_000 : 20_000_000),
                 callGasLimit: UInt64(1_000_000)
             ),
             preVerificationGas: UInt64(500_000),
@@ -560,7 +681,10 @@ actor PQTransactionSigner {
         let dummySig = try await signStealthUserOp(&userOp, stealthPrivateKey: stealthPrivateKey)
         userOp.signature = dummySig
         
-        let gasEstimate = try await bundler.estimateUserOperationGas(userOp: userOp)
+        let gasEstimate = try await bundler.estimateUserOperationGas(
+            userOp: userOp,
+            senderAddress: sender
+        )
         
         // Apply 1.5x safety multiplier (higher than normal 1.2x because deployment
         // gas can vary more, and we'd rather over-reserve than fail with AA24)
@@ -663,7 +787,7 @@ actor PQTransactionSigner {
             initCode: initCode,
             callData: placeholderCalldata,
             accountGasLimits: UserOperationBuilder.packAccountGasLimits(
-                verificationGasLimit: UInt64(10_000_000),
+                verificationGasLimit: UInt64(deployed ? 15_000_000 : 20_000_000),
                 callGasLimit: UInt64(1_000_000)
             ),
             preVerificationGas: UInt64(500_000),
@@ -678,7 +802,10 @@ actor PQTransactionSigner {
         let dummySig = try await signStealthUserOp(&estimationOp, stealthPrivateKey: stealthPrivateKey)
         estimationOp.signature = dummySig
         
-        let gasEstimate = try await bundler.estimateUserOperationGas(userOp: estimationOp)
+        let gasEstimate = try await bundler.estimateUserOperationGas(
+            userOp: estimationOp,
+            senderAddress: sender
+        )
         
         // Apply 1.5x safety multiplier — deployment + ML-DSA-44 gas can vary more
         // than normal verification, so use a wider margin for counterfactual accounts.
@@ -777,11 +904,380 @@ actor PQTransactionSigner {
             chainId: chainId
         )
         
-        return try await UserOperationBuilder.signHybrid(
+        // ── AA23 Diagnostic Logging ──
+        let eoaAddress = try await wallet.getAddress()
+        SecureLogger.info(
+            "PQ signUserOp: userOpHash=0x\(hash.map { String(format: "%02x", $0) }.joined().prefix(16))…, "
+            + "signer(EOA)=\(eoaAddress.prefix(14))…, chainId=\(chainId)",
+            category: .session
+        )
+        
+        // ── AA24 Diagnostic: verify our EOA matches the on-chain preQuantumPubKey ──
+        let senderHex = "0x" + userOp.sender.map { String(format: "%02x", $0) }.joined()
+        await verifyOnChainPreQuantumKey(sender: senderHex, currentEOA: eoaAddress)
+        
+        let hybridSig = try await UserOperationBuilder.signHybrid(
             userOpHash: hash,
             wallet: wallet,
             pqKeyManager: pqKeyManager
         )
+        
+        // Log signature component sizes for debugging AA23
+        SecureLogger.info(
+            "PQ signUserOp: hybridSigLen=\(hybridSig.count)B (expected: ABI-encoded 65B ECDSA + 2420B MLDSA)",
+            category: .session
+        )
+        
+        return hybridSig
+    }
+    
+    // MARK: - On-Chain Key Verification
+    
+    /// Read the preQuantumPubKey from the smart account's storage and compare
+    /// with our current wallet address. Logs match/mismatch to help debug AA24.
+    ///
+    /// Solidity storage layout of ZKNOX_ERC4337_account:
+    ///   slot 0: _entryPoint (address)
+    ///   slot 1: preQuantumPubKey (bytes) — 20-byte address, stored inline
+    ///   slot 2: postQuantumPubKey (bytes) — 20-byte PKContract address
+    ///   slot 3: preQuantumLogicContractAddress (address)
+    ///   slot 4: postQuantumLogicContractAddress (address)
+    private func verifyOnChainPreQuantumKey(sender: String, currentEOA: String) async {
+        do {
+            // Read storage slot 1 (preQuantumPubKey) from the smart account
+            let slotData = try await ethGetStorageAt(address: sender, slot: "0x1")
+            
+            // For Solidity `bytes` of length < 32: data is left-aligned, last byte = 2 * length
+            // preQuantumPubKey is 20 bytes, so last byte = 0x28 (40)
+            guard slotData.count == 32 else {
+                SecureLogger.warning("PQ DIAG: storage slot 1 unexpected size: \(slotData.count)", category: .session)
+                return
+            }
+            
+            let storedLength = Int(slotData[31]) / 2
+            guard storedLength == 20 else {
+                SecureLogger.warning(
+                    "PQ DIAG: preQuantumPubKey stored length=\(storedLength), expected 20",
+                    category: .session
+                )
+                return
+            }
+            
+            let onChainAddress = "0x" + slotData.prefix(20).map { String(format: "%02x", $0) }.joined()
+            let match = onChainAddress.lowercased() == currentEOA.lowercased()
+            
+            SecureLogger.info(
+                "PQ DIAG: on-chain preQuantumPubKey=\(onChainAddress), "
+                + "current wallet=\(currentEOA), match=\(match ? "✅" : "❌ MISMATCH")",
+                category: .session
+            )
+            
+            if !match {
+                SecureLogger.error(
+                    "PQ DIAG: ⚠️ ECDSA KEY MISMATCH — the wallet key was regenerated after account deployment! "
+                    + "On-chain expects \(onChainAddress) but wallet is \(currentEOA). "
+                    + "This WILL cause AA24.",
+                    category: .session
+                )
+            }
+            
+            // Also read slot 2 (postQuantumPubKey — the PKContract address)
+            let slot2Data = try await ethGetStorageAt(address: sender, slot: "0x2")
+            if slot2Data.count == 32 {
+                let pqKeyLen = Int(slot2Data[31]) / 2
+                if pqKeyLen == 20 {
+                    let pkContractAddr = "0x" + slot2Data.prefix(20).map { String(format: "%02x", $0) }.joined()
+                    SecureLogger.info(
+                        "PQ DIAG: on-chain postQuantumPubKey (PKContract)=\(pkContractAddr)",
+                        category: .session
+                    )
+                }
+            }
+        } catch {
+            SecureLogger.warning(
+                "PQ DIAG: could not read on-chain keys (non-critical): \(error.localizedDescription)",
+                category: .session
+            )
+        }
+    }
+    
+    /// Read a storage slot from a contract via eth_getStorageAt.
+    private func ethGetStorageAt(address: String, slot: String) async throws -> Data {
+        let chain: PQAccountDeployer.Chain
+        switch chainId {
+        case 11_155_111: chain = .sepolia
+        case 421_614: chain = .arbitrumSepolia
+        default: chain = .sepolia
+        }
+        
+        let body: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_getStorageAt",
+            "params": [address, slot, "latest"]
+        ]
+        
+        let allRPCs = [chain.rpcURL] + chain.fallbackRPCURLs
+        let session = URLSession.shared // testnet — no need for Tor
+        
+        for rpcEndpoint in allRPCs {
+            guard let url = URL(string: rpcEndpoint) else { continue }
+            do {
+                var request = URLRequest(url: url)
+                request.httpMethod = "POST"
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.httpBody = try JSONSerialization.data(withJSONObject: body)
+                request.timeoutInterval = 15
+                
+                let (responseData, _) = try await session.data(for: request)
+                guard let json = try JSONSerialization.jsonObject(with: responseData) as? [String: Any],
+                      let hexResult = json["result"] as? String else {
+                    continue
+                }
+                let hex = hexResult.hasPrefix("0x") ? String(hexResult.dropFirst(2)) : hexResult
+                return ABIEncoder.hexToData(hex)
+            } catch {
+                continue
+            }
+        }
+        throw PQTransactionError.rpcError("eth_getStorageAt failed for all RPCs")
+    }
+    
+    // MARK: - On-Chain Verifier Diagnostics
+    
+    /// Call each signature verifier independently via eth_call to determine
+    /// which verifier (ECDSA or ML-DSA) rejects the signature on-chain.
+    /// This is the definitive AA24 diagnostic.
+    private func diagnoseVerifiersOnChain(
+        sender: String,
+        userOpHash: Data,
+        hybridSig: Data
+    ) async {
+        do {
+            // ── Stale-address check ──
+            // Compare the address we're transacting against with what the CURRENT
+            // expansion code would produce. If different, the account was deployed
+            // with an older key expansion (e.g., pre-NTT fix) and must be redeployed.
+            do {
+                let freshPreQ = try await getPreQuantumKeyForFactory()
+                let freshPostQ = try await getPostQuantumKeyForFactory()
+                let freshAddress = try await deployer.getAddress(
+                    preQuantumPubKey: freshPreQ,
+                    postQuantumPubKey: freshPostQ
+                )
+                let normalizedSender = sender.lowercased()
+                let normalizedFresh = freshAddress.lowercased()
+                if normalizedSender != normalizedFresh {
+                    SecureLogger.error(
+                        "PQ DIAG ⚠️ STALE DEPLOYMENT DETECTED: "
+                        + "transacting against \(sender) but current key expansion "
+                        + "produces \(freshAddress). The on-chain PKContract has stale data "
+                        + "(likely pre-NTT-fix t1). Account MUST be redeployed. "
+                        + "Call PQAccountViewModel.reset() then re-initialize.",
+                        category: .session
+                    )
+                } else {
+                    SecureLogger.info(
+                        "PQ DIAG: address matches current expansion ✅ (\(freshAddress))",
+                        category: .session
+                    )
+                }
+            } catch {
+                SecureLogger.warning(
+                    "PQ DIAG: stale-address check failed: \(error.localizedDescription)",
+                    category: .session
+                )
+            }
+
+            // 1. Decode hybrid signature: abi.decode(sig, (bytes, bytes))
+            guard hybridSig.count >= 128 else {
+                SecureLogger.warning("PQ DIAG VERIFY: hybrid sig too short: \(hybridSig.count)B", category: .session)
+                return
+            }
+            
+            guard let offset1 = ABIEncoder.decodeUInt256(Data(hybridSig[0..<32])),
+                  let offset2 = ABIEncoder.decodeUInt256(Data(hybridSig[32..<64])) else {
+                SecureLogger.warning("PQ DIAG VERIFY: cannot decode offsets", category: .session)
+                return
+            }
+            
+            let off1 = Int(offset1), off2 = Int(offset2)
+            guard off1 + 32 <= hybridSig.count, off2 + 32 <= hybridSig.count,
+                  let len1 = ABIEncoder.decodeUInt256(Data(hybridSig[off1..<(off1 + 32)])),
+                  let len2 = ABIEncoder.decodeUInt256(Data(hybridSig[off2..<(off2 + 32)])) else {
+                SecureLogger.warning("PQ DIAG VERIFY: cannot decode sig lengths", category: .session)
+                return
+            }
+            
+            let ecdsaSig = Data(hybridSig[(off1 + 32)..<(off1 + 32 + Int(len1))])
+            let mldsaSig = Data(hybridSig[(off2 + 32)..<(off2 + 32 + Int(len2))])
+            
+            SecureLogger.info(
+                "PQ DIAG VERIFY: decoded hybrid → ECDSA=\(ecdsaSig.count)B, MLDSA=\(mldsaSig.count)B",
+                category: .session
+            )
+            
+            // 2. Read all 5 storage slots from the smart account
+            let slot0 = try await ethGetStorageAt(address: sender, slot: "0x0")
+            let slot1 = try await ethGetStorageAt(address: sender, slot: "0x1")
+            let slot2 = try await ethGetStorageAt(address: sender, slot: "0x2")
+            let slot3 = try await ethGetStorageAt(address: sender, slot: "0x3")
+            let slot4 = try await ethGetStorageAt(address: sender, slot: "0x4")
+            
+            // Log raw slot values for debugging storage layout
+            for (idx, slotVal) in [slot0, slot1, slot2, slot3, slot4].enumerated() {
+                SecureLogger.info(
+                    "PQ DIAG VERIFY: slot\(idx)=0x\(slotVal.map { String(format: "%02x", $0) }.joined())",
+                    category: .session
+                )
+            }
+            
+            // Slot 0: _entryPoint (address, right-aligned in 32 bytes)
+            let entryPointAddr = "0x" + slot0.suffix(20).map { String(format: "%02x", $0) }.joined()
+            SecureLogger.info("PQ DIAG VERIFY: EntryPoint=\(entryPointAddr)", category: .session)
+            
+            // Slots 1,2: preQuantumPubKey / postQuantumPubKey (Solidity inline bytes)
+            let preQPKLen = Int(slot1[31]) / 2
+            let preQPK = Data(slot1.prefix(preQPKLen))
+            let postQPKLen = Int(slot2[31]) / 2
+            let postQPK = Data(slot2.prefix(postQPKLen))
+            
+            SecureLogger.info(
+                "PQ DIAG VERIFY: preQPK(\(preQPKLen)B)=0x\(preQPK.map { String(format: "%02x", $0) }.joined()), "
+                + "postQPK(\(postQPKLen)B)=0x\(postQPK.map { String(format: "%02x", $0) }.joined())",
+                category: .session
+            )
+            
+            // Slots 3,4: verifier contract addresses (address, right-aligned)
+            let preQuantumVerifier = "0x" + slot3.suffix(20).map { String(format: "%02x", $0) }.joined()
+            let postQuantumVerifier = "0x" + slot4.suffix(20).map { String(format: "%02x", $0) }.joined()
+            
+            SecureLogger.info(
+                "PQ DIAG VERIFY: ECDSAk1=\(preQuantumVerifier), ZKNOX_dilithium=\(postQuantumVerifier)",
+                category: .session
+            )
+            
+            // 3. Compute verify(bytes,bytes32,bytes) selector
+            let verifySelector = ABIEncoder.functionSelector("verify(bytes,bytes32,bytes)")
+            let selectorHex = "0x" + verifySelector.map { String(format: "%02x", $0) }.joined()
+            
+            // 4a. Call ECDSAk1Verifier.verify(preQPK, userOpHash, ecdsaSig)
+            let ecdsaParams = ABIEncoder.encode(
+                types: [.bytes, .bytesFixed(32), .bytes],
+                values: [.bytes(preQPK), .bytes(userOpHash), .bytes(ecdsaSig)]
+            )
+            let ecdsaCalldata = verifySelector + ecdsaParams
+            
+            SecureLogger.info(
+                "PQ DIAG VERIFY: calling ECDSAk1.verify — pk=\(preQPK.count)B, hash=\(userOpHash.count)B, sig=\(ecdsaSig.count)B, calldata=\(ecdsaCalldata.count)B",
+                category: .session
+            )
+            
+            if let ecdsaResult = await diagEthCall(to: preQuantumVerifier, data: ecdsaCalldata) {
+                let ecdsaReturn = Data(ecdsaResult.prefix(4))
+                let ecdsaPass = ecdsaReturn == verifySelector
+                SecureLogger.info(
+                    "PQ DIAG VERIFY: ECDSAk1 → 0x\(ecdsaReturn.map { String(format: "%02x", $0) }.joined()) "
+                    + "(expected \(selectorHex)) \(ecdsaPass ? "✅ PASS" : "❌ FAIL")",
+                    category: .session
+                )
+            } else {
+                SecureLogger.error("PQ DIAG VERIFY: ECDSAk1 → ❌ REVERTED", category: .session)
+            }
+            
+            // 4b. Call ZKNOX_dilithium.verify(postQPK, userOpHash, mldsaSig)
+            let mldsaParams = ABIEncoder.encode(
+                types: [.bytes, .bytesFixed(32), .bytes],
+                values: [.bytes(postQPK), .bytes(userOpHash), .bytes(mldsaSig)]
+            )
+            let mldsaCalldata = verifySelector + mldsaParams
+            
+            SecureLogger.info(
+                "PQ DIAG VERIFY: calling ZKNOX_dilithium.verify — pk=\(postQPK.count)B, hash=\(userOpHash.count)B, sig=\(mldsaSig.count)B, calldata=\(mldsaCalldata.count)B",
+                category: .session
+            )
+            
+            if let mldsaResult = await diagEthCall(to: postQuantumVerifier, data: mldsaCalldata) {
+                let mldsaReturn = Data(mldsaResult.prefix(4))
+                let mldsaPass = mldsaReturn == verifySelector
+                SecureLogger.info(
+                    "PQ DIAG VERIFY: ZKNOX_dilithium → 0x\(mldsaReturn.map { String(format: "%02x", $0) }.joined()) "
+                    + "(expected \(selectorHex)) \(mldsaPass ? "✅ PASS" : "❌ FAIL")",
+                    category: .session
+                )
+            } else {
+                SecureLogger.error("PQ DIAG VERIFY: ZKNOX_dilithium → ❌ REVERTED", category: .session)
+            }
+            
+        } catch {
+            SecureLogger.warning(
+                "PQ DIAG VERIFY: on-chain verifier test error: \(error.localizedDescription)",
+                category: .session
+            )
+        }
+    }
+    
+    /// Generic eth_call for diagnostic purposes. Returns nil if the call reverts or fails.
+    private func diagEthCall(to address: String, data calldata: Data) async -> Data? {
+        let chain: PQAccountDeployer.Chain
+        switch chainId {
+        case 11_155_111: chain = .sepolia
+        case 421_614: chain = .arbitrumSepolia
+        default: chain = .sepolia
+        }
+        
+        let dataHex = "0x" + calldata.map { String(format: "%02x", $0) }.joined()
+        let body: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_call",
+            "params": [
+                ["to": address, "data": dataHex, "gas": "0x1E84800"],  // 32M gas for ML-DSA
+                "latest"
+            ]
+        ]
+        
+        let allRPCs = [chain.rpcURL] + chain.fallbackRPCURLs
+        let session = URLSession.shared
+        
+        for rpcEndpoint in allRPCs {
+            guard let url = URL(string: rpcEndpoint) else { continue }
+            do {
+                var request = URLRequest(url: url)
+                request.httpMethod = "POST"
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.httpBody = try JSONSerialization.data(withJSONObject: body)
+                request.timeoutInterval = 30
+                
+                let (responseData, _) = try await session.data(for: request)
+                guard let json = try JSONSerialization.jsonObject(with: responseData) as? [String: Any] else {
+                    continue
+                }
+                
+                if let hexResult = json["result"] as? String {
+                    let hex = hexResult.hasPrefix("0x") ? String(hexResult.dropFirst(2)) : hexResult
+                    if hex.isEmpty { return Data() }
+                    return ABIEncoder.hexToData(hex)
+                }
+                
+                // eth_call reverted — log the error
+                if let error = json["error"] as? [String: Any] {
+                    let msg = error["message"] as? String ?? "unknown"
+                    let errData = error["data"] as? String ?? ""
+                    SecureLogger.warning(
+                        "PQ DIAG VERIFY: eth_call to \(address.prefix(14))… reverted: \(msg) data=\(errData.prefix(60))",
+                        category: .session
+                    )
+                    return nil
+                }
+                continue
+            } catch {
+                continue
+            }
+        }
+        
+        SecureLogger.warning("PQ DIAG VERIFY: all RPCs failed for eth_call to \(address.prefix(14))…", category: .session)
+        return nil
     }
     
     // MARK: - EntryPoint Nonce
@@ -947,6 +1443,7 @@ enum PQTransactionError: Error, LocalizedError {
     case rpcError(String)
     case signingFailed(String)
     case insufficientBalance(balance: Double, sendAmount: Double, gasCost: Double)
+    case bundlerRejected(String)
     
     var errorDescription: String? {
         switch self {
@@ -959,7 +1456,10 @@ enum PQTransactionError: Error, LocalizedError {
         case .signingFailed(let msg):
             return "PQ signing failed: \(msg)"
         case .insufficientBalance(let balance, let sendAmount, let gasCost):
-            return String(format: "Insufficient balance: you have %.6f ETH but need %.6f ETH to send + %.6f ETH for gas (total %.6f ETH). Reduce the send amount or add funds.", balance, sendAmount, gasCost, sendAmount + gasCost)
+            let shortfall = (sendAmount + gasCost) - balance
+            return String(format: "Insufficient balance: you have %.6f ETH but need %.6f ETH to send + %.6f ETH gas for PQ signature verification (total %.6f ETH).\n\nYou need ~%.4f more ETH. Reduce the send amount or add funds.", balance, sendAmount, gasCost, sendAmount + gasCost, max(shortfall, 0))
+        case .bundlerRejected(let msg):
+            return "Bundler rejected: \(msg)"
         }
     }
 }

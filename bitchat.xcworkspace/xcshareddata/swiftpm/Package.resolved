@@ -1,5 +1,5 @@
 {
-  "originHash" : "4ada2814858c0fbf1b1a6d6ccf5ac3a2f9cd79af5c4554a1702a7de37e00c54e",
+  "originHash" : "20e9dd2cbb8ec1092c2ba59d41060b117d67639a6f3c985e6fe5da0ffd846310",
   "pins" : [
     {
       "identity" : "asn1",
@@ -35,15 +35,6 @@
       "state" : {
         "revision" : "8c62aba8a3011c9bcea232e5ee007fb0b34a15e2",
         "version" : "0.21.1"
-      }
-    },
-    {
-      "identity" : "swiftdilithium",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/leif-ibsen/SwiftDilithium",
-      "state" : {
-        "revision" : "e5d4392af75f6c6094e5a15ec90f432eff9eb733",
-        "version" : "3.5.0"
       }
     }
   ],
