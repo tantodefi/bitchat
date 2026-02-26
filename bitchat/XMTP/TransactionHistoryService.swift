@@ -204,6 +204,35 @@ final class TransactionHistoryService: ObservableObject {
         let cachedHashes = Set(cachedTxs.map { $0.txHash.lowercased() })
         SecureLogger.info("TransactionHistoryService: \(cachedTxs.count) cached tx hashes loaded", category: .network)
 
+        // ── Step 1b: Materialize PQ account cached transactions directly ──
+        // PQ sends store userOpHash (not blockchain txHash), so receipt lookup
+        // will fail for them. We materialize them as display objects immediately.
+        let pqCachedTxs = cachedTxs.filter { $0.source == .pqAccount || $0.source == .pqDeploy }
+        for pqTx in pqCachedTxs {
+            let weiValue = BigUInt(hexString: pqTx.value) ?? BigUInt(0)
+            let isDeploy = pqTx.source == .pqDeploy
+            allTxs.append(OnChainTransaction(
+                id: pqTx.id,
+                txHash: pqTx.txHash,
+                blockNumber: pqTx.blockNumber,
+                timestamp: pqTx.timestamp,
+                from: pqTx.from,
+                to: pqTx.to,
+                value: weiValue,
+                gasUsed: nil,
+                gasPrice: nil,
+                input: nil,
+                status: .confirmed,
+                txType: isDeploy ? .contractDeploy : (!weiValue.isZero ? .send : .contractCall),
+                tokenSymbol: nil,
+                tokenAmount: nil,
+                contractAddress: isDeploy ? pqTx.to : nil,
+                verificationLevel: .unverified,
+                failureReason: nil,
+                chainId: pqTx.chainId
+            ))
+        }
+
         // ── Step 2: Local pending/confirmed/failed from MeshTransactionRelay ──
         discoveryProgress = "Loading local transactions…"
         let localTxs = buildLocalTransactions(from: meshRelay, address: address)
@@ -238,15 +267,19 @@ final class TransactionHistoryService: ObservableObject {
         }
 
         // ── Step 3: Fetch verified receipts for all known tx hashes ──
+        // Exclude PQ cached hashes — they are userOpHashes, not real txHashes,
+        // so eth_getTransactionReceipt will return null and waste RPC calls.
         discoveryProgress = "Verifying known transactions…"
-        let allKnownHashes = cachedHashes.union(Set(localTxs.compactMap { $0.txHash?.lowercased() }))
+        let pqHashSet = Set(pqCachedTxs.map { $0.txHash.lowercased() })
+        let allKnownHashes = cachedHashes.union(Set(localTxs.compactMap { $0.txHash?.lowercased() })).subtracting(pqHashSet)
 
         if !allKnownHashes.isEmpty {
             let receiptTxs = await fetchReceiptsForKnownHashes(
                 hashes: allKnownHashes,
                 address: normalizedAddr,
                 chainId: chainId,
-                useTestnet: useTestnet
+                useTestnet: useTestnet,
+                pqAddress: pqAddress
             )
             allTxs.append(contentsOf: receiptTxs)
             SecureLogger.info("TransactionHistoryService: \(receiptTxs.count) txs from receipt lookup", category: .network)
@@ -414,7 +447,8 @@ final class TransactionHistoryService: ObservableObject {
         hashes: Set<String>,
         address: String,
         chainId: UInt64,
-        useTestnet: Bool
+        useTestnet: Bool,
+        pqAddress: String? = nil
     ) async -> [OnChainTransaction] {
         var results: [OnChainTransaction] = []
         let heliosAvailable = await HeliosManager.shared.isRunning
@@ -436,7 +470,8 @@ final class TransactionHistoryService: ObservableObject {
                             address: address,
                             chainId: chainId,
                             useTestnet: useTestnet,
-                            heliosAvailable: heliosAvailable
+                            heliosAvailable: heliosAvailable,
+                            pqAddress: pqAddress
                         )
                     }
                 }
@@ -458,7 +493,8 @@ final class TransactionHistoryService: ObservableObject {
         address: String,
         chainId: UInt64,
         useTestnet: Bool,
-        heliosAvailable: Bool
+        heliosAvailable: Bool,
+        pqAddress: String? = nil
     ) async -> OnChainTransaction? {
         do {
             let receiptJSON: String
@@ -489,10 +525,14 @@ final class TransactionHistoryService: ObservableObject {
             let effectiveGasPriceHex = receipt["effectiveGasPrice"] as? String
             let gasPrice = parseHexUInt64(effectiveGasPriceHex)
 
-            // Determine tx type based on from/to relationship to our address
+            // Determine tx type based on from/to relationship to our address.
+            // Also accept PQ smart account address — ERC-4337 UserOps are sent by
+            // the bundler's EOA to the EntryPoint contract, so from/to won't match
+            // the user's EOA. But the PQ address may appear in internal traces/logs.
             let normalizedAddr = address.lowercased()
-            let isSend = from == normalizedAddr
-            let isReceive = to == normalizedAddr
+            let normalizedPQ = pqAddress?.lowercased()
+            let isSend = from == normalizedAddr || from == normalizedPQ
+            let isReceive = to == normalizedAddr || to == normalizedPQ
             guard isSend || isReceive else { return nil }
 
             // Try to get the actual tx value by fetching block timestamp too
@@ -723,39 +763,70 @@ final class TransactionHistoryService: ObservableObject {
     private func parseUserOperationLog(_ log: HeliosManager.VerifiedLog, pqAddress: String, chainId: UInt64) -> OnChainTransaction? {
         // UserOperationEvent(bytes32 indexed userOpHash, address indexed sender, address indexed paymaster,
         //                    uint256 nonce, bool success, uint256 actualGasCost, uint256 actualGasUsed)
+        // topics[0] = event signature hash
+        // topics[1] = userOpHash (indexed)
+        // topics[2] = sender (indexed)
+        // topics[3] = paymaster (indexed)
         guard log.topics.count >= 3 else { return nil }
 
-        let userOpHash = log.topics.count > 0 ? log.topics[0] : ""
+        let userOpHash = log.topics.count > 1 ? log.topics[1] : ""
+        _ = userOpHash // available for future correlation
 
         // Parse data fields: nonce (32) + success (32) + gasCost (32) + gasUsed (32)
         let dataHex = log.data.hasPrefix("0x") ? String(log.data.dropFirst(2)) : log.data
         let success: Bool
+        let actualGasUsed: UInt64?
         if dataHex.count >= 128 {
             let successHex = String(dataHex[dataHex.index(dataHex.startIndex, offsetBy: 64)..<dataHex.index(dataHex.startIndex, offsetBy: 128)])
             success = successHex.last != "0"
+            // Parse actualGasUsed from bytes 192..256 (4th word)
+            if dataHex.count >= 256 {
+                let gasUsedHex = String(dataHex[dataHex.index(dataHex.startIndex, offsetBy: 192)..<dataHex.index(dataHex.startIndex, offsetBy: 256)])
+                actualGasUsed = UInt64(gasUsedHex, radix: 16)
+            } else {
+                actualGasUsed = nil
+            }
         } else {
             success = true
+            actualGasUsed = nil
         }
 
         let blockHex = log.blockNumber.hasPrefix("0x") ? String(log.blockNumber.dropFirst(2)) : log.blockNumber
         let blockNumber = UInt64(blockHex, radix: 16)
 
+        // Try to find the actual destination and value from the cached PQ transaction.
+        // The on-chain tx is EntryPoint.handleOps, but the user cares about the inner
+        // execute(dest, value, data) call — match by userOpHash or tx hash.
+        let normalizedPQ = pqAddress.lowercased()
+        let cachedPQTxs = TransactionStore.shared.allTransactions(for: normalizedPQ)
+            .filter { $0.source == .pqAccount }
+
+        // Try to match by on-chain txHash (if a cached entry has same chain + recent timestamp)
+        // or just pick the closest cached PQ tx within a reasonable time window.
+        let matchedCached = cachedPQTxs.first { cached in
+            cached.chainId == chainId
+        }
+
+        let displayTo = matchedCached?.to ?? Self.entryPointV07
+        let displayValue = matchedCached.flatMap { BigUInt(hexString: $0.value) } ?? BigUInt(0)
+        let txType: OnChainTxType = !displayValue.isZero ? .send : .contractCall
+
         return OnChainTransaction(
             id: "\(log.transactionHash)-userop",
             txHash: log.transactionHash,
             blockNumber: blockNumber,
-            timestamp: Date(),
+            timestamp: matchedCached?.timestamp ?? Date(),
             from: pqAddress,
-            to: Self.entryPointV07,
-            value: BigUInt(0),
-            gasUsed: nil,
+            to: displayTo,
+            value: displayValue,
+            gasUsed: actualGasUsed,
             gasPrice: nil,
             input: nil,
             status: success ? .confirmed : .reverted,
-            txType: .contractCall,
+            txType: txType,
             tokenSymbol: nil,
             tokenAmount: nil,
-            contractAddress: Self.entryPointV07,
+            contractAddress: displayTo != Self.entryPointV07 ? nil : Self.entryPointV07,
             verificationLevel: verificationLevel,
             failureReason: success ? nil : "UserOperation reverted",
             chainId: chainId
@@ -1064,7 +1135,8 @@ final class TransactionHistoryService: ObservableObject {
 
         let (data, _) = try await session.data(for: request)
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let result = json["result"] else {
+              let result = json["result"],
+              !(result is NSNull) else {
             return "{}"
         }
 
@@ -1171,7 +1243,8 @@ final class TransactionHistoryService: ObservableObject {
 
         let (data, _) = try await session.data(for: request)
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let result = json["result"] else {
+              let result = json["result"],
+              !(result is NSNull) else {
             return "{}"
         }
 

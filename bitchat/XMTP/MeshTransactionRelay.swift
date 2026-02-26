@@ -559,6 +559,9 @@ final class MeshTransactionRelay: ObservableObject {
     private func submitUserOpToBundler(_ payload: TxUserOpPayload) async {
         updateRelayStatus(payload.requestId, status: .relaying, relayedVia: nil)
         
+        // Use sender field (always populated in a valid UserOp) as fallback for fromAddress
+        let effectiveFrom = payload.fromAddress ?? payload.sender
+        
         do {
             let userOpHash = try await submitUserOpToBundlerRPC(payload)
             
@@ -570,7 +573,7 @@ final class MeshTransactionRelay: ObservableObject {
                 txHash: userOpHash,
                 chainId: payload.chainId,
                 toAddress: payload.toAddress,
-                fromAddress: payload.fromAddress,
+                fromAddress: effectiveFrom,
                 amount: payload.amount,
                 currency: "ETH",
                 confirmedAt: Date(),
@@ -585,7 +588,7 @@ final class MeshTransactionRelay: ObservableObject {
                     CachedTransaction(
                         id: userOpHash,
                         txHash: userOpHash,
-                        from: (payload.fromAddress ?? "").lowercased(),
+                        from: effectiveFrom.lowercased(),
                         to: payload.toAddress.lowercased(),
                         value: payload.amount.map { String(format: "0x%llx", $0) } ?? "0x0",
                         timestamp: Date(),
@@ -593,7 +596,7 @@ final class MeshTransactionRelay: ObservableObject {
                         chainId: UInt64(payload.chainId),
                         source: .pqAccount
                     ),
-                    for: (payload.fromAddress ?? "").lowercased()
+                    for: effectiveFrom.lowercased()
                 )
             }
             
